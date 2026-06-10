@@ -2,6 +2,14 @@
 
 在 Cursor 里通过自定义 OpenAI Base URL，使用 Kiro 订阅的 Claude 模型。
 
+> ⚠️ **重要限制：启用本方案后，Cursor 里的官方 OpenAI 模型（GPT 系列）将无法使用。**
+>
+> Cursor 一旦开启自定义 OpenAI API Key + Base URL，会把**所有 OpenAI 品牌的模型（`gpt-*`、`o*` 等）**全部路由到你设的 Base URL，而不是只对手动添加的别名生效。本网关只认识 `kiro-*` 别名，不认识 `gpt-*`，所以选 GPT 系列会直接报错。这是 Cursor 的全局劫持行为，没有「部分 GPT 走 Cursor、部分走自定义地址」的分流开关。
+>
+> 如果你还想在 Cursor 里用官方 GPT 模型，只能二选一：
+> 1. **来回切开关**：用 Cursor 原生 GPT（订阅额度）时关掉自定义 OpenAI Key，用 Kiro 的 Claude 时再打开。
+> 2. **让网关代理 GPT**：自行扩展网关，把 `gpt-*`/`o*` 透传到官方 `https://api.openai.com/v1`（用你自己的 OpenAI API Key，走 OpenAI 官方计费，非 Cursor 订阅额度）。
+
 ## 背景
 
 Cursor 支持自定义 OpenAI 兼容的 API 地址，但有几个坑：
@@ -233,6 +241,7 @@ docker compose logs --tail=200 kiro-gateway
 - patch 脚本是幂等的，`restart` 不会重复打补丁，但修改 patch 后必须 `down && up`
 - 镜像 tag 已 pin，不会自动升级；升级步骤见「升级上游镜像」
 - `/usage` 和聊天接口共用 `PROXY_API_KEY`，也会经 cloudflared 暴露到公网
+- 启用本方案后，Cursor 里的官方 OpenAI 模型（GPT 系列）将无法使用，详见文首「重要限制」
 
 ## 致谢
 
