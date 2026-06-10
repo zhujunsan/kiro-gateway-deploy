@@ -1,0 +1,7 @@
+# Secrets — never commit real env
+.env
+.env.*
+!.env.example
+
+# macOS
+.DS_Store

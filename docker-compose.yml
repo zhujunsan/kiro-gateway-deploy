@@ -1,0 +1,41 @@
+services:
+  kiro-gateway:
+    # Pinned: patches in ./patches are verified against this exact upstream build.
+    # 升级前先确认新版的 config.py / model_resolver.py / main.py 结构没变（详见 README 故障排查），
+    # 再改成新的 main-<sha> 并重新验证。对应 digest: sha256:0ee8cba3...c54f573d
+    image: ghcr.io/jwadow/kiro-gateway:main-a5292ca
+    container_name: kiro-gateway
+    ports:
+      - "${KIRO_GATEWAY_PORT:-18000}:8000"
+    volumes:
+      - "${HOME}/.aws/sso/cache:/home/kiro/.aws/sso/cache"
+      - "./patches/apply_aliases.py:/patches/apply_aliases.py:ro"
+      - "./patches/add_usage_endpoint.py:/patches/add_usage_endpoint.py:ro"
+    environment:
+      KIRO_CREDS_FILE: /home/kiro/.aws/sso/cache/kiro-auth-token.json
+      KIRO_API_REGION: ${KIRO_API_REGION:-us-east-1}
+      PROFILE_ARN: ${PROFILE_ARN}
+      PROXY_API_KEY: ${PROXY_API_KEY}
+    command:
+      - sh
+      - -ec
+      - |
+        python /patches/apply_aliases.py
+        python /patches/add_usage_endpoint.py
+        exec python main.py
+    restart: unless-stopped
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: kiro-gateway-cloudflared
+    depends_on:
+      kiro-gateway:
+        condition: service_healthy
+    environment:
+      TUNNEL_TRANSPORT_PROTOCOL: ${TUNNEL_TRANSPORT_PROTOCOL:-http2}
+      TUNNEL_TOKEN: ${CLOUDFLARED_TOKEN}
+    command:
+      - tunnel
+      - --no-autoupdate
+      - run
+    restart: unless-stopped
