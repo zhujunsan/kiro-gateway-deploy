@@ -10,6 +10,12 @@
 > 1. **来回切开关**：用 Cursor 原生 GPT（订阅额度）时关掉自定义 OpenAI Key，用 Kiro 的 Claude 时再打开。
 > 2. **让网关代理 GPT**：自行扩展网关，把 `gpt-*`/`o*` 透传到官方 `https://api.openai.com/v1`（用你自己的 OpenAI API Key，走 OpenAI 官方计费，非 Cursor 订阅额度）。
 
+> 💸 **Team 方案注意：即使 BYOK 也要收 Cursor Token 费。**
+>
+> 根据 [Cursor 模型与价格文档](https://cursor.com/cn/docs/models-and-pricing#cursor-token)，在**团队（Teams）方案**中，非 Auto 的智能体请求需支付每百万 token **$0.25** 的 Cursor Token 费率。这笔费用是在模型 API 定价之外**额外收取**的，且**适用于自带密钥（BYOK）用量**——也就是说，即使你用本网关把模型流量接到自己的 Kiro 订阅上，Cursor 仍会按通过它的 token 量收这笔费。
+>
+> 只有 **Auto 免收** Cursor Token 费率。个人方案（Pro / Pro Plus / Ultra）目前不收这笔费用，此提示主要针对 Team 方案用户。
+
 ## 背景
 
 Cursor 支持自定义 OpenAI 兼容的 API 地址，但有几个坑：

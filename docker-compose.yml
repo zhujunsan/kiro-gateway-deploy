@@ -16,6 +16,7 @@ services:
       KIRO_API_REGION: ${KIRO_API_REGION:-us-east-1}
       PROFILE_ARN: ${PROFILE_ARN}
       PROXY_API_KEY: ${PROXY_API_KEY}
+      FAKE_REASONING: ${FAKE_REASONING:-false}
     command:
       - sh
       - -ec
