@@ -33,6 +33,16 @@ def _write_sha(out: Path) -> str:
 def build_macos_dmg() -> Path:
     arch = "arm64" if platform.machine() == "arm64" else "amd64"
     out = OUT / f"KiroGatewayTray-{VER}-macos-{arch}.dmg"
+
+    # create-dmg puts everything in the source folder into the DMG.
+    # DIST contains both the raw COLLECT folder and the .app bundle;
+    # stage only the .app into a temp dir to avoid the extra folder.
+    stage = APP / "build" / "dmg-stage"
+    if stage.exists():
+        shutil.rmtree(stage)
+    stage.mkdir(parents=True)
+    shutil.copytree(DIST / "KiroGatewayTray.app", stage / "KiroGatewayTray.app", symlinks=True)
+
     result = subprocess.run(
         [
             "create-dmg",
@@ -44,7 +54,7 @@ def build_macos_dmg() -> Path:
             "--hide-extension", "KiroGatewayTray.app",
             "--app-drop-link", "420", "190",
             str(out),
-            str(DIST),
+            str(stage),
         ],
         check=False,
     )
