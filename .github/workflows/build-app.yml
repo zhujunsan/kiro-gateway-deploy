@@ -63,6 +63,7 @@ jobs:
         run: python -m pytest -q
 
       - name: Inject repo metadata
+        shell: bash
         env:
           UPSTREAM_REPO_OVERRIDE: ${{ vars.UPSTREAM_REPO || '' }}
           UPSTREAM_SHA_OVERRIDE: ${{ vars.UPSTREAM_SHA || '' }}
