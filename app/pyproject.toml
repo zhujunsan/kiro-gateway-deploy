@@ -1,8 +1,41 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
 name = "kiro-gateway-tray"
-version = "0.1.0"
 description = "Cross-platform tray app for kiro-gateway (no Docker)"
 requires-python = ">=3.11"
+dynamic = ["version"]
+dependencies = [
+    # App runtime
+    "pystray",
+    "Pillow",
+    "platformdirs",
+    "tomli-w",
+    "httpx",
+    # Gateway (vendored) runtime
+    "fastapi",
+    "uvicorn[standard]",
+    "loguru",
+    "python-dotenv",
+    "tiktoken",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pyinstaller",
+    "pytest",
+    "pytest-asyncio",
+]
+
+# Single source of truth for the version: the package's __version__. CI's
+# inject_metadata.py rewrites that constant from the git tag at release time.
+[tool.hatch.version]
+path = "kiro_gateway_tray/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["kiro_gateway_tray"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

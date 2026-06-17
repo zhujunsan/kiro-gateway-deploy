@@ -6,12 +6,16 @@ import httpx
 
 from . import appconfig
 
+# Reused connection pool for localhost gateway calls (usage + models). Avoids
+# building a fresh client/connection on every menu refresh.
+_client = httpx.Client(timeout=30.0)
+
 
 def fetch(timeout: float = 30.0) -> dict:
     cfg = appconfig.load()
     url = f"http://127.0.0.1:{cfg.gateway.port}/usage"
     headers = {"Authorization": f"Bearer {cfg.gateway.proxy_api_key}"}
-    resp = httpx.get(url, headers=headers, timeout=timeout)
+    resp = _client.get(url, headers=headers, timeout=timeout)
     if resp.status_code != 200:
         raise RuntimeError(f"/usage returned {resp.status_code}: {resp.text[:200]}")
     return resp.json()
@@ -60,7 +64,7 @@ def fetch_models(timeout: float = 10.0) -> list[str]:
     cfg = appconfig.load()
     url = f"http://127.0.0.1:{cfg.gateway.port}/v1/models"
     headers = {"Authorization": f"Bearer {cfg.gateway.proxy_api_key}"}
-    resp = httpx.get(url, headers=headers, timeout=timeout)
+    resp = _client.get(url, headers=headers, timeout=timeout)
     if resp.status_code != 200:
         raise RuntimeError(f"/v1/models returned {resp.status_code}")
     data = resp.json().get("data") or []

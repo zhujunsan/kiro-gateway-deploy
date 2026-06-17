@@ -10,8 +10,10 @@ import sys
 # entry script (where there is no parent package for relative imports).
 try:
     from . import appconfig, paths, platform_compat
+    from .log import logger, setup as _setup_logging
 except ImportError:  # frozen entry script: no parent package
     from kiro_gateway_tray import appconfig, paths, platform_compat
+    from kiro_gateway_tray.log import logger, setup as _setup_logging
 
 _lock = None
 
@@ -53,8 +55,11 @@ def main() -> int:
         print(paths.config_file())
         return 0
 
+    _setup_logging()  # parent-process log sink (tray.log); child has its own
+
     if not _acquire_lock():
         print("Kiro Tray 已在运行中，不允许启动多个实例。", file=sys.stderr)
+        logger.warning("another instance is already running; refusing to start")
         return 1
 
     if not args.cli and _has_display():
@@ -67,6 +72,7 @@ def main() -> int:
             return 0
         except tray.TrayUnavailable as e:
             print(f"[tray unavailable: {e}] 退化到 CLI 模式", file=sys.stderr)
+            logger.info("tray unavailable ({}); falling back to CLI mode", e)
 
     try:
         from . import cli

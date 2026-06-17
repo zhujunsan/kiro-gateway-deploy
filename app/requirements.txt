@@ -1,12 +1,3 @@
-# App runtime deps
-pystray
-Pillow
-platformdirs
-tomli-w
-httpx
-# Gateway (vendored) runtime deps
-fastapi
-uvicorn[standard]
-loguru
-python-dotenv
-tiktoken
+# Runtime deps are declared in pyproject.toml; this file stays for the
+# documented `pip install -r requirements.txt` workflow.
+-e .

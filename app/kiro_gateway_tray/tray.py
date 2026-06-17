@@ -10,6 +10,7 @@ from typing import Callable
 from . import appconfig, dialogs, macos_menu, paths, platform_compat, usage
 from .async_cache import AsyncRefreshCache
 from .icon import make_icon
+from .log import logger
 from .supervisor import Supervisor
 
 
@@ -279,7 +280,7 @@ def run() -> None:
                     _update["info"] = info
                     icon.update_menu()
             except Exception:
-                pass  # silent failure, never bother the user
+                logger.debug("update check failed", exc_info=True)  # never bother the user
         threading.Thread(target=_work, daemon=True).start()
 
     def update_visible(_item) -> bool:
@@ -329,6 +330,7 @@ def run() -> None:
             sup.register(cfg, secret)
         except Exception as e:
             print(f"[kiro-gateway-tray setup error] {e}", file=sys.stderr)
+            logger.exception("first-run setup failed")
             dialogs.alert("Kiro Tray 错误", str(e)[:300])
             return
 
@@ -339,6 +341,7 @@ def run() -> None:
             sup.start()
         except Exception as e:
             print(f"[kiro-gateway-tray startup error] {e}", file=sys.stderr)
+            logger.exception("supervisor start failed")
             _notify(icon, "Kiro Tray 错误", str(e)[:200])
         _refresh_icon(icon)
         icon.update_menu()

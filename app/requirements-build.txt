@@ -1,4 +1,2 @@
--r requirements.txt
-pyinstaller
-pytest
-pytest-asyncio
+# Build/test deps are the dev extra in pyproject.toml; CI installs via this file.
+-e .[dev]

@@ -10,6 +10,7 @@ from typing import Callable
 import httpx
 
 from . import appconfig
+from .log import logger
 from .appconfig import AppCfg
 from .gateway import GatewayProcess
 from .cloudflared import CloudflaredProcess
@@ -18,6 +19,9 @@ from .cloudflared import CloudflaredProcess
 class Supervisor:
     # consecutive failed /health probes before flipping "starting" -> "error"
     _UNHEALTHY_THRESHOLD = 5
+    # health probe cadence: tight while settling, relaxed once steady-running
+    _PROBE_INTERVAL_ACTIVE = 3      # seconds, while starting/unhealthy
+    _PROBE_INTERVAL_STEADY = 15     # seconds, once consistently running
 
     def __init__(self, gateway=None, tunnel=None) -> None:
         self.gateway = gateway or GatewayProcess()
@@ -29,6 +33,8 @@ class Supervisor:
         self._gw_health: str = "stopped"
         self._health_thread: threading.Thread | None = None
         self._health_stop = threading.Event()
+        # Reused connection pool for localhost health/usage probes.
+        self._client = httpx.Client(timeout=3)
 
     def _load(self) -> AppCfg:
         self._cfg = appconfig.load()
@@ -45,7 +51,7 @@ class Supervisor:
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:
-                if httpx.get(url, timeout=3).status_code == 200:
+                if self._client.get(url, timeout=3).status_code == 200:
                     return True
             except httpx.HTTPError:
                 pass
@@ -91,21 +97,23 @@ class Supervisor:
         if not secret:
             # No secret available (older config registered before secrets were
             # persisted). Can't re-sync the port; the tunnel keeps pointing at
-            # the old port. Log so this isn't a silent 502 mystery.
-            print(
-                "[kiro-gateway-tray] 本地端口已变更但无法同步到 Worker"
-                "（缺少激活码缓存）。请重新激活，或将端口改回 "
-                f"{cfg.cloudflare.registered_port}。",
-                file=sys.stderr,
+            # the old port. Surface it so this isn't a silent 502 mystery.
+            msg = (
+                "本地端口已变更但无法同步到 Worker（缺少激活码缓存）。"
+                f"请重新激活，或将端口改回 {cfg.cloudflare.registered_port}。"
             )
+            print(f"[kiro-gateway-tray] {msg}", file=sys.stderr)
+            logger.warning(msg)
             return
         from . import provision
         try:
             provision.update_port(cfg, secret)
             cfg.cloudflare.registered_port = cfg.gateway.port
             appconfig.save(cfg)
+            logger.info("synced tunnel port to {} via Worker", cfg.gateway.port)
         except Exception as e:
             print(f"[kiro-gateway-tray] update-port 失败: {e}", file=sys.stderr)
+            logger.exception("update-port failed")
 
     def start(self) -> bool:
         cfg = self._load()
@@ -131,41 +139,52 @@ class Supervisor:
         return self.start()
 
     def _start_health_loop(self) -> None:
-        """Start a background thread that probes gateway /health every 3s.
+        """Start a background thread that probes gateway /health.
 
-        While the process is alive but not yet answering, the state is
-        "starting"; after ``_UNHEALTHY_THRESHOLD`` consecutive failed probes it
-        flips to "error" so a wedged gateway (bad port, bad profile_arn) is
-        visible instead of spinning on "starting" forever."""
+        Probes every ``_PROBE_INTERVAL_ACTIVE`` seconds while settling; once the
+        gateway has been answering steadily it backs off to
+        ``_PROBE_INTERVAL_STEADY`` to avoid needless wakeups. While the process
+        is alive but not yet answering, the state is "starting"; after
+        ``_UNHEALTHY_THRESHOLD`` consecutive failed probes it flips to "error"
+        so a wedged gateway (bad port, bad profile_arn) is visible instead of
+        spinning on "starting" forever."""
         if self._health_thread and self._health_thread.is_alive():
             return
         self._health_stop.clear()
 
         def _loop():
             consecutive_failures = 0
+            consecutive_ok = 0
             while not self._health_stop.is_set():
+                interval = self._PROBE_INTERVAL_ACTIVE
                 if not self.gateway.is_alive():
                     self._gw_health = "stopped"
                     consecutive_failures = 0
+                    consecutive_ok = 0
                 else:
                     cfg = self._cfg or self._load()
                     url = f"http://127.0.0.1:{cfg.gateway.port}/health"
                     healthy = False
                     try:
-                        healthy = httpx.get(url, timeout=1).status_code == 200
+                        healthy = self._client.get(url, timeout=1).status_code == 200
                     except Exception:
                         healthy = False
                     if healthy:
                         self._gw_health = "running"
                         consecutive_failures = 0
+                        consecutive_ok += 1
+                        # Back off only after the gateway has proven stable.
+                        if consecutive_ok >= 2:
+                            interval = self._PROBE_INTERVAL_STEADY
                     else:
+                        consecutive_ok = 0
                         consecutive_failures += 1
                         self._gw_health = (
                             "error"
                             if consecutive_failures >= self._UNHEALTHY_THRESHOLD
                             else "starting"
                         )
-                self._health_stop.wait(3)
+                self._health_stop.wait(interval)
 
         self._health_thread = threading.Thread(target=_loop, daemon=True)
         self._health_thread.start()

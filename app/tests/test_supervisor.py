@@ -115,3 +115,9 @@ def test_port_sync_skipped_without_secret(monkeypatch, tmp_path, capsys):
     s.start()
     err = capsys.readouterr().err
     assert "无法同步" in err
+
+
+def test_health_probe_intervals_ordered():
+    # Steady cadence must be looser than the active one, and both positive.
+    assert supervisor.Supervisor._PROBE_INTERVAL_ACTIVE > 0
+    assert supervisor.Supervisor._PROBE_INTERVAL_STEADY > supervisor.Supervisor._PROBE_INTERVAL_ACTIVE

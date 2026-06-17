@@ -7,6 +7,7 @@ import sys
 import threading
 
 from . import appconfig, paths, usage
+from .log import logger, setup as _setup_logging
 from .supervisor import Supervisor
 
 
@@ -36,6 +37,7 @@ def run() -> int:
     cfg = appconfig.load()
     sup = Supervisor()
     sup.provision_callback = _first_run_setup_cli
+    _setup_logging()
 
     print("Kiro Gateway (CLI 模式)")
     print(f"  配置文件: {paths.config_file()}")
@@ -46,6 +48,7 @@ def run() -> int:
         sup.start()
     except Exception as e:
         print(f"  启动失败: {e}", file=sys.stderr)
+        logger.exception("CLI supervisor start failed")
         return 1
 
     cfg = appconfig.load()  # reload after potential provision
