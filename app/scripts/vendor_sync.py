@@ -1,5 +1,7 @@
 # app/scripts/vendor_sync.py
-"""Clone upstream at the pinned SHA, copy needed files, apply patches."""
+"""Clone the (already-patched) upstream fork at the pinned SHA and copy the
+files the app embeds. The fork bakes in kiro-* aliases + /usage, so there is
+no build-time patching step."""
 from __future__ import annotations
 
 import shutil
@@ -38,12 +40,8 @@ def main() -> None:
             else:
                 shutil.copy2(s, d)
 
-    from patches import apply_aliases, add_usage_endpoint  # noqa: E402
-    apply_aliases.main(VENDOR)
-    add_usage_endpoint.main(VENDOR)
-
     (VENDOR / "__init__.py").write_text("")
-    print(f"[ok] vendored upstream {UPSTREAM_SHA} into {VENDOR}")
+    print(f"[ok] vendored fork {UPSTREAM_SHA[:7]} into {VENDOR}")
 
 
 if __name__ == "__main__":
