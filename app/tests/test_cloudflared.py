@@ -49,3 +49,44 @@ def test_provision_read_profile_arn_and_region(monkeypatch):
     monkeypatch.setattr(provision, "_read_kiro_token", lambda _cfg: {"profileArn": arn})
     assert provision.read_profile_arn(cfg) == arn
     assert provision.read_api_region(cfg) == "us-east-1"
+
+
+def test_post_with_retry_retries_on_5xx(monkeypatch):
+    from kiro_gateway_tray import provision
+
+    class _Resp:
+        def __init__(self, code):
+            self.status_code = code
+            self.text = "x"
+
+    calls = {"n": 0}
+
+    def fake_post(url, json, timeout):
+        calls["n"] += 1
+        return _Resp(500 if calls["n"] < 3 else 200)
+
+    monkeypatch.setattr(provision.httpx, "post", fake_post)
+    monkeypatch.setattr(provision.time, "sleep", lambda _s: None)
+    resp = provision._post_with_retry("http://x/provision", {})
+    assert resp.status_code == 200
+    assert calls["n"] == 3
+
+
+def test_post_with_retry_no_retry_on_401(monkeypatch):
+    from kiro_gateway_tray import provision
+
+    class _Resp:
+        status_code = 401
+        text = "nope"
+
+    calls = {"n": 0}
+
+    def fake_post(url, json, timeout):
+        calls["n"] += 1
+        return _Resp()
+
+    monkeypatch.setattr(provision.httpx, "post", fake_post)
+    monkeypatch.setattr(provision.time, "sleep", lambda _s: None)
+    resp = provision._post_with_retry("http://x/provision", {})
+    assert resp.status_code == 401
+    assert calls["n"] == 1  # client error returned immediately, not retried

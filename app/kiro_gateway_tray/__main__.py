@@ -9,31 +9,19 @@ import sys
 # Works both as a package module (python -m kiro_gateway_tray) and as a PyInstaller
 # entry script (where there is no parent package for relative imports).
 try:
-    from . import appconfig, paths
+    from . import appconfig, paths, platform_compat
 except ImportError:  # frozen entry script: no parent package
-    from kiro_gateway_tray import appconfig, paths
+    from kiro_gateway_tray import appconfig, paths, platform_compat
 
-_lock_fd = None
+_lock = None
 
 
 def _acquire_lock() -> bool:
     """Try to acquire an exclusive lock file. Returns False if another instance is running."""
-    global _lock_fd
+    global _lock
     paths.ensure_dirs()
-    lock_path = paths.data_dir() / "kiro-gateway-tray.lock"
-    try:
-        _lock_fd = open(lock_path, "w")
-        if sys.platform == "win32":
-            import msvcrt
-            msvcrt.locking(_lock_fd.fileno(), msvcrt.LK_NBLCK, 1)
-        else:
-            import fcntl
-            fcntl.flock(_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        _lock_fd.write(str(os.getpid()))
-        _lock_fd.flush()
-        return True
-    except OSError:
-        return False
+    _lock = platform_compat.SingleInstanceLock(paths.data_dir() / "kiro-gateway-tray.lock")
+    return _lock.acquire()
 
 
 def _has_display() -> bool:

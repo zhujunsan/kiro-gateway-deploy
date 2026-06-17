@@ -58,3 +58,43 @@ def test_is_provisioned(tmp_path, monkeypatch):
     cfg.cloudflare.hostname = "kg-alice.example.com"
     cfg.cloudflare.run_token = "eyJ_test"
     assert appconfig.is_provisioned(cfg) is True
+
+
+def test_cache_returns_same_instance_until_save(tmp_path, monkeypatch):
+    monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
+    appconfig.invalidate_cache()
+    c1 = appconfig.load(use_cache=True)
+    c2 = appconfig.load(use_cache=True)
+    assert c1 is c2  # cache hit returns the same object
+
+
+def test_save_refreshes_cache(tmp_path, monkeypatch):
+    monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
+    appconfig.invalidate_cache()
+    c1 = appconfig.load(use_cache=True)
+    c1.gateway.port = 55555
+    appconfig.save(c1)
+    c2 = appconfig.load(use_cache=True)
+    assert c2.gateway.port == 55555
+
+
+def test_url_helpers(tmp_path, monkeypatch):
+    monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
+    cfg = appconfig.load()
+    cfg.gateway.port = 64005
+    assert appconfig.local_url(cfg) == "http://127.0.0.1:64005/v1"
+    assert appconfig.tunnel_url(cfg) == ""
+    # base_url falls back to local when no tunnel hostname
+    assert appconfig.base_url(cfg) == "http://127.0.0.1:64005/v1"
+    cfg.cloudflare.hostname = "kg-alice.example.com"
+    assert appconfig.tunnel_url(cfg) == "https://kg-alice.example.com/v1"
+    assert appconfig.base_url(cfg) == "https://kg-alice.example.com/v1"
+
+
+def test_shared_secret_persists(tmp_path, monkeypatch):
+    monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
+    cfg = appconfig.load()
+    cfg.cloudflare.shared_secret = "act-code-123"
+    appconfig.save(cfg)
+    again = appconfig.load()
+    assert again.cloudflare.shared_secret == "act-code-123"

@@ -67,3 +67,51 @@ def test_stop(monkeypatch, tmp_path):
     s.stop()
     assert s.gateway.is_alive() is False
     assert s.tunnel.is_alive() is False
+
+
+def test_persisted_secret_enables_port_sync_across_restart(monkeypatch, tmp_path):
+    # Simulate an already-registered user reopening the app: no in-session
+    # secret, but one persisted in config. Changing the port must trigger
+    # update_port (regression for the silent-skip bug).
+    monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
+    cfg = appconfig.load()
+    cfg.cloudflare.hostname = "kg-test.example.com"
+    cfg.cloudflare.run_token = "eyJ_test"
+    cfg.cloudflare.shared_secret = "persisted-secret"
+    cfg.cloudflare.registered_port = 64005
+    cfg.gateway.port = 64010  # user changed the port
+    appconfig.save(cfg)
+
+    s = supervisor.Supervisor(gateway=_FakeGateway(), tunnel=_FakeTunnel())
+    monkeypatch.setattr(s, "_wait_healthy", lambda timeout=30: True)
+
+    calls = {"update_port": 0}
+    import kiro_gateway_tray.provision as pmod
+
+    def fake_update_port(cfg, secret):
+        calls["update_port"] += 1
+        assert secret == "persisted-secret"
+        return True
+
+    monkeypatch.setattr(pmod, "update_port", fake_update_port)
+    s.start()
+    assert calls["update_port"] == 1
+    assert appconfig.load().cloudflare.registered_port == 64010
+
+
+def test_port_sync_skipped_without_secret(monkeypatch, tmp_path, capsys):
+    # Older config registered before secrets were persisted: no secret anywhere.
+    # Port-sync must skip and warn rather than crash.
+    monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
+    cfg = appconfig.load()
+    cfg.cloudflare.hostname = "kg-test.example.com"
+    cfg.cloudflare.run_token = "eyJ_test"
+    cfg.cloudflare.registered_port = 64005
+    cfg.gateway.port = 64010
+    appconfig.save(cfg)
+
+    s = supervisor.Supervisor(gateway=_FakeGateway(), tunnel=_FakeTunnel())
+    monkeypatch.setattr(s, "_wait_healthy", lambda timeout=30: True)
+    s.start()
+    err = capsys.readouterr().err
+    assert "无法同步" in err

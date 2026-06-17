@@ -2,6 +2,7 @@
 """Orchestrate gateway + cloudflared and handle first-run provisioning."""
 from __future__ import annotations
 
+import sys
 import threading
 import time
 from typing import Callable
@@ -15,6 +16,9 @@ from .cloudflared import CloudflaredProcess
 
 
 class Supervisor:
+    # consecutive failed /health probes before flipping "starting" -> "error"
+    _UNHEALTHY_THRESHOLD = 5
+
     def __init__(self, gateway=None, tunnel=None) -> None:
         self.gateway = gateway or GatewayThread()
         self.tunnel = tunnel or CloudflaredProcess()
@@ -28,6 +32,11 @@ class Supervisor:
 
     def _load(self) -> AppCfg:
         self._cfg = appconfig.load()
+        # Restore the activation secret persisted at registration time so that
+        # update-port works across restarts (not just within the session that
+        # first provisioned). Falls back to any in-session value.
+        if self._cfg.cloudflare.shared_secret:
+            self._cached_secret = self._cfg.cloudflare.shared_secret
         return self._cfg
 
     def _wait_healthy(self, timeout: int = 30) -> bool:
@@ -67,6 +76,9 @@ class Supervisor:
         cfg.cloudflare.hostname = hostname
         cfg.cloudflare.run_token = run_token
         cfg.cloudflare.registered_port = cfg.gateway.port
+        # Persist the secret so port-sync survives restarts. Safe-ish: config is
+        # chmod 0600 on POSIX. See appconfig.save().
+        cfg.cloudflare.shared_secret = shared_secret
         appconfig.save(cfg)
 
     def _sync_port_if_changed(self, cfg: AppCfg) -> None:
@@ -75,16 +87,25 @@ class Supervisor:
             return
         if cfg.cloudflare.registered_port == cfg.gateway.port:
             return
-        secret = self._cached_secret
+        secret = self._cached_secret or cfg.cloudflare.shared_secret
         if not secret:
-            return  # no cached secret, skip silently
+            # No secret available (older config registered before secrets were
+            # persisted). Can't re-sync the port; the tunnel keeps pointing at
+            # the old port. Log so this isn't a silent 502 mystery.
+            print(
+                "[kiro-gateway-tray] 本地端口已变更但无法同步到 Worker"
+                "（缺少激活码缓存）。请重新激活，或将端口改回 "
+                f"{cfg.cloudflare.registered_port}。",
+                file=sys.stderr,
+            )
+            return
         from . import provision
         try:
             provision.update_port(cfg, secret)
             cfg.cloudflare.registered_port = cfg.gateway.port
             appconfig.save(cfg)
-        except Exception:
-            pass  # non-fatal: tunnel still works on old port
+        except Exception as e:
+            print(f"[kiro-gateway-tray] update-port 失败: {e}", file=sys.stderr)
 
     def start(self) -> bool:
         cfg = self._load()
@@ -110,25 +131,40 @@ class Supervisor:
         return self.start()
 
     def _start_health_loop(self) -> None:
-        """Start a background thread that probes gateway /health every 3s."""
+        """Start a background thread that probes gateway /health every 3s.
+
+        While the process is alive but not yet answering, the state is
+        "starting"; after ``_UNHEALTHY_THRESHOLD`` consecutive failed probes it
+        flips to "error" so a wedged gateway (bad port, bad profile_arn) is
+        visible instead of spinning on "starting" forever."""
         if self._health_thread and self._health_thread.is_alive():
             return
         self._health_stop.clear()
 
         def _loop():
+            consecutive_failures = 0
             while not self._health_stop.is_set():
                 if not self.gateway.is_alive():
                     self._gw_health = "stopped"
+                    consecutive_failures = 0
                 else:
                     cfg = self._cfg or self._load()
                     url = f"http://127.0.0.1:{cfg.gateway.port}/health"
+                    healthy = False
                     try:
-                        if httpx.get(url, timeout=1).status_code == 200:
-                            self._gw_health = "running"
-                        else:
-                            self._gw_health = "starting"
+                        healthy = httpx.get(url, timeout=1).status_code == 200
                     except Exception:
-                        self._gw_health = "starting"
+                        healthy = False
+                    if healthy:
+                        self._gw_health = "running"
+                        consecutive_failures = 0
+                    else:
+                        consecutive_failures += 1
+                        self._gw_health = (
+                            "error"
+                            if consecutive_failures >= self._UNHEALTHY_THRESHOLD
+                            else "starting"
+                        )
                 self._health_stop.wait(3)
 
         self._health_thread = threading.Thread(target=_loop, daemon=True)

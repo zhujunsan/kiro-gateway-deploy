@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import httpx
@@ -11,6 +12,29 @@ from . import appconfig
 from .appconfig import AppCfg
 
 _USERNAME_LEN = 12  # first 12 hex chars of clientIdHash (~48 bits, collision-safe)
+_HTTP_RETRIES = 3   # attempts for transient network errors
+_HTTP_TIMEOUT = 30
+
+
+def _post_with_retry(url: str, payload: dict) -> httpx.Response:
+    """POST with bounded retries on transient network/5xx errors.
+
+    Auth failures (401) and other 4xx are returned immediately so callers can
+    surface a precise message instead of retrying a doomed request."""
+    last_err: Exception | None = None
+    for attempt in range(1, _HTTP_RETRIES + 1):
+        try:
+            resp = httpx.post(url, json=payload, timeout=_HTTP_TIMEOUT)
+        except httpx.HTTPError as e:
+            last_err = e
+        else:
+            # Retry only on server-side transient failures.
+            if resp.status_code < 500:
+                return resp
+            last_err = RuntimeError(f"Worker {resp.status_code}: {resp.text[:200]}")
+        if attempt < _HTTP_RETRIES:
+            time.sleep(2 * attempt)
+    raise RuntimeError(f"请求 {url} 失败（重试 {_HTTP_RETRIES} 次）：{last_err}")
 
 
 def _read_kiro_token(cfg: AppCfg) -> dict | None:
@@ -67,14 +91,13 @@ def run(cfg: AppCfg, shared_secret: str) -> tuple[str, str]:
     username = _get_username(cfg)
     url = _base_url(cfg) + "/provision"
 
-    resp = httpx.post(
+    resp = _post_with_retry(
         url,
-        json={
+        {
             "shared_secret": shared_secret,
             "username": username,
             "port": cfg.gateway.port,
         },
-        timeout=30,
     )
 
     if resp.status_code == 401:
@@ -101,14 +124,13 @@ def update_port(cfg: AppCfg, shared_secret: str) -> bool:
     username = _get_username(cfg)
     url = _base_url(cfg) + "/update-port"
 
-    resp = httpx.post(
+    resp = _post_with_retry(
         url,
-        json={
+        {
             "shared_secret": shared_secret,
             "username": username,
             "port": cfg.gateway.port,
         },
-        timeout=30,
     )
 
     if resp.status_code == 401:

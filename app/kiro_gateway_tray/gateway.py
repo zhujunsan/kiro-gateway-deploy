@@ -45,6 +45,7 @@ class GatewayThread:
     def __init__(self) -> None:
         self._server = None
         self._thread: threading.Thread | None = None
+        self._logging_ready = False
 
     def start(self, cfg: AppCfg) -> None:
         _apply_env(cfg)
@@ -58,6 +59,14 @@ class GatewayThread:
         main = __import__("main")
 
         self._setup_logging()
+        # NOTE (in-process limitation): the vendored gateway reads most config
+        # from env vars at *import* time (config.py). On a restart the `main`
+        # module is already cached in sys.modules, so import-time config is NOT
+        # re-read. _apply_env above refreshes os.environ, which covers values the
+        # gateway reads per-request, plus host/port used here to rebind the
+        # socket. Settings consumed only at import (if any) need a full process
+        # restart to take effect. Running the gateway as a child process would
+        # remove this caveat but is a larger change (see plan).
         config = uvicorn.Config(
             app=main.app,
             host=os.environ["SERVER_HOST"],
@@ -69,18 +78,19 @@ class GatewayThread:
         self._thread.start()
 
     def _setup_logging(self) -> None:
-        """Add file sinks for loguru (gateway) and stdlib logging (uvicorn)."""
+        """Add file sinks for loguru (gateway) and stdlib logging (uvicorn).
+
+        Idempotent across restarts: loguru sinks are only added once to avoid
+        piling up duplicate file handlers on every start/restart cycle."""
         import logging
 
         log_dir = paths.log_dir()
         log_dir.mkdir(parents=True, exist_ok=True)
         log_file = str(log_dir / "gateway.log")
 
-        # loguru sink
         from loguru import logger as _loguru
-        _loguru.add(log_file, rotation="2 MB", retention=3, encoding="utf-8", enqueue=True)
 
-        # Intercept stdlib logging into loguru so uvicorn logs also land in the file
+        # stdlib -> loguru interception is always (re)installed; it's idempotent.
         class _InterceptHandler(logging.Handler):
             def emit(self, record):
                 try:
@@ -98,6 +108,12 @@ class GatewayThread:
             log = logging.getLogger(name)
             log.handlers = [intercept]
             log.propagate = False
+
+        # Add the file sink only once per process.
+        if self._logging_ready:
+            return
+        _loguru.add(log_file, rotation="2 MB", retention=3, encoding="utf-8", enqueue=True)
+        self._logging_ready = True
 
     def stop(self) -> None:
         if self._server is not None:
