@@ -35,7 +35,18 @@ def main() -> int:
     parser.add_argument("--cli", action="store_true", help="force headless CLI mode")
     parser.add_argument("--print-config", action="store_true",
                         help="print config file path and exit")
+    parser.add_argument("--run-gateway", action="store_true",
+                        help=argparse.SUPPRESS)  # internal: gateway child process
     args = parser.parse_args()
+
+    if args.run_gateway:
+        # Child process entry: run only the gateway, no lock/tray/CLI. The parent
+        # populated os.environ + CWD before spawning us.
+        try:
+            from . import gateway
+        except ImportError:
+            from kiro_gateway_tray import gateway
+        return gateway.run_gateway_blocking()
 
     if args.print_config:
         appconfig.load()

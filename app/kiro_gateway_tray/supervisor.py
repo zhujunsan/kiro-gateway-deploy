@@ -11,7 +11,7 @@ import httpx
 
 from . import appconfig
 from .appconfig import AppCfg
-from .gateway import GatewayThread
+from .gateway import GatewayProcess
 from .cloudflared import CloudflaredProcess
 
 
@@ -20,7 +20,7 @@ class Supervisor:
     _UNHEALTHY_THRESHOLD = 5
 
     def __init__(self, gateway=None, tunnel=None) -> None:
-        self.gateway = gateway or GatewayThread()
+        self.gateway = gateway or GatewayProcess()
         self.tunnel = tunnel or CloudflaredProcess()
         self._cfg: AppCfg | None = None
         self._cached_secret: str | None = None

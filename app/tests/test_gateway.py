@@ -22,3 +22,16 @@ def test_apply_env_sets_process_env(tmp_path, monkeypatch):
     assert os.environ["PROFILE_ARN"] == "arn:test"
     assert os.environ["PROXY_API_KEY"] == "k123"
     assert os.environ["SERVER_HOST"] == "127.0.0.1"
+
+
+def test_child_command_source_mode(monkeypatch):
+    monkeypatch.setattr(gateway.sys, "frozen", False, raising=False)
+    cmd = gateway._child_command()
+    assert cmd[1:] == ["-m", "kiro_gateway_tray", "--run-gateway"]
+
+
+def test_child_command_frozen_mode(monkeypatch):
+    monkeypatch.setattr(gateway.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(gateway.sys, "executable", "/Apps/KiroGatewayTray", raising=False)
+    cmd = gateway._child_command()
+    assert cmd == ["/Apps/KiroGatewayTray", "--run-gateway"]
