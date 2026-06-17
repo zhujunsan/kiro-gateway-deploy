@@ -14,6 +14,7 @@ from kiro.routes_openai import verify_api_key as _usage_verify_api_key
 _USAGE_KIRO_VERSION = "0.11.107"
 _USAGE_NODE_VERSION = "22.22.0"
 _USAGE_SYSTEM_VERSION = "darwin#24.6.0"
+_USAGE_OVERAGE_RATE_USD = 0.04
 
 
 def _usage_pick_auth():
@@ -28,13 +29,26 @@ def _usage_pick_auth():
 
 
 def _usage_summary(data: dict) -> dict:
-    """Replicate kiro.rs usage_limits aggregation: base + active trial + active bonuses."""
+    """Replicate kiro.rs usage_limits aggregation: base + active trial + active bonuses.
+
+    On paid plans, usage past the monthly limit (overage) is billed at $0.04 per
+    extra credit. We compute per-breakdown overage + cost and a grand total so the
+    caller can show the projected additional charge.
+    """
     sub = (data.get("subscriptionInfo") or {}).get("subscriptionTitle")
     breakdowns = data.get("usageBreakdownList") or []
     if not breakdowns:
-        return {"subscription": sub, "nextDateReset": data.get("nextDateReset"), "breakdowns": []}
+        return {
+            "subscription": sub,
+            "nextDateReset": data.get("nextDateReset"),
+            "breakdowns": [],
+            "overageRateUsd": _USAGE_OVERAGE_RATE_USD,
+            "overageCreditsTotal": 0.0,
+            "overageCostUsd": 0.0,
+        }
 
     out = []
+    total_overage = 0.0
     for b in breakdowns:
         used = b.get("currentUsageWithPrecision", b.get("currentUsage", 0)) or 0
         limit = b.get("usageLimitWithPrecision", b.get("usageLimit", 0)) or 0
@@ -46,11 +60,24 @@ def _usage_summary(data: dict) -> dict:
             if bonus.get("status") == "ACTIVE":
                 used += bonus.get("currentUsage", 0) or 0
                 limit += bonus.get("usageLimit", 0) or 0
+        overage = used - limit
+        if overage < 0:
+            overage = 0.0
+        total_overage += overage
         out.append({
             "used": round(used, 2),
             "limit": round(limit, 2),
+            "overage": round(overage, 2),
+            "overageCostUsd": round(overage * _USAGE_OVERAGE_RATE_USD, 2),
         })
-    return {"subscription": sub, "nextDateReset": data.get("nextDateReset"), "breakdowns": out}
+    return {
+        "subscription": sub,
+        "nextDateReset": data.get("nextDateReset"),
+        "breakdowns": out,
+        "overageRateUsd": _USAGE_OVERAGE_RATE_USD,
+        "overageCreditsTotal": round(total_overage, 2),
+        "overageCostUsd": round(total_overage * _USAGE_OVERAGE_RATE_USD, 2),
+    }
 
 
 @app.get("/usage", dependencies=[_UsageDepends(_usage_verify_api_key)])

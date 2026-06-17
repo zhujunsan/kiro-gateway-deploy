@@ -1,0 +1,8 @@
+kiro_tray/vendor/
+resources/cloudflared/
+build/
+dist/
+release/
+*.spec.bak
+__pycache__/
+.venv/

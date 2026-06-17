@@ -1,0 +1,12 @@
+# App runtime deps
+pystray
+Pillow
+platformdirs
+tomli-w
+httpx
+# Gateway (vendored) runtime deps
+fastapi
+uvicorn[standard]
+loguru
+python-dotenv
+tiktoken
