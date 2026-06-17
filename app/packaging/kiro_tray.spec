@@ -26,8 +26,18 @@ else:
 datas = [
     (str(VENDOR), "vendor"),
     (str(RES / "cloudflared" / _cf_sub / _cf_exe), f"resources/cloudflared/{_cf_sub}"),
-    (str(RES / "icon.png"), "resources"),
 ]
+# Bundle the menu-bar glyph source + fallback PNG so tray.make_icon() finds them
+# at runtime (looked up via sys._MEIPASS/resources). Only include what exists.
+for _res in ("icon-source.png", "icon.png"):
+    _rp = RES / _res
+    if _rp.exists():
+        datas.append((str(_rp), "resources"))
+
+# macOS .app bundle icon (Finder/Dock); not used for the menu-bar glyph.
+_icns = RES / "icon.icns"
+_bundle_icon = str(_icns) if _icns.exists() else None
+
 binaries = []
 hiddenimports = []
 
@@ -55,7 +65,7 @@ exe = EXE(
     exclude_binaries=True,
     name=_name,
     console=_console,
-    icon=None,
+    icon=_bundle_icon,
 )
 coll = COLLECT(exe, a.binaries, a.datas, name=_name)
 
@@ -63,7 +73,10 @@ if sys.platform == "darwin":
     app = BUNDLE(
         coll,
         name=f"{_name}.app",
-        icon=None,
+        icon=_bundle_icon,
         bundle_identifier="dev.kiro.tray",
-        info_plist={"LSUIElement": True},
+        info_plist={
+            "LSUIElement": True,            # menu-bar only; no Dock icon
+            "NSHighResolutionCapable": True,
+        },
     )

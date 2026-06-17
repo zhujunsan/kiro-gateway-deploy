@@ -2,6 +2,7 @@
 """System-tray / menu-bar UI via pystray."""
 from __future__ import annotations
 
+import sys
 import threading
 import webbrowser
 from pathlib import Path
@@ -14,12 +15,163 @@ class TrayUnavailable(RuntimeError):
     pass
 
 
-def _load_icon():
+# ----------------------------------------------------------------------------
+# Menu-bar icon: a macOS "template image" negative-space silhouette. The source
+# icon-source.png is a "black rounded square + white k→ glyph"; the black body
+# (square minus glyph) is exactly the alpha shape we want — body opaque, glyph
+# and corners transparent. With template mode on, the system tints it: white in
+# dark menu bars (glyph knocked out to show through), inverted in light bars,
+# auto-adapting to light/dark.
+# Status is encoded by SHAPE (template drops color): bottom-right corner is a
+# knocked-out solid dot when running, a hollow ring when stopped.
+# Packaged (PyInstaller) assets come from sys._MEIPASS; from source they sit in
+# app/resources/.
+# ----------------------------------------------------------------------------
+def _asset_path(name: str) -> Path:
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        for cand in (Path(meipass) / "resources" / name, Path(meipass) / name):
+            if cand.exists():
+                return cand
+    return Path(__file__).resolve().parent.parent / "resources" / name
+
+
+# Draw on a high-res canvas and let Cocoa scale to menu-bar size; combined with
+# the Retina fix below this stays crisp.
+_TRAY_RENDER = 256
+# Transparent padding ratio: native menu-bar icons all have breathing room.
+# Content occupies 75% -> padding 12.5%.
+_TRAY_PAD = 0.125
+
+
+def _load_silhouette():
+    """Extract the negative-space silhouette alpha mask from icon-source.png.
+
+    Black body -> opaque, white glyph / outside-corners -> transparent. i.e.
+    alpha = inverted grayscale, cropped to the body bbox.
+    """
     from PIL import Image
-    icon_path = Path(__file__).parent.parent / "resources" / "icon.png"
-    if icon_path.exists():
-        return Image.open(icon_path)
-    return Image.new("RGB", (64, 64), (60, 120, 220))
+
+    src = _asset_path("icon-source.png")
+    if not src.exists():
+        src = _asset_path("icon.png")
+    if not src.exists():
+        return None
+    try:
+        gray = Image.open(src).convert("L")
+    except Exception:
+        return None
+    alpha = gray.point(lambda p: 255 - p)  # black(0)->255 opaque; white(255)->0 transparent
+    bbox = alpha.point(lambda p: 255 if p > 32 else 0).getbbox()
+    if bbox:
+        alpha = alpha.crop(bbox)
+    return alpha
+
+
+_SILHOUETTE = None
+_SILHOUETTE_LOADED = False
+
+
+def _silhouette():
+    global _SILHOUETTE, _SILHOUETTE_LOADED
+    if not _SILHOUETTE_LOADED:
+        _SILHOUETTE = _load_silhouette()
+        _SILHOUETTE_LOADED = True
+    return _SILHOUETTE
+
+
+def make_icon(running: bool):
+    """Return the template negative-space silhouette (transparent + opaque black
+    body). The system tints it automatically."""
+    from PIL import Image, ImageChops, ImageDraw
+
+    size = _TRAY_RENDER
+    canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+
+    pad = int(size * _TRAY_PAD)
+    box = size - 2 * pad
+    sil = _silhouette()
+    if sil is not None:
+        alpha = sil.resize((box, box), Image.LANCZOS)
+        body = Image.new("RGBA", (box, box), (0, 0, 0, 255))
+        body.putalpha(alpha)
+        canvas.paste(body, (pad, pad), body)
+    else:
+        ImageDraw.Draw(canvas).rounded_rectangle(
+            (pad, pad, pad + box - 1, pad + box - 1),
+            radius=int(box * 0.22),
+            fill=(0, 0, 0, 255),
+        )
+
+    # Status shape in the bottom-right corner, knocked out of the silhouette
+    # (alpha=0) so the tinted body shows the background through it.
+    # running = knocked-out solid dot; stopped = knocked-out ring. Shape-coded
+    # because template mode keeps no color.
+    overlay = Image.new("L", (size, size), 0)
+    od = ImageDraw.Draw(overlay)
+    r = int(size * 0.24)
+    x1 = size - pad
+    y1 = size - pad
+    dot = (x1 - r, y1 - r, x1, y1)
+    if running:
+        od.ellipse(dot, fill=255)  # solid = running
+    else:
+        ring = max(2, int(size * 0.05))
+        od.ellipse(dot, outline=255, width=ring)  # hollow ring = stopped
+    ca = canvas.getchannel("A")
+    knocked = ImageChops.subtract(ca, overlay)
+    canvas.putalpha(knocked)
+    return canvas
+
+
+def _install_retina_icon_fix() -> None:
+    """Fix pystray's macOS backend Retina blur.
+
+    Its _assert_image scales the image to "menu-bar thickness" pixels (~22px)
+    then builds an NSImage, which defaults to 1px=1pt, so on 2x screens it is
+    upscaled to fill 44px and goes blurry. Here we render a 44px bitmap per the
+    backingScaleFactor and setSize_ to 22pt, so the system treats it as a Retina
+    asset and draws it sharp. macOS only.
+    """
+    if sys.platform != "darwin":
+        return
+    try:
+        import io
+
+        import AppKit
+        import Foundation
+        import PIL.Image
+        from pystray import _darwin
+    except Exception:
+        return
+
+    def _assert_image(self) -> None:  # noqa: ANN001
+        thickness = self._status_bar.thickness()
+        pts = int(thickness)
+        try:
+            scale = AppKit.NSScreen.mainScreen().backingScaleFactor() or 1.0
+        except Exception:
+            scale = 2.0
+        px = max(1, int(round(thickness * scale)))
+
+        if self._icon_image and tuple(self._icon_image.size()) == (pts, pts):
+            return
+
+        source = self._icon
+        if source.size != (px, px):
+            source = source.resize((px, px), PIL.Image.LANCZOS)
+
+        b = io.BytesIO()
+        source.save(b, "png")
+        image = AppKit.NSImage.alloc().initWithData_(Foundation.NSData(b.getvalue()))
+        image.setSize_((pts, pts))
+        # template image: system tints per light/dark menu bar (negative-space
+        # silhouette), matching the design.
+        image.setTemplate_(True)
+        self._icon_image = image
+        self._status_item.button().setImage_(image)
+
+    _darwin.Icon._assert_image = _assert_image
 
 
 def _local_url(cfg) -> str:
@@ -116,6 +268,13 @@ def run() -> None:
         except Exception:
             pass
 
+    def _refresh_icon(icon):
+        # Swap the menu-bar glyph to match running/stopped state.
+        try:
+            icon.icon = make_icon(sup.status()["gateway"] == "running")
+        except Exception:
+            pass
+
     def on_start_or_restart(icon, _item):
         # Same menu slot: "启动" when stopped, "重启" when already running.
         restarting = sup.status()["gateway"] == "running"
@@ -131,12 +290,14 @@ def run() -> None:
                 _notify(icon, "Kiro Tray", f"{verb}\n{_tunnel_url(cfg)}")
             except Exception as e:
                 _notify(icon, "Kiro Tray 错误", str(e)[:200])
+            _refresh_icon(icon)
             icon.update_menu()
         threading.Thread(target=_work, daemon=True).start()
 
     def on_stop(icon, _item):
         sup.stop()
         _notify(icon, "Kiro Tray", "网关已停止")
+        _refresh_icon(icon)
         icon.update_menu()
 
     def _copy(icon, value, label):
@@ -243,7 +404,18 @@ def run() -> None:
         pystray.MenuItem("退出", on_quit),
     )
 
-    icon = pystray.Icon("kiro-tray", _load_icon(), "Kiro Gateway", menu)
-    threading.Thread(target=sup.start, daemon=True).start()
+    def _startup():
+        # Bring the gateway + tunnel up in the background, then sync the icon
+        # to whatever state we ended in (running on success, stopped on error).
+        try:
+            sup.start()
+        except Exception as e:
+            _notify(icon, "Kiro Tray 错误", str(e)[:200])
+        _refresh_icon(icon)
+        icon.update_menu()
+
+    icon = pystray.Icon("kiro-tray", make_icon(False), "Kiro Gateway", menu)
+    _install_retina_icon_fix()  # macOS only; sharp menu-bar glyph + template tint
+    threading.Thread(target=_startup, daemon=True).start()
     _kick_update_check()        # startup check; updates.check() handles 24h caching
     icon.run()
