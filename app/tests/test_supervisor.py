@@ -1,4 +1,4 @@
-from kiro_tray import supervisor, appconfig
+from kiro_gateway_tray import supervisor, appconfig
 
 
 class _FakeGateway:
@@ -16,10 +16,10 @@ class _FakeTunnel:
 
 
 def _make_sup(monkeypatch, tmp_path, provisioned=True):
-    monkeypatch.setenv("KIRO_TRAY_HOME", str(tmp_path))
+    monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
     cfg = appconfig.load()
     if provisioned:
-        cfg.cloudflare.hostname = "kg-test.botsonny.top"
+        cfg.cloudflare.hostname = "kg-test.example.com"
         cfg.cloudflare.run_token = "eyJ_test"
         appconfig.save(cfg)
     s = supervisor.Supervisor(gateway=_FakeGateway(), tunnel=_FakeTunnel())
@@ -32,7 +32,7 @@ def test_start_provisioned(monkeypatch, tmp_path):
     s.start()
     assert s.gateway.is_alive() is True
     assert s.tunnel.is_alive() is True
-    assert s.status()["hostname"] == "kg-test.botsonny.top"
+    assert s.status()["hostname"] == "kg-test.example.com"
 
 
 def test_start_not_provisioned_no_callback_raises(monkeypatch, tmp_path):
@@ -48,14 +48,14 @@ def test_start_not_provisioned_with_callback(monkeypatch, tmp_path):
     s = _make_sup(monkeypatch, tmp_path, provisioned=False)
 
     def fake_provision(cfg):
-        cfg.cloudflare.hostname = "kg-cb.botsonny.top"
+        cfg.cloudflare.hostname = "kg-cb.example.com"
         cfg.cloudflare.run_token = "eyJ_cb"
         appconfig.save(cfg)
         raise StopIteration("mock provision complete")
 
     # Patch provision.run to avoid real HTTP call
-    import kiro_tray.provision as pmod
-    monkeypatch.setattr(pmod, "run", lambda cfg, secret: ("kg-cb.botsonny.top", "eyJ_cb"))
+    import kiro_gateway_tray.provision as pmod
+    monkeypatch.setattr(pmod, "run", lambda cfg, secret: ("kg-cb.example.com", "eyJ_cb"))
     s.provision_callback = lambda cfg: "fake-secret"
     s.start()
     assert s.gateway.is_alive() is True

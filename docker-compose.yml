@@ -1,29 +1,36 @@
 services:
   kiro-gateway:
-    # Pinned: patches in ./patches are verified against this exact upstream build.
-    # 升级前先确认新版的 config.py / model_resolver.py / main.py 结构没变（详见 README 故障排查），
-    # 再改成新的 main-<sha> 并重新验证。对应 digest: sha256:0ee8cba3...c54f573d
-    image: ghcr.io/jwadow/kiro-gateway:main-a5292ca
+    # Fork ghcr.io/zhujunsan/kiro-gateway has the four Cursor-backend changes
+    # (kiro-* aliases, GET /usage, OpenAI tool_use content blocks, keep-system
+    # -prompt trim) baked into the source, so no start-time patching is needed.
+    # 升级：在 fork 的 main 上 rebase 上游、推送后 CI 产出新的 main-<sha> tag，改这里即可。
+    image: ghcr.io/zhujunsan/kiro-gateway:main-0936303
     container_name: kiro-gateway
     ports:
       - "${KIRO_GATEWAY_PORT:-18000}:8000"
     volumes:
       - "${HOME}/.aws/sso/cache:/home/kiro/.aws/sso/cache"
-      - "./patches/apply_aliases.py:/patches/apply_aliases.py:ro"
-      - "./patches/add_usage_endpoint.py:/patches/add_usage_endpoint.py:ro"
     environment:
       KIRO_CREDS_FILE: /home/kiro/.aws/sso/cache/kiro-auth-token.json
       KIRO_API_REGION: ${KIRO_API_REGION:-us-east-1}
       PROFILE_ARN: ${PROFILE_ARN}
       PROXY_API_KEY: ${PROXY_API_KEY}
       FAKE_REASONING: ${FAKE_REASONING:-false}
-    command:
-      - sh
-      - -ec
-      - |
-        python /patches/apply_aliases.py
-        python /patches/add_usage_endpoint.py
-        exec python main.py
+      # Cursor 优化：Agent 模式上下文 + 工具定义很大，下面这几个针对性调过。
+      # 自动裁剪超大 payload，避免撞 Kiro ~615KB 上限报 "Improperly formed request"。
+      AUTO_TRIM_PAYLOAD: ${AUTO_TRIM_PAYLOAD:-true}
+      KIRO_MAX_PAYLOAD_BYTES: ${KIRO_MAX_PAYLOAD_BYTES:-600000}
+      # 上游流式中途截断时让模型自感知并改写更小的输出（默认就是 true，显式固定）。
+      TRUNCATION_RECOVERY: ${TRUNCATION_RECOVERY:-true}
+      # 关掉自动注入的 web_search 工具：Cursor 自己管理工具集，多塞一个会干扰 tool calling。
+      WEB_SEARCH_ENABLED: ${WEB_SEARCH_ENABLED:-false}
+      # 带大上下文时首 token 容易慢，调大超时避免被过早掐断重试。
+      FIRST_TOKEN_TIMEOUT: ${FIRST_TOKEN_TIMEOUT:-30}
+      STREAMING_READ_TIMEOUT: ${STREAMING_READ_TIMEOUT:-300}
+      # 排查开关（默认关闭）：需要抓包时临时 `DEBUG_MODE=errors`（只落盘失败请求）
+      # 或 `DEBUG_MODE=all`（每次请求覆盖落盘到 /app/debug_logs），配 `LOG_LEVEL=DEBUG`。
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      DEBUG_MODE: ${DEBUG_MODE:-off}
     restart: unless-stopped
 
   cloudflared:

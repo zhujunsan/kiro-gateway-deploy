@@ -1,30 +1,30 @@
-from kiro_tray import appconfig
+from kiro_gateway_tray import appconfig
 
 
 def test_defaults_roundtrip(tmp_path, monkeypatch):
-    monkeypatch.setenv("KIRO_TRAY_HOME", str(tmp_path))
+    monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
     cfg = appconfig.load()
-    assert cfg.gateway.port == 18000
+    assert cfg.gateway.port == 64005
     assert cfg.cloudflare.hostname == ""
     assert cfg.cloudflare.run_token == ""
     assert appconfig.path().exists()
 
 
 def test_edit_and_reload(tmp_path, monkeypatch):
-    monkeypatch.setenv("KIRO_TRAY_HOME", str(tmp_path))
+    monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
     cfg = appconfig.load()
     cfg.gateway.proxy_api_key = "secret123"
-    cfg.cloudflare.hostname = "kg-alice.botsonny.top"
+    cfg.cloudflare.hostname = "kg-alice.example.com"
     cfg.cloudflare.run_token = "eyJ_test"
     appconfig.save(cfg)
     again = appconfig.load()
     assert again.gateway.proxy_api_key == "secret123"
-    assert again.cloudflare.hostname == "kg-alice.botsonny.top"
+    assert again.cloudflare.hostname == "kg-alice.example.com"
     assert again.cloudflare.run_token == "eyJ_test"
 
 
 def test_to_env_maps_known_keys(tmp_path, monkeypatch):
-    monkeypatch.setenv("KIRO_TRAY_HOME", str(tmp_path))
+    monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
     cfg = appconfig.load()
     cfg.gateway.profile_arn = "arn:x"
     cfg.gateway.proxy_api_key = "k"
@@ -32,14 +32,29 @@ def test_to_env_maps_known_keys(tmp_path, monkeypatch):
     assert env["PROFILE_ARN"] == "arn:x"
     assert env["PROXY_API_KEY"] == "k"
     assert env["SERVER_HOST"] == "127.0.0.1"
-    assert env["SERVER_PORT"] == "18000"
+    assert env["SERVER_PORT"] == "64005"
     assert env["FAKE_REASONING"] == "false"
 
 
+def test_legacy_fake_reasoning_migrates_to_extra(tmp_path, monkeypatch):
+    monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
+    cfg = appconfig.load()
+    p = appconfig.path()
+    p.write_text(
+        '[gateway]\nfake_reasoning = true\n\n[gateway_extra]\nAUTO_TRIM_PAYLOAD = "true"\n',
+        encoding="utf-8",
+    )
+    again = appconfig.load()
+    assert not hasattr(again.gateway, "fake_reasoning")
+    assert again.gateway_extra["FAKE_REASONING"] == "true"
+    env = appconfig.to_gateway_env(again)
+    assert env["FAKE_REASONING"] == "true"
+
+
 def test_is_provisioned(tmp_path, monkeypatch):
-    monkeypatch.setenv("KIRO_TRAY_HOME", str(tmp_path))
+    monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
     cfg = appconfig.load()
     assert appconfig.is_provisioned(cfg) is False
-    cfg.cloudflare.hostname = "kg-alice.botsonny.top"
+    cfg.cloudflare.hostname = "kg-alice.example.com"
     cfg.cloudflare.run_token = "eyJ_test"
     assert appconfig.is_provisioned(cfg) is True

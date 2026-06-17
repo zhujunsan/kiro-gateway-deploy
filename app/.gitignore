@@ -1,4 +1,4 @@
-kiro_tray/vendor/
+kiro_gateway_tray/vendor/
 resources/cloudflared/
 build/
 dist/

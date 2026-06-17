@@ -1,10 +1,11 @@
-# app/kiro_tray/cloudflared.py
+# app/kiro_gateway_tray/cloudflared.py
 """Locate the cloudflared binary and manage the cloudflared child process."""
 from __future__ import annotations
 
 import platform
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 from . import paths
@@ -48,17 +49,44 @@ class CloudflaredProcess:
 
     def __init__(self) -> None:
         self._proc: subprocess.Popen | None = None
+        self._connected = False
+        self._reader: threading.Thread | None = None
 
     def start(self, cfg: AppCfg) -> None:
         run_token = cfg.cloudflare.run_token
         if not run_token:
             raise RuntimeError("cloudflare.run_token 未设置，请先完成首启注册。")
+        self._connected = False
+        cmd = [str(binary_path()), "tunnel", "--no-autoupdate"]
+        protocol = getattr(cfg.cloudflare, "protocol", "") or "http2"
+        if protocol:
+            cmd += ["--protocol", protocol]
+        cmd += ["run", "--token", run_token]
         self._proc = subprocess.Popen(
-            [str(binary_path()), "tunnel", "--no-autoupdate", "run", "--token", run_token],
+            cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
         )
+        self._reader = threading.Thread(target=self._watch_output, daemon=True)
+        self._reader.start()
+
+    def _watch_output(self) -> None:
+        """Read cloudflared output, detect connection status, and write to log file."""
+        from . import paths
+        proc = self._proc
+        if not proc or not proc.stdout:
+            return
+        log_path = paths.log_dir() / "cloudflared.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "w", encoding="utf-8") as f:
+            for line in proc.stdout:
+                f.write(line)
+                f.flush()
+                if "Registered tunnel connection" in line:
+                    self._connected = True
+                elif "Unregistered tunnel connection" in line:
+                    self._connected = False
 
     def stop(self) -> None:
         if self._proc and self._proc.poll() is None:
@@ -67,6 +95,10 @@ class CloudflaredProcess:
                 self._proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 self._proc.kill()
+        self._connected = False
 
     def is_alive(self) -> bool:
         return bool(self._proc and self._proc.poll() is None)
+
+    def is_connected(self) -> bool:
+        return self._connected

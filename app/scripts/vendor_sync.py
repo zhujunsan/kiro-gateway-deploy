@@ -12,9 +12,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from kiro_tray import UPSTREAM_REPO, UPSTREAM_SHA  # noqa: E402
+from kiro_gateway_tray import UPSTREAM_REPO, UPSTREAM_SHA  # noqa: E402
 
-VENDOR = ROOT / "kiro_tray" / "vendor"
+VENDOR = ROOT / "kiro_gateway_tray" / "vendor"
 COPY_ITEMS = ["main.py", "kiro", "requirements.txt"]
 
 

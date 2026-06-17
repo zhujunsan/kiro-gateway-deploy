@@ -1,5 +1,5 @@
 [project]
-name = "kiro-tray"
+name = "kiro-gateway-tray"
 version = "0.1.0"
 description = "Cross-platform tray app for kiro-gateway (no Docker)"
 requires-python = ">=3.11"

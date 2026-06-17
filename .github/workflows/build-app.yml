@@ -36,6 +36,18 @@ jobs:
             gobject-introspection libcairo2-dev pkg-config
         working-directory: ${{ github.workspace }}
 
+      - name: Install packaging tools (macOS – create-dmg)
+        if: runner.os == 'macOS'
+        run: brew install create-dmg
+
+      - name: Fetch appimagetool (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p build
+          curl -fsSL -o build/appimagetool-x86_64.AppImage \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x build/appimagetool-x86_64.AppImage
+
       - name: Install build deps
         run: |
           python -m pip install --upgrade pip
@@ -50,8 +62,32 @@ jobs:
       - name: Run tests
         run: python -m pytest -q
 
+      - name: Inject repo metadata
+        env:
+          UPSTREAM_REPO_OVERRIDE: ${{ vars.UPSTREAM_REPO || '' }}
+          UPSTREAM_SHA_OVERRIDE: ${{ vars.UPSTREAM_SHA || '' }}
+        run: |
+          python -c "
+          import re, os
+          f = 'kiro_gateway_tray/__init__.py'
+          txt = open(f).read()
+          repo = os.environ['GITHUB_REPOSITORY']
+          tag = os.environ.get('GITHUB_REF_NAME', '')
+          txt = re.sub(r'GITHUB_REPO = \"[^\"]+\"', f'GITHUB_REPO = \"{repo}\"', txt)
+          if tag.startswith('app-v'):
+              ver = tag.removeprefix('app-v')
+              txt = re.sub(r'__version__ = \"[^\"]+\"', f'__version__ = \"{ver}\"', txt)
+          upstream_repo = os.environ.get('UPSTREAM_REPO_OVERRIDE', '')
+          if upstream_repo:
+              txt = re.sub(r'UPSTREAM_REPO = \"[^\"]+\"', f'UPSTREAM_REPO = \"{upstream_repo}\"', txt)
+          upstream_sha = os.environ.get('UPSTREAM_SHA_OVERRIDE', '')
+          if upstream_sha:
+              txt = re.sub(r'UPSTREAM_SHA = \"[^\"]+\"', f'UPSTREAM_SHA = \"{upstream_sha}\"', txt)
+          open(f, 'w').write(txt)
+          "
+
       - name: Build with PyInstaller
-        run: pyinstaller packaging/kiro_tray.spec --noconfirm
+        run: pyinstaller packaging/kiro_gateway_tray.spec --noconfirm
 
       - name: Package dist
         run: python packaging/make_dist.py
@@ -59,7 +95,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: kiro-tray-${{ matrix.os }}
+          name: kiro-gateway-tray-${{ matrix.os }}
           path: app/release/*
 
   release:

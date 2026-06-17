@@ -20,7 +20,9 @@
 
 Cursor 支持自定义 OpenAI 兼容的 API 地址，但有几个坑：
 
-1. **需要公网地址**：Cursor 会先把请求发回自己的服务器，再转发到你指定的目标地址——所以本地部署的服务 Cursor 根本到不了。本项目用 Cloudflare Tunnel 把网关暴露到公网。
+1. **需要公网地址**：Cursor 会先把请求发回自己的服务器，再转发到你指定的目标地址——所以本地部署的服务 Cursor 根本到不了。本项目提供两种把网关暴露到公网的方式，二选一或都开：
+   - **Cloudflare Tunnel**：不需要自己的服务器，但要一个托管在 Cloudflare 的域名（域名可在别处买，改 NS 到 Cloudflare 免费版即可）。
+   - **自建 frps 转发**：你自己有一台带公网 IP 的服务器并跑了 frps，用 frpc 把网关反代出去。大陆服务器也能用。
 
 2. **只能走 OpenAI 兼容协议，且 `claude-*` 模型名有特殊处理**：Cursor 只允许自定义 OpenAI 地址，不能自定义 Anthropic 地址。而且对 `claude` 开头的模型名做了特殊路由——即使你把它加到自定义模型列表里，请求仍然不走你的 OpenAI 兼容地址。所以需要给模型起别名（`kiro-sonnet-4.6`、`kiro-opus-4.6` 等），让 Cursor 认为这是一个未知模型，走你的自定义地址。另外上游 `ListModels` 里没有 opus 4.8，也顺手补上了。
 
@@ -32,21 +34,45 @@ Cursor 支持自定义 OpenAI 兼容的 API 地址，但有几个坑：
 
 Mac 上推荐 [OrbStack](https://orbstack.dev/)（轻量替代 Docker Desktop），安装后开箱即用，自带 `docker` 和 `docker compose` 命令。
 
-### 2. 准备 Cloudflare Tunnel
+### 2. 准备公网入口（二选一）
 
-需要一个公网入口。去 [Cloudflare Zero Trust](https://one.dash.cloudflare.com/) 控制台：
+Cursor 后端在海外，需要能访问到一个稳定的公网地址，再由它打回你本机的网关。下面两种方式选一个即可（也可以都配，用 `COMPOSE_PROFILES` 控制启用哪个，见步骤 3）。
+
+#### 方式 A：Cloudflare Tunnel
+
+不需要自己的服务器，但要一个托管在 Cloudflare 的域名（域名可在别处买，改 NS 指到 Cloudflare 免费版即可）。去 [Cloudflare Zero Trust](https://one.dash.cloudflare.com/) 控制台：
 
 1. 左侧 Networks → Tunnels → Create a tunnel
 2. 选 Cloudflared，取个名字，创建后会给你一个 tunnel token（`eyJ...` 开头的长串）
 3. 在 Public Hostname 里添加一条：域名指向 `http://kiro-gateway:8000`（这是 compose 内部的服务名）
 
-记下 tunnel token，后面要用。
+记下 tunnel token，后面填到 `.env` 的 `CLOUDFLARED_TOKEN`。最终 Base URL 是 `https://<your-cloudflare-domain>/v1`。
 
-### 2. 准备 Kiro 凭据
+#### 方式 B：自建 frps 转发
+
+你自己有一台带公网 IP 的服务器并跑了 frps（大陆服务器也能用），用 frpc 把网关反代出去。
+
+1. 在 frps 服务器上准备 `frps.toml` 并启动，至少包含：
+
+   ```toml
+   bindPort = 7000
+   auth.method = "token"
+   auth.token = "<和 frpc 一致的强随机串>"
+   ```
+
+   放行入站端口：frps 的 `bindPort`（默认 7000）和你要暴露网关的 `FRP_REMOTE_PORT`（默认 8080）。
+
+2. 本机这侧的 frpc 已在 `docker-compose.yml` 里配好，配置模板见 `frpc/frpc.toml`，只需在 `.env` 填 `FRP_SERVER_ADDR` / `FRP_TOKEN` 等变量（见步骤 3）。
+
+最终 Base URL：
+- 纯 TCP 直出：`http://<frps-ip>:<FRP_REMOTE_PORT>/v1`（明文传输，`PROXY_API_KEY` 务必用强随机串）
+- 若在 frps 侧再挂一层带证书的反代（如 Caddy/Nginx）走域名：`https://<your-domain>/v1`（推荐）
+
+### 3. 准备 Kiro 凭据
 
 本机需要已完成 Kiro SSO 登录，确保 `~/.aws/sso/cache/kiro-auth-token.json` 存在。直接打开 Kiro IDE 登录一次即可。
 
-### 3. 配置并启动
+### 4. 配置并启动
 
 ```bash
 git clone https://github.com/zhujunsan/kiro-gateway-deploy.git
@@ -55,12 +81,28 @@ cp .env.example .env
 open -e .env
 ```
 
-填入三项：
+公共项（两种隧道都要填）：
 
 ```
 PROFILE_ARN=arn:aws:codewhisperer:us-east-1:<account>:profile/<id>
 PROXY_API_KEY=<给客户端用的鉴权 key，自己生成一个强随机串>
-CLOUDFLARED_TOKEN=<上一步拿到的 tunnel token>
+```
+
+再用 `COMPOSE_PROFILES` 选择启用哪个隧道，并填对应变量：
+
+```
+# 只用 Cloudflare
+COMPOSE_PROFILES=cloudflare
+CLOUDFLARED_TOKEN=<方式 A 拿到的 tunnel token>
+
+# 只用 frps
+COMPOSE_PROFILES=frp
+FRP_SERVER_ADDR=<frps 服务器公网 IP 或域名>
+FRP_TOKEN=<和 frps.toml 里 auth.token 一致的串>
+# 可选：FRP_SERVER_PORT（默认 7000）、FRP_REMOTE_PORT（默认 8080）
+
+# 两个都开
+COMPOSE_PROFILES=cloudflare,frp
 ```
 
 启动：
@@ -69,28 +111,33 @@ CLOUDFLARED_TOKEN=<上一步拿到的 tunnel token>
 docker compose up -d
 ```
 
-查看日志确认 patch 成功：
+查看日志确认网关起来了：
 
 ```bash
-docker compose logs kiro-gateway | grep '\[ok\]'
+docker compose logs kiro-gateway | tail -20
 ```
 
-正常应输出三行 `[ok] patched ...`。
+正常应看到 uvicorn 监听 `:8000`、healthcheck 通过。隧道日志可按需查看：`docker compose logs -f cloudflared` 或 `docker compose logs -f frpc`。
 
-### 4. 配置 Cursor
+### 5. 配置 Cursor
 
 Cursor Settings → Models → OpenAI API Key & Base URL：
 
 - **API Key**: 填你 `.env` 里设的 `PROXY_API_KEY`
-- **Base URL**: `https://<your-cloudflare-domain>/v1`
+- **Base URL**: 按你用的隧道填：
+  - Cloudflare：`https://<your-cloudflare-domain>/v1`
+  - frps 纯 TCP 直出：`http://<frps-ip>:<FRP_REMOTE_PORT>/v1`
+  - frps + 域名反代：`https://<your-domain>/v1`
 
 然后在模型列表里添加你想用的别名（见下表），就可以在 Cursor 里选这些模型了。
 
-### 5. 验证
+### 6. 验证
+
+把 `<base-url>` 换成上一步的地址：
 
 ```bash
 curl -H "Authorization: Bearer $PROXY_API_KEY" \
-     https://<your-cloudflare-domain>/v1/models
+     <base-url>/models
 ```
 
 ## 可用模型
@@ -105,7 +152,7 @@ curl -H "Authorization: Bearer $PROXY_API_KEY" \
 | `kiro-sonnet-4.5` | `claude-sonnet-4.5` |
 | `kiro-haiku-4.5` | `claude-haiku-4.5` |
 
-要修改别名，编辑 `patches/apply_aliases.py` 中的 `EXTRA_ALIASES`，然后 `docker compose down && docker compose up -d`。
+要修改别名，编辑 fork（[`zhujunsan/kiro-gateway`](https://github.com/zhujunsan/kiro-gateway)）`kiro/config.py` 里的 `MODEL_ALIASES`，推送后 CI 产出新镜像 tag，再改 `docker-compose.yml` 的 `image:`。
 
 ## 查额度（`GET /usage`）
 
@@ -136,12 +183,16 @@ curl -H "Authorization: Bearer $PROXY_API_KEY" http://localhost:18000/usage
 
 ### 工作原理
 
-本项目基于 [`ghcr.io/jwadow/kiro-gateway`](https://github.com/jwadow/kiro-gateway) 镜像，启动时通过两个 Python 脚本 patch 容器内的源码：
+本项目基于 [`ghcr.io/zhujunsan/kiro-gateway`](https://github.com/zhujunsan/kiro-gateway) 镜像 —— 这是上游 [`jwadow/kiro-gateway`](https://github.com/jwadow/kiro-gateway) 的 fork，把针对 Cursor 后端的四处改动直接写进了源码（不再靠启动时 patch）：
 
-1. `patches/apply_aliases.py` — 注入 `kiro-*` 模型别名到 `config.py` 和 `model_resolver.py`
-2. `patches/add_usage_endpoint.py` — 注入 `GET /usage` 端点到 `main.py`
+1. `kiro/config.py` + `kiro/model_resolver.py` — 注册 `kiro-*` 模型别名，并让 `get_model_id_for_kiro()`（转换器热路径）识别别名
+2. `main.py` — 新增 `GET /usage` 端点（走 Amazon Q `getUsageLimits`）
+3. `kiro/converters_openai.py` — OpenAI 适配器回退解析 Anthropic 风格的 `tool_use` content block，避免工具调用历史被降级成纯文本
+4. `kiro/payload_guards.py` — 裁剪超大 payload 时固定 `history[0]`，避免折叠进去的 system prompt 被裁掉
 
-Patch 是幂等的（有 sentinel 标记），`restart` 不会重复打，但修改 patch 脚本后必须 `down && up` 重建容器。
+fork 的 CI（`.github/workflows/docker.yml`）在 push 到 main 时自动构建并推送多架构镜像，tag 为 `main-<sha>` 与 `latest`。
+
+> `patches/` 目录保留作参考 —— 这四处改动最初就是以启动时 patch 的形式在这里验证的，现已原样落进 fork 源码。运行时不再挂载或执行它们；改逻辑请直接改 fork 源码。
 
 ### 目录结构
 
@@ -152,11 +203,15 @@ Patch 是幂等的（有 sentinel 标记），`restart` 不会重复打，但修
 ├── .env.example                # 占位模板
 ├── .gitignore
 ├── README.md
+├── frpc/
+│   └── frpc.toml               # frpc 配置模板（用 FRP_* 环境变量渲染）
 ├── tools/
 │   └── check_usage.py          # 独立脚本：不依赖容器，直接读 token 查额度
-└── patches/
-    ├── apply_aliases.py        # 启动时 patch：注入 kiro-* 模型别名
-    └── add_usage_endpoint.py   # 启动时 patch：注入 GET /usage 端点
+└── patches/                    # 参考存档：fork 源码改动的来源（运行时不再使用）
+    ├── apply_aliases.py
+    ├── add_usage_endpoint.py
+    ├── fix_trim_keep_system.py
+    └── fix_openai_tooluse_blocks.py
 ```
 
 ### 配置项
@@ -167,7 +222,12 @@ Patch 是幂等的（有 sentinel 标记），`restart` 不会重复打，但修
 |---|---|---|---|
 | `PROFILE_ARN` | 是 | — | CodeWhisperer profile ARN |
 | `PROXY_API_KEY` | 是 | — | 客户端调用网关时的 Bearer token |
-| `CLOUDFLARED_TOKEN` | 是 | — | Cloudflare Tunnel token |
+| `COMPOSE_PROFILES` | 否 | `cloudflare` | 启用哪个隧道：`cloudflare` / `frp` / `cloudflare,frp` |
+| `CLOUDFLARED_TOKEN` | 视隧道 | — | Cloudflare Tunnel token（用 cloudflare 时必填） |
+| `FRP_SERVER_ADDR` | 视隧道 | — | frps 服务器公网 IP 或域名（用 frp 时必填） |
+| `FRP_TOKEN` | 视隧道 | — | frpc ↔ frps 鉴权 token，需与 frps.toml 一致（用 frp 时必填） |
+| `FRP_SERVER_PORT` | 否 | `7000` | frps 的 `bindPort` |
+| `FRP_REMOTE_PORT` | 否 | `8080` | frps 上暴露网关的公网端口 |
 | `KIRO_GATEWAY_PORT` | 否 | `18000` | 宿主机暴露端口 |
 | `KIRO_API_REGION` | 否 | `us-east-1` | Kiro / CodeWhisperer 区域 |
 | `TUNNEL_TRANSPORT_PROTOCOL` | 否 | `http2` | Cloudflare 隧道传输协议 |
@@ -177,64 +237,51 @@ Patch 是幂等的（有 sentinel 标记），`restart` 不会重复打，但修
 ```bash
 docker compose up -d                 # 启动
 docker compose down                  # 停止并移除容器
-docker compose restart kiro-gateway  # 重启网关（不重跑 patch）
+docker compose restart kiro-gateway  # 重启网关
 docker compose logs -f kiro-gateway  # 跟随网关日志
-docker compose logs -f cloudflared   # 跟随隧道日志
+docker compose logs -f cloudflared   # 跟随 Cloudflare 隧道日志（用 cloudflare 时）
+docker compose logs -f frpc          # 跟随 frpc 日志（用 frp 时）
 docker compose ps                    # 查看健康状态
 ```
 
 > 镜像 tag 已在 `docker-compose.yml` 里固定（pin 到某个 `main-<sha>`），所以 `docker compose pull` 拿到的还是同一个版本，不会自动升级。升级方法见下方「升级上游镜像」。
 
-### 升级上游镜像
+### 升级
 
-镜像被刻意 pin 在 `docker-compose.yml` 里的 `main-<sha>`，因为 `patches/` 下的补丁是针对这个特定构建验证过的。直接升到新版可能让 patch 锚点失效、容器起不来（这是预期的「响亮失败」——patch 对不上会直接 `sys.exit`，不会静默跑错）。
+镜像被刻意 pin 在 `docker-compose.yml` 里的 `main-<sha>`。升级有两种情况：
 
-升级步骤：
+**只想拿 fork 的新构建**（已有改动的小修）：在 fork 仓库 push 后，CI 产出新的 `main-<sha>` tag，把 `docker-compose.yml` 的 `image:` 改成新 tag，`docker compose down && docker compose up -d` 重建即可。
 
-1. 在 [上游 commits](https://github.com/jwadow/kiro-gateway/commits/main) 找到想升级到的提交，取它的短 sha，对应镜像 tag 即 `main-<短sha>`。
-2. 改 `docker-compose.yml` 里的 `image:` 为新 tag，`docker compose down && docker compose up -d` 重建。
-3. 看日志确认三条 patch 都 `[ok]`：
+**想同步上游新版本**：在 fork（`zhujunsan/kiro-gateway`）把上游 `jwadow/kiro-gateway` 的 main rebase/merge 进来。四处改动现在是源码里的正常 commit，大概率能干净合并；若上游改了相同位置产生冲突，正常解决冲突即可（不会再有「patch 锚点失配」那种脆弱性）。推送后 CI 出新 tag，再改 `docker-compose.yml`。
 
-   ```bash
-   docker compose logs -f kiro-gateway
-   ```
+升级后看日志确认起得来：
 
-   若出现 `MODEL_ALIASES not found` / `get_model_id_for_kiro body not found` / `app.include_router not found`，说明上游结构变了，按「故障排查」对应条目调整 patch 脚本的锚点后再重建。
+```bash
+docker compose logs -f kiro-gateway
+```
 
 ### 故障排查
 
-**`config.py: MODEL_ALIASES not found`**
-
-上游镜像结构变了。进容器确认：
-
-```bash
-docker compose run --rm --entrypoint python kiro-gateway -c "import kiro.config; print([k for k in dir(kiro.config) if 'ALIAS' in k])"
-```
-
-**`model_resolver.py: get_model_id_for_kiro body not found`**
-
-上游改了函数体。进容器确认：
-
-```bash
-docker compose run --rm --entrypoint python kiro-gateway -c "import inspect, kiro.model_resolver as m; print(inspect.getsource(m.get_model_id_for_kiro))"
-```
-
-**`main.py: app.include_router not found`**
-
-上游改了 `main.py` 结构。进容器确认：
-
-```bash
-docker compose run --rm --entrypoint python kiro-gateway -c "import main; print([r.path for r in main.app.routes])"
-```
-
-**healthcheck 不过 / cloudflared 起不来**
+**healthcheck 不过 / 隧道起不来**
 
 ```bash
 docker compose ps
 docker compose logs --tail=200 kiro-gateway
+docker compose logs --tail=200 cloudflared   # 用 cloudflare 时
+docker compose logs --tail=200 frpc          # 用 frp 时
 ```
 
 常见原因：SSO token 失效（重新登录 Kiro）、`PROFILE_ARN` 写错、AWS 网络不通。
+
+**frpc 连不上 frps**
+
+进 `frpc` 日志看报错：
+
+```bash
+docker compose logs --tail=200 frpc
+```
+
+常见原因：`FRP_SERVER_ADDR`/`FRP_SERVER_PORT` 写错、frps 的 `bindPort` 未放行、`FRP_TOKEN` 与 frps.toml 的 `auth.token` 不一致、`FRP_REMOTE_PORT` 在 frps 上未放行或被占用。
 
 **SSO token 过期**
 
@@ -244,9 +291,9 @@ docker compose logs --tail=200 kiro-gateway
 
 - `.env` 永远不要提交到 git，模板见 `.env.example`
 - `PROXY_API_KEY` 建议用 `openssl rand -hex 32` 生成强随机串，不要用弱密码
-- patch 脚本是幂等的，`restart` 不会重复打补丁，但修改 patch 后必须 `down && up`
-- 镜像 tag 已 pin，不会自动升级；升级步骤见「升级上游镜像」
-- `/usage` 和聊天接口共用 `PROXY_API_KEY`，也会经 cloudflared 暴露到公网
+- 镜像 tag 已 pin，不会自动升级；升级步骤见「升级」
+- `/usage` 和聊天接口共用 `PROXY_API_KEY`，也会经隧道（cloudflared / frpc）暴露到公网
+- frps 纯 TCP 直出走的是明文 `http`，`PROXY_API_KEY` 会明文传输；介意的话用域名 + HTTPS（在 frps 侧挂 Caddy/Nginx 反代签证书），并给 frpc ↔ frps 设 `FRP_TOKEN`
 - 启用本方案后，Cursor 里的官方 OpenAI 模型（GPT 系列）将无法使用，详见文首「重要限制」
 
 ## 致谢

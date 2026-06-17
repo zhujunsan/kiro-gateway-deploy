@@ -1,4 +1,4 @@
-# app/kiro_tray/usage.py
+# app/kiro_gateway_tray/usage.py
 """Query the gateway's own GET /usage endpoint on localhost."""
 from __future__ import annotations
 
@@ -51,5 +51,17 @@ def format_menu_line(data: dict) -> str:
     line = f"{b.get('used', 0)} / {b.get('limit', 0)}"
     cost = data.get("overageCostUsd", 0) or 0
     if cost > 0:
-        line += f" (+${cost})"
+        line += f" (${cost})"
     return line
+
+
+def fetch_models(timeout: float = 10.0) -> list[str]:
+    """Return sorted list of model IDs from the gateway's /v1/models endpoint."""
+    cfg = appconfig.load()
+    url = f"http://127.0.0.1:{cfg.gateway.port}/v1/models"
+    headers = {"Authorization": f"Bearer {cfg.gateway.proxy_api_key}"}
+    resp = httpx.get(url, headers=headers, timeout=timeout)
+    if resp.status_code != 200:
+        raise RuntimeError(f"/v1/models returned {resp.status_code}")
+    data = resp.json().get("data") or []
+    return sorted(m["id"] for m in data if "id" in m)

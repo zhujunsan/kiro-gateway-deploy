@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 把现有依赖 Docker 的 kiro-gateway 部署，重做成一个 Mac / Windows / Linux(Ubuntu 24.04+) 都能用的本地托盘 App：进程内跑网关，子进程跑 cloudflared 隧道，无需 Docker、无需本机预装 Python。用户打开 App、填 Kiro token 位置、首次输入一次性共享密钥，App 自动向你部署的 Cloudflare Worker 签发一个专属子域名（`kg-<username>.botsonny.top`），此后每次启动直接连通，无需任何手工操作。
+**Goal:** 把现有依赖 Docker 的 kiro-gateway 部署，重做成一个 Mac / Windows / Linux(Ubuntu 24.04+) 都能用的本地托盘 App：进程内跑网关，子进程跑 cloudflared 隧道，无需 Docker、无需本机预装 Python。用户打开 App、填 Kiro token 位置、首次输入一次性共享密钥，App 自动向你部署的 Cloudflare Worker 签发一个专属子域名（`kg-<username>.example.com`），此后每次启动直接连通，无需任何手工操作。
 
 **Architecture:**
 
@@ -19,7 +19,7 @@ Cloudflare Worker（你部署，用户永远接触不到）
   └── 存 KV（username → tunnel_id），返回 run_token 给 App
 
 公网访问路径：
-  Cursor（海外）→ https://kg-alice.botsonny.top/v1 → Cloudflare → cloudflared → App 内网关
+  Cursor（海外）→ https://kg-alice.example.com/v1 → Cloudflare → cloudflared → App 内网关
 ```
 
 App 在构建期把上游 `jwadow/kiro-gateway`(pin 在 `a5292ca`) 的源码 vendor 进来并打补丁(注入 `kiro-*` 别名 + `/usage` 端点)；运行期先把用户配置翻译成环境变量、chdir 到可写数据目录，再在后台线程里用 uvicorn 跑 `main:app`，同时把 cloudflared 官方二进制作为子进程拉起。托盘 UI 用 `pystray`(三平台同一套代码)，检测不到托盘时(典型是 Ubuntu/GNOME)自动退化成 CLI 模式。出包交给 GitHub Actions：三平台 matrix workflow，打 tag 时自动发 Release。
@@ -148,7 +148,7 @@ app/                                  # 本地托盘 App
 
 在 [dash.cloudflare.com/profile/api-tokens](https://dash.cloudflare.com/profile/api-tokens) 创建 **Custom Token**，勾选：
 - `Account / Cloudflare Tunnel / Edit`（建删 tunnel）
-- `Zone / DNS / Edit`（限定 `botsonny.top` 这个 zone，建 CNAME 记录）
+- `Zone / DNS / Edit`（限定 `example.com` 这个 zone，建 CNAME 记录）
 
 不要用 Global API Key。
 
@@ -161,20 +161,20 @@ app/                                  # 本地托盘 App
 
 2. PUT /accounts/{CF_ACCOUNT_ID}/cfd_tunnel/{tunnel_id}/configurations
    body: { config: { ingress: [
-     { hostname: "kg-<username>.botsonny.top", service: "http://localhost:18000" },
+     { hostname: "kg-<username>.example.com", service: "http://localhost:18000" },
      { service: "http_status:404" }
    ]}}
    → 配置 ingress（⚠️ 不会自动建 DNS 记录）
 
 3. POST /zones/{CF_ZONE_ID}/dns_records
    body: { type: "CNAME", proxied: true,
-           name: "kg-<username>.botsonny.top",
+           name: "kg-<username>.example.com",
            content: "<tunnel_id>.cfargotunnel.com" }
    → 建 CNAME，proxied:true 必须，否则 HTTPS 不通
 
 4. KV.put("user:<username>", JSON.stringify({ tunnel_id, hostname, created_at }))
 
-5. 返回 { hostname: "kg-<username>.botsonny.top", run_token: "eyJ..." }
+5. 返回 { hostname: "kg-<username>.example.com", run_token: "eyJ..." }
 ```
 
 - [ ] **Step 1: 安装 wrangler**
@@ -217,15 +217,15 @@ compatibility_date = "2025-01-01"
 binding = "PROVISION_KV"
 id = "<上一步拿到的 KV namespace id>"
 
-# 自定义域名：把 Worker 绑到 botsonny.top 的子域名，而不是用默认 *.workers.dev。
-# custom_domain = true 时，wrangler 会自动在 botsonny.top 这个 zone 里建好
+# 自定义域名：把 Worker 绑到 example.com 的子域名，而不是用默认 *.workers.dev。
+# custom_domain = true 时，wrangler 会自动在 example.com 这个 zone 里建好
 # 路由和代理 DNS 记录（前提是该 zone 已在当前 Cloudflare 账号下，你的情况满足）。
 [[routes]]
-pattern = "kiro-gateway-provision.botsonny.top"
+pattern = "kiro-gateway-provision.example.com"
 custom_domain = true
 ```
 
-> 注：`kiro-gateway-provision.botsonny.top` 是一级子域名，落在 Universal SSL 的 `*.botsonny.top` 覆盖范围内，HTTPS 直接可用，无需额外证书。换成别的名字（如 `kiro-api.botsonny.top`）同理，只要保持单级子域名即可。
+> 注：`kiro-gateway-provision.example.com` 是一级子域名，落在 Universal SSL 的 `*.example.com` 覆盖范围内，HTTPS 直接可用，无需额外证书。换成别的名字（如 `kiro-api.example.com`）同理，只要保持单级子域名即可。
 
 - [ ] **Step 5: 写 `worker/src/index.js`**
 
@@ -240,10 +240,10 @@ custom_domain = true
 //
 // Required Worker Secrets (set via wrangler secret put):
 //   SHARED_SECRET   — the secret distributed to users out-of-band
-//   CF_API_TOKEN    — scoped: Tunnel:Edit + DNS:Edit (botsonny.top only)
+//   CF_API_TOKEN    — scoped: Tunnel:Edit + DNS:Edit (example.com only)
 //   CF_ACCOUNT_ID
 //   CF_ZONE_ID
-//   DOMAIN_SUFFIX   — e.g. "botsonny.top"
+//   DOMAIN_SUFFIX   — e.g. "example.com"
 //   HOSTNAME_PREFIX — e.g. "kg"  → final hostname = kg-<username>.<DOMAIN_SUFFIX>
 
 const CF_API = "https://api.cloudflare.com/client/v4";
@@ -388,10 +388,10 @@ wrangler secret put CF_ACCOUNT_ID
 # 输入：你的 Cloudflare Account ID（在 dash.cloudflare.com 右上角或任意域名概览页右栏）
 
 wrangler secret put CF_ZONE_ID
-# 输入：botsonny.top 的 Zone ID（域名概览页右栏 API 区域）
+# 输入：example.com 的 Zone ID（域名概览页右栏 API 区域）
 
 wrangler secret put DOMAIN_SUFFIX
-# 输入：botsonny.top
+# 输入：example.com
 
 wrangler secret put HOSTNAME_PREFIX
 # 输入：kg
@@ -404,20 +404,20 @@ cd worker
 wrangler deploy
 ```
 
-因为 `wrangler.toml` 里配了 `routes` 自定义域名，首次 `deploy` 时 wrangler 会自动在 `botsonny.top` 这个 zone 下创建 `kiro-gateway-provision.botsonny.top` 的路由和所需 DNS 记录（域名已在你 Cloudflare 账号下，无需手工加）。输出末尾会显示类似：
+因为 `wrangler.toml` 里配了 `routes` 自定义域名，首次 `deploy` 时 wrangler 会自动在 `example.com` 这个 zone 下创建 `kiro-gateway-provision.example.com` 的路由和所需 DNS 记录（域名已在你 Cloudflare 账号下，无需手工加）。输出末尾会显示类似：
 
 ```
 Published kiro-provision (0.00 sec)
-  https://kiro-gateway-provision.botsonny.top
+  https://kiro-gateway-provision.example.com
   https://kiro-provision.<your-workers-dev-subdomain>.workers.dev
 ```
 
-App 里的 `PROVISION_WORKER_URL` 填 `https://kiro-gateway-provision.botsonny.top` 即可。`workers.dev` 那个地址仍然可用，但自定义域名更干净、也便于以后换实现。
+App 里的 `PROVISION_WORKER_URL` 填 `https://kiro-gateway-provision.example.com` 即可。`workers.dev` 那个地址仍然可用，但自定义域名更干净、也便于以后换实现。
 
 - [ ] **Step 8: 验证 Worker 正常工作**
 
 ```bash
-curl -s -X POST https://kiro-gateway-provision.botsonny.top/provision \
+curl -s -X POST https://kiro-gateway-provision.example.com/provision \
   -H "Content-Type: application/json" \
   -d '{"shared_secret":"<你设的 SHARED_SECRET>","username":"testuser"}' | jq .
 ```
@@ -426,7 +426,7 @@ curl -s -X POST https://kiro-gateway-provision.botsonny.top/provision \
 
 ```json
 {
-  "hostname": "kg-testuser.botsonny.top",
+  "hostname": "kg-testuser.example.com",
   "run_token": "eyJ..."
 }
 ```
@@ -435,7 +435,7 @@ curl -s -X POST https://kiro-gateway-provision.botsonny.top/provision \
 
 ```json
 {
-  "hostname": "kg-testuser.botsonny.top",
+  "hostname": "kg-testuser.example.com",
   "run_token": null,
   "message": "already provisioned"
 }
@@ -458,10 +458,10 @@ curl -s -X POST https://kiro-gateway-provision.botsonny.top/provision \
 | Secret | 说明 |
 |---|---|
 | SHARED_SECRET | 发给用户的一次性激活码，泄露了重新设一个即可 |
-| CF_API_TOKEN | Custom Token：Tunnel:Edit + DNS:Edit(botsonny.top) |
+| CF_API_TOKEN | Custom Token：Tunnel:Edit + DNS:Edit(example.com) |
 | CF_ACCOUNT_ID | Cloudflare Account ID |
-| CF_ZONE_ID | botsonny.top 的 Zone ID |
-| DOMAIN_SUFFIX | botsonny.top |
+| CF_ZONE_ID | example.com 的 Zone ID |
+| DOMAIN_SUFFIX | example.com |
 | HOSTNAME_PREFIX | kg |
 
 ## 更新 SHARED_SECRET（换批用户时）
@@ -884,7 +884,7 @@ fake_reasoning = false
 
 [cloudflare]
 # 首启注册后由 App 自动写入，用户不需手填
-hostname = ""              # e.g. kg-alice.botsonny.top
+hostname = ""              # e.g. kg-alice.example.com
 run_token = ""             # per-tunnel 窄权限 token
 provision_url = ""         # Worker URL，首次激活时填入
 ```
@@ -909,12 +909,12 @@ def test_edit_and_reload(tmp_path, monkeypatch):
     monkeypatch.setenv("KIRO_TRAY_HOME", str(tmp_path))
     cfg = appconfig.load()
     cfg.gateway.proxy_api_key = "secret123"
-    cfg.cloudflare.hostname = "kg-alice.botsonny.top"
+    cfg.cloudflare.hostname = "kg-alice.example.com"
     cfg.cloudflare.run_token = "eyJ_test"
     appconfig.save(cfg)
     again = appconfig.load()
     assert again.gateway.proxy_api_key == "secret123"
-    assert again.cloudflare.hostname == "kg-alice.botsonny.top"
+    assert again.cloudflare.hostname == "kg-alice.example.com"
     assert again.cloudflare.run_token == "eyJ_test"
 
 
@@ -935,7 +935,7 @@ def test_is_provisioned(tmp_path, monkeypatch):
     monkeypatch.setenv("KIRO_TRAY_HOME", str(tmp_path))
     cfg = appconfig.load()
     assert appconfig.is_provisioned(cfg) is False
-    cfg.cloudflare.hostname = "kg-alice.botsonny.top"
+    cfg.cloudflare.hostname = "kg-alice.example.com"
     cfg.cloudflare.run_token = "eyJ_test"
     assert appconfig.is_provisioned(cfg) is True
 ```
@@ -971,7 +971,7 @@ class GatewayCfg:
 
 @dataclass
 class CloudflareCfg:
-    hostname: str = ""        # kg-<username>.botsonny.top, written by provision flow
+    hostname: str = ""        # kg-<username>.example.com, written by provision flow
     run_token: str = ""       # per-tunnel run token, written by provision flow
     provision_url: str = ""   # Worker URL, set by user once before first activation
 
@@ -1312,7 +1312,7 @@ def run(cfg: AppCfg, shared_secret: str) -> tuple[str, str]:
     if not cfg.cloudflare.provision_url:
         raise RuntimeError(
             "provision_url 未配置。请在 config.toml 的 [cloudflare] 段填入 Worker URL。\n"
-            "示例：provision_url = \"https://kiro-gateway-provision.botsonny.top\""
+            "示例：provision_url = \"https://kiro-gateway-provision.example.com\""
         )
 
     email = _read_kiro_email(cfg)
@@ -1600,7 +1600,7 @@ def _make_sup(monkeypatch, tmp_path, provisioned=True):
     monkeypatch.setenv("KIRO_TRAY_HOME", str(tmp_path))
     cfg = appconfig.load()
     if provisioned:
-        cfg.cloudflare.hostname = "kg-test.botsonny.top"
+        cfg.cloudflare.hostname = "kg-test.example.com"
         cfg.cloudflare.run_token = "eyJ_test"
         appconfig.save(cfg)
     s = supervisor.Supervisor(gateway=_FakeGateway(), tunnel=_FakeTunnel())
@@ -1613,7 +1613,7 @@ def test_start_provisioned(monkeypatch, tmp_path):
     s.start()
     assert s.gateway.is_alive() is True
     assert s.tunnel.is_alive() is True
-    assert s.status()["hostname"] == "kg-test.botsonny.top"
+    assert s.status()["hostname"] == "kg-test.example.com"
 
 
 def test_start_not_provisioned_no_callback_raises(monkeypatch, tmp_path):
@@ -1629,14 +1629,14 @@ def test_start_not_provisioned_with_callback(monkeypatch, tmp_path):
     s = _make_sup(monkeypatch, tmp_path, provisioned=False)
 
     def fake_provision(cfg):
-        cfg.cloudflare.hostname = "kg-cb.botsonny.top"
+        cfg.cloudflare.hostname = "kg-cb.example.com"
         cfg.cloudflare.run_token = "eyJ_cb"
         appconfig.save(cfg)
         raise StopIteration("mock provision complete")
 
     # Patch provision.run to avoid real HTTP call
     import kiro_tray.provision as pmod
-    monkeypatch.setattr(pmod, "run", lambda cfg, secret: ("kg-cb.botsonny.top", "eyJ_cb"))
+    monkeypatch.setattr(pmod, "run", lambda cfg, secret: ("kg-cb.example.com", "eyJ_cb"))
     s.provision_callback = lambda cfg: "fake-secret"
     s.start()
     assert s.gateway.is_alive() is True
@@ -2358,7 +2358,7 @@ if __name__ == "__main__":
 
 把 kiro-gateway 跑成 Mac / Windows / Linux 的本地托盘小工具，无需 Docker。
 进程内跑网关，子进程跑 cloudflared 把本机网关经 Cloudflare 网络暴露为
-`https://kg-<你的用户名>.botsonny.top/v1`，供 Cursor 直接使用。
+`https://kg-<你的用户名>.example.com/v1`，供 Cursor 直接使用。
 
 > 与仓库根目录的 Docker 部署是两条独立的线，互不影响。
 
@@ -2380,7 +2380,7 @@ if __name__ == "__main__":
    proxy_api_key = "<自己生成一个强随机串>"
 
    [cloudflare]
-   provision_url = "https://kiro-gateway-provision.botsonny.top"
+   provision_url = "https://kiro-gateway-provision.example.com"
    ```
 
 4. 重新启动 App → 弹出激活码输入框（托盘模式）或命令行提示（CLI 模式），
@@ -2389,7 +2389,7 @@ if __name__ == "__main__":
 5. 注册完成后 App 自动启动网关和隧道。从托盘菜单「复制 Tunnel URL」和
    「复制 Gateway 密码」，填进 Cursor → Settings → Models → OpenAI API Key & Base URL：
    - **API Key**: 托盘「复制 Gateway 密码」（即 `config.toml` 里的 `proxy_api_key`）
-   - **Base URL**: 托盘「复制 Tunnel URL」（即 `https://kg-<你的用户名>.botsonny.top/v1`）
+   - **Base URL**: 托盘「复制 Tunnel URL」（即 `https://kg-<你的用户名>.example.com/v1`）
    - 本机调试也可用「复制本地 URL」（`http://127.0.0.1:<port>/v1`）
 
 6. 以后每次开机启动 App 即可，无需再输激活码。

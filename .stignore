@@ -1,0 +1,38 @@
+// 机密文件不同步
+.env
+.env.*
+
+// macOS
+.DS_Store
+.AppleDouble
+
+// Python 缓存与打包产物
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov
+.venv
+venv
+env
+build
+dist
+
+// Node / Cloudflare Worker
+node_modules
+.wrangler
+
+// 日志与调试产物
+*.log
+debug_logs
+
+// 版本控制内部目录（Syncthing 同步 .git 易冲突）
+.git
+
+// 编辑器 / 工具缓存
+.idea
+*.swp
+*.swo

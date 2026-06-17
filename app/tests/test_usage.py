@@ -1,5 +1,5 @@
 # app/tests/test_usage.py
-from kiro_tray import usage
+from kiro_gateway_tray import usage
 
 
 def test_format_summary_with_overage():
@@ -37,7 +37,7 @@ def test_format_menu_line_with_overage():
         "breakdowns": [{"used": 1100, "limit": 1000}],
         "overageCostUsd": 4.0,
     }
-    assert usage.format_menu_line(data) == "1100 / 1000 (+$4.0)"
+    assert usage.format_menu_line(data) == "1100 / 1000 ($4.0)"
 
 
 def test_format_menu_line_no_overage():

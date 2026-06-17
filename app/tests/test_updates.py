@@ -1,5 +1,5 @@
 # app/tests/test_updates.py
-from kiro_tray import updates
+from kiro_gateway_tray import updates
 
 
 def test_parse_version_strips_prefix():
@@ -16,7 +16,7 @@ def test_is_newer():
 
 
 def test_cache_roundtrip_and_ttl(tmp_path, monkeypatch):
-    monkeypatch.setenv("KIRO_TRAY_HOME", str(tmp_path))
+    monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
     # No cache yet -> should_check True
     assert updates._should_check() is True
     updates._write_cache(latest="0.2.0")
@@ -27,7 +27,7 @@ def test_cache_roundtrip_and_ttl(tmp_path, monkeypatch):
 
 
 def test_check_uses_cache_when_fresh(tmp_path, monkeypatch):
-    monkeypatch.setenv("KIRO_TRAY_HOME", str(tmp_path))
+    monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
     updates._write_cache(latest="9.9.9")
     # fresh cache -> no HTTP call, returns cached latest
     def _boom(*a, **k):

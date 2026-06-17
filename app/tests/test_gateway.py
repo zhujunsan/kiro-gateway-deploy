@@ -1,6 +1,6 @@
 # app/tests/test_gateway.py
 from pathlib import Path
-from kiro_tray import gateway, appconfig
+from kiro_gateway_tray import gateway, appconfig
 
 
 def test_vendor_root_missing_raises(monkeypatch):
@@ -13,7 +13,7 @@ def test_vendor_root_missing_raises(monkeypatch):
 
 
 def test_apply_env_sets_process_env(tmp_path, monkeypatch):
-    monkeypatch.setenv("KIRO_TRAY_HOME", str(tmp_path))
+    monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
     cfg = appconfig.load()
     cfg.gateway.profile_arn = "arn:test"
     cfg.gateway.proxy_api_key = "k123"

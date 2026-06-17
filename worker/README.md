@@ -4,24 +4,26 @@
 
 1. `npm install -g wrangler && wrangler login`
 2. `wrangler kv namespace create PROVISION_KV` → 把 id 填进 wrangler.toml
-3. 按 src/index.js 注释逐一 `wrangler secret put <KEY>`
+3. 复制 `secrets.json.example` 为 `secrets.json`，把值填好，然后 `wrangler secret bulk secrets.json` 一次性导入
 4. `wrangler deploy`
 
 ## Secrets 清单
 
+下表即 `secrets.json` 需要填的字段（`secrets.json.example` 是模板）：
+
 | Secret | 说明 |
 |---|---|
-| SHARED_SECRET | 发给用户的一次性激活码，泄露了重新设一个即可 |
-| CF_API_TOKEN | Custom Token：Tunnel:Edit + DNS:Edit(botsonny.top) |
+| SHARED_SECRET | 发给用户的一次性激活码，泄露了重新设一个即可。可用 `openssl rand -hex 16` 生成 |
+| CF_API_TOKEN | Custom Token：Tunnel:Edit + DNS:Edit(example.com) |
 | CF_ACCOUNT_ID | Cloudflare Account ID |
-| CF_ZONE_ID | botsonny.top 的 Zone ID |
-| DOMAIN_SUFFIX | botsonny.top |
+| CF_ZONE_ID | example.com 的 Zone ID |
+| DOMAIN_SUFFIX | example.com |
 | HOSTNAME_PREFIX | kg |
 
 ## 更新 SHARED_SECRET（换批用户时）
 
 ```bash
-wrangler secret put SHARED_SECRET
+wrangler secret put SHARED_SECRET   # 可用 openssl rand -hex 16 生成一个新激活码
 wrangler deploy
 ```
 

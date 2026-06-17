@@ -6,12 +6,12 @@ from pathlib import Path
 
 from platformdirs import user_config_dir, user_data_dir, user_log_dir
 
-_APP_NAME = "KiroTray"
-_APP_AUTHOR = "KiroTray"
+_APP_NAME = "KiroGatewayTray"
+_APP_AUTHOR = "KiroGatewayTray"
 
 
 def _home_override() -> Path | None:
-    raw = os.environ.get("KIRO_TRAY_HOME")
+    raw = os.environ.get("KIRO_GATEWAY_TRAY_HOME")
     return Path(raw).expanduser() if raw else None
 
 

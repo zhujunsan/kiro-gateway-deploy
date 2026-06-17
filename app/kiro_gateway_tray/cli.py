@@ -1,4 +1,4 @@
-# app/kiro_tray/cli.py
+# app/kiro_gateway_tray/cli.py
 """Headless fallback when no tray is available (typically Ubuntu/GNOME)."""
 from __future__ import annotations
 
@@ -16,9 +16,17 @@ def _base_url(cfg) -> str:
     return f"http://127.0.0.1:{cfg.gateway.port}/v1"
 
 
-def _ask_shared_secret_cli(cfg) -> str:
-    print("\n=== Kiro Tray 首次激活 ===")
-    print(f"Worker URL: {cfg.cloudflare.provision_url or '(未设置，请先填 config.toml)'}")
+def _first_run_setup_cli(cfg) -> str:
+    """CLI guided setup: prompt for provision_url (if empty) + shared secret."""
+    print("\n=== Kiro Tray 首次配置 ===")
+    if not cfg.cloudflare.provision_url:
+        print("请输入 Worker 服务地址（provision URL）：", end="", flush=True)
+        url = input().strip()
+        cfg.cloudflare.provision_url = url
+        appconfig.save(cfg)
+        print(f"  已保存: {url}")
+
+    print(f"\nWorker: {cfg.cloudflare.provision_url}")
     print("请输入激活码（共享密钥）：", end="", flush=True)
     secret = input().strip()
     if not secret:
@@ -29,7 +37,7 @@ def _ask_shared_secret_cli(cfg) -> str:
 def run() -> int:
     cfg = appconfig.load()
     sup = Supervisor()
-    sup.provision_callback = _ask_shared_secret_cli
+    sup.provision_callback = _first_run_setup_cli
 
     print("Kiro Gateway (CLI 模式)")
     print(f"  配置文件: {paths.config_file()}")

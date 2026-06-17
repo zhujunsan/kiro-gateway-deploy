@@ -1,6 +1,6 @@
 # app/tests/test_cloudflared.py
 from pathlib import Path
-from kiro_tray import cloudflared, appconfig
+from kiro_gateway_tray import cloudflared, appconfig
 
 
 def test_binary_name_per_platform():
@@ -21,8 +21,31 @@ def test_binary_path_missing_raises(monkeypatch):
         assert "cloudflared" in str(e).lower()
 
 
-def test_provision_email_to_username():
-    from kiro_tray.provision import _email_to_username
-    assert _email_to_username("alice@example.com") == "alice"
-    assert _email_to_username("john.doe@example.com") == "john-doe"
-    assert _email_to_username("ALICE@example.com") == "alice"
+def test_provision_username_from_client_id_hash(monkeypatch):
+    from kiro_gateway_tray import provision
+    cfg = appconfig.AppCfg()
+    monkeypatch.setattr(
+        provision, "_read_client_id_hash", lambda _cfg: "ABCDEF0123456789abcdef"
+    )
+    # first 12 hex chars, lowercased
+    assert provision._get_username(cfg) == "abcdef012345"
+
+
+def test_provision_username_missing_hash_raises(monkeypatch):
+    from kiro_gateway_tray import provision
+    cfg = appconfig.AppCfg()
+    monkeypatch.setattr(provision, "_read_client_id_hash", lambda _cfg: None)
+    try:
+        provision._get_username(cfg)
+        assert False, "expected RuntimeError"
+    except RuntimeError as e:
+        assert "clientIdHash" in str(e)
+
+
+def test_provision_read_profile_arn_and_region(monkeypatch):
+    from kiro_gateway_tray import provision
+    cfg = appconfig.AppCfg()
+    arn = "arn:aws:codewhisperer:us-east-1:123456789012:profile/ABC"
+    monkeypatch.setattr(provision, "_read_kiro_token", lambda _cfg: {"profileArn": arn})
+    assert provision.read_profile_arn(cfg) == arn
+    assert provision.read_api_region(cfg) == "us-east-1"
