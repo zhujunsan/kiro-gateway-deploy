@@ -43,9 +43,14 @@ python3.11 -m venv .venv && . .venv/bin/activate
 pip install -r requirements-build.txt
 python scripts/vendor_sync.py           # 拉上游 fork（已内置 kiro-* 别名 + /usage）
 python scripts/fetch_cloudflared.py     # 下载当前平台 cloudflared
+python scripts/compress_cloudflared.py  # 可选：UPX 压缩 cloudflared（macOS 自动跳过）
 pyinstaller packaging/kiro_gateway_tray.spec --noconfirm
 python packaging/make_dist.py           # 产物在 app/release/
 ```
+
+> `compress_cloudflared.py` 用 UPX 把 cloudflared 二进制就地压缩（Linux/Windows 约减 ~50%），
+> cloudflared 以独立子进程运行，压缩不影响主程序。macOS 自动跳过（UPX 在 Apple Silicon 上不稳定且会破坏签名），
+> 未装 upx 时也会友好跳过。CI 在发布构建时会自动执行这一步。
 
 `make_dist.py` 会根据当前平台产出对应安装包，需预装打包工具：
 - macOS → `.dmg`，需 `brew install create-dmg`
