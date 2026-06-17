@@ -52,7 +52,7 @@ python packaging/make_dist.py           # 产物在 app/release/
 - Windows → `-setup.exe`，需安装 [Inno Setup 6](https://jrsoftware.org/isdl.php)
 - Linux → `.AppImage`，需 `appimagetool`（放到 `app/build/appimagetool-x86_64.AppImage`）
 
-三平台发布包由 GitHub Actions matrix 自动构建（CI 会自动装好上述工具），打 `app-v*` tag 即触发，
+三平台发布包由 GitHub Actions matrix 自动构建（CI 会自动装好上述工具），打 `v*` tag 即触发，
 构建完自动创建 GitHub Release 并上传安装包。
 
 ## 配置项（config.toml）

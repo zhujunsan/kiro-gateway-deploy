@@ -2,7 +2,7 @@ name: build-app
 
 on:
   push:
-    tags: ["app-v*"]
+    tags: ["v*"]
   pull_request:
     paths: ["app/**", ".github/workflows/build-app.yml"]
   workflow_dispatch:
@@ -74,8 +74,8 @@ jobs:
           repo = os.environ['GITHUB_REPOSITORY']
           tag = os.environ.get('GITHUB_REF_NAME', '')
           txt = re.sub(r'GITHUB_REPO = \"[^\"]+\"', f'GITHUB_REPO = \"{repo}\"', txt)
-          if tag.startswith('app-v'):
-              ver = tag.removeprefix('app-v')
+          if tag.startswith('v'):
+              ver = tag.removeprefix('v')
               txt = re.sub(r'__version__ = \"[^\"]+\"', f'__version__ = \"{ver}\"', txt)
           upstream_repo = os.environ.get('UPSTREAM_REPO_OVERRIDE', '')
           if upstream_repo:
@@ -101,7 +101,7 @@ jobs:
   release:
     name: publish release
     needs: build
-    if: startsWith(github.ref, 'refs/tags/app-v')
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
