@@ -11,9 +11,7 @@ from .supervisor import Supervisor
 
 
 def _base_url(cfg) -> str:
-    if cfg.cloudflare.hostname:
-        return f"https://{cfg.cloudflare.hostname}/v1"
-    return f"http://127.0.0.1:{cfg.gateway.port}/v1"
+    return appconfig.base_url(cfg)
 
 
 def _first_run_setup_cli(cfg) -> str:

@@ -160,7 +160,7 @@ def _install_menu_gray_suffix() -> None:
         return
 
     _orig_create_menu = _darwin.Icon._create_menu
-    _TAG_GAP = 40.0
+    _TAG_GAP = 16.0
 
     def _ns_len(s):
         return Foundation.NSString.stringWithString_(s).length()
@@ -305,26 +305,30 @@ def _install_retina_icon_fix() -> None:
 
 
 def _local_url(cfg) -> str:
-    return f"http://127.0.0.1:{cfg.gateway.port}/v1"
+    return appconfig.local_url(cfg)
 
 
 def _tunnel_url(cfg) -> str:
-    if cfg.cloudflare.hostname:
-        return f"https://{cfg.cloudflare.hostname}/v1"
-    return ""
+    return appconfig.tunnel_url(cfg)
 
 
 def _base_url(cfg) -> str:
     # 启动通知里优先报 tunnel 地址，没有就退回本地。
-    return _tunnel_url(cfg) or _local_url(cfg)
+    return appconfig.base_url(cfg)
+
+
+def _escape_applescript(s: str) -> str:
+    """Escape a string for safe embedding in an AppleScript double-quoted literal.
+    Backslashes must be escaped first, then double quotes."""
+    return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
 def _osascript_input(title: str, prompt: str, default: str = "", hidden: bool = False) -> str:
     """Show a native macOS input dialog via osascript. Returns user input or raises."""
     import subprocess
     hidden_clause = "with hidden answer" if hidden else ""
-    escaped_prompt = prompt.replace('"', '\\"')
-    escaped_default = default.replace('"', '\\"')
+    escaped_prompt = _escape_applescript(prompt)
+    escaped_default = _escape_applescript(default)
     script = (
         f'display dialog "{escaped_prompt}" '
         f'default answer "{escaped_default}" '
@@ -351,7 +355,7 @@ def _osascript_alert(title: str, message: str) -> None:
     if sys.platform != "darwin":
         return
     import subprocess
-    escaped = message.replace('"', '\\"').replace("\n", "\\n")
+    escaped = _escape_applescript(message).replace("\n", "\\n")
     subprocess.run(
         ["osascript", "-e", f'display alert "{title}" message "{escaped}"'],
         capture_output=True, timeout=30,
@@ -391,7 +395,7 @@ def _osascript_form_cf(title: str, default_url: str = "") -> tuple[str, str]:
     Returns (provision_url, secret).
     """
     import subprocess
-    escaped_url = default_url.replace('"', '\\"')
+    escaped_url = _escape_applescript(default_url)
     script = (
         f'display dialog "请输入 Provision 服务地址：\\n\\n由管理员提供的隧道签发服务 URL" '
         f'with title "{title} (1/2)" '
@@ -410,7 +414,7 @@ def _osascript_form_cf(title: str, default_url: str = "") -> tuple[str, str]:
     if not url:
         raise RuntimeError("Provision 服务地址不能为空。")
 
-    escaped_url2 = url.replace('"', '\\"')
+    escaped_url2 = _escape_applescript(url)
     script2 = (
         f'display dialog "Worker: {escaped_url2}\\n\\n请输入激活码（共享密钥）：" '
         f'with title "{title} (2/2)" '
@@ -609,15 +613,15 @@ def run() -> None:
             _notify(icon, label, value)
 
     def on_copy_local_url(icon, _item):
-        cfg = appconfig.load()
+        cfg = appconfig.load(use_cache=True)
         _copy(icon, _local_url(cfg), "本地 URL")
 
     def on_copy_tunnel_url(icon, _item):
-        cfg = appconfig.load()
+        cfg = appconfig.load(use_cache=True)
         _copy(icon, _tunnel_url(cfg), "Tunnel URL")
 
     def on_copy_password(icon, _item):
-        cfg = appconfig.load()
+        cfg = appconfig.load(use_cache=True)
         _copy(icon, cfg.gateway.proxy_api_key, "Gateway 密码")
 
     def on_open_config(_icon, _item):
@@ -646,35 +650,38 @@ def run() -> None:
 
     # --- copy items: show actual value + clipboard tag ---
     def local_url_line(_item):
-        cfg = appconfig.load()
-        return f"🔗  本地 URL: {_local_url(cfg)}\t复制"
+        cfg = appconfig.load(use_cache=True)
+        return f"🔗 本地 URL: {_local_url(cfg)}\t复制"
 
     def tunnel_url_line(_item):
-        cfg = appconfig.load()
+        cfg = appconfig.load(use_cache=True)
         url = _tunnel_url(cfg) or "未配置"
-        return f"🔗  隧道 URL: {url}\t复制"
+        return f"🔗 隧道 URL: {url}\t复制"
 
     def password_line(_item):
-        cfg = appconfig.load()
+        cfg = appconfig.load(use_cache=True)
         key = cfg.gateway.proxy_api_key
         masked = key[:1] + "***" + key[-1:] if len(key) >= 2 else "***"
-        return f"🔑  Gateway 密码: {masked}\t复制"
+        return f"🔑 Gateway 密码: {masked}\t复制"
 
     # --- models submenu: dynamic list loaded from /v1/models ---
     _models_cache = {"items": None, "inflight": False}
+    _models_lock = threading.Lock()
 
     def _refresh_models():
-        if _models_cache["inflight"]:
-            return
-        _models_cache["inflight"] = True
+        with _models_lock:
+            if _models_cache["inflight"]:
+                return
+            _models_cache["inflight"] = True
 
         def _work():
             try:
                 models = usage.fetch_models()
-                _models_cache["items"] = models
             except Exception:
-                _models_cache["items"] = []
-            _models_cache["inflight"] = False
+                models = []
+            with _models_lock:
+                _models_cache["items"] = models
+                _models_cache["inflight"] = False
             try:
                 icon.update_menu()
             except Exception:
@@ -689,7 +696,8 @@ def run() -> None:
 
     def _models_submenu_items():
         _refresh_models()
-        items = _models_cache["items"]
+        with _models_lock:
+            items = _models_cache["items"]
         if items is None:
             return [pystray.MenuItem("加载中…", None, enabled=False)]
         if not items:
@@ -701,8 +709,8 @@ def run() -> None:
 
     def start_line(_item):
         if sup.status()["gateway"] == "running":
-            return "🔄  重启"
-        return "▶️  启动"
+            return "🔄 重启"
+        return "▶️ 启动"
 
     # --- update notice (Task 13): only shown when a newer release exists ---
     # _update_info is filled by a background check kicked off at startup
@@ -764,14 +772,8 @@ def run() -> None:
     if not appconfig.is_provisioned(cfg):
         try:
             secret = _first_run_setup(cfg)
-            sup._cached_secret = secret
             cfg = appconfig.load()  # reload after provision_url was saved
-            from . import provision
-            hostname, run_token = provision.run(cfg, secret)
-            cfg.cloudflare.hostname = hostname
-            cfg.cloudflare.run_token = run_token
-            cfg.cloudflare.registered_port = cfg.gateway.port
-            appconfig.save(cfg)
+            sup.register(cfg, secret)
         except Exception as e:
             print(f"[kiro-gateway-tray setup error] {e}", file=sys.stderr)
             _osascript_alert("Kiro Tray 错误", str(e)[:300])

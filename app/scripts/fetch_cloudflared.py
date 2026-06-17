@@ -6,12 +6,32 @@ import io
 import platform
 import sys
 import tarfile
+import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DEST_BASE = ROOT / "resources" / "cloudflared"
 BASE_URL = "https://github.com/cloudflare/cloudflared/releases/latest/download"
+
+DOWNLOAD_TIMEOUT = 60  # seconds per attempt
+DOWNLOAD_RETRIES = 3
+
+
+def _download(url: str) -> bytes:
+    """Download a URL with a per-attempt timeout and bounded retries."""
+    last_err: Exception | None = None
+    for attempt in range(1, DOWNLOAD_RETRIES + 1):
+        try:
+            with urllib.request.urlopen(url, timeout=DOWNLOAD_TIMEOUT) as resp:  # noqa: S310
+                return resp.read()
+        except (urllib.error.URLError, TimeoutError) as e:
+            last_err = e
+            print(f"[warn] attempt {attempt}/{DOWNLOAD_RETRIES} failed: {e}")
+            if attempt < DOWNLOAD_RETRIES:
+                time.sleep(2 * attempt)
+    raise RuntimeError(f"failed to download {url} after {DOWNLOAD_RETRIES} attempts: {last_err}")
 
 
 def _target() -> tuple[str, str]:
@@ -42,7 +62,7 @@ def fetch(os_name: str, arch: str) -> Path:
 
     url = f"{BASE_URL}/{filename}"
     print(f"downloading {url}")
-    data = urllib.request.urlopen(url).read()  # noqa: S310
+    data = _download(url)
 
     if filename.endswith(".tgz"):
         with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as t:

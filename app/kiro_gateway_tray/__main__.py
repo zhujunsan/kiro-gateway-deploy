@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import fcntl
 import os
 import sys
 
@@ -24,7 +23,12 @@ def _acquire_lock() -> bool:
     lock_path = paths.data_dir() / "kiro-gateway-tray.lock"
     try:
         _lock_fd = open(lock_path, "w")
-        fcntl.flock(_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if sys.platform == "win32":
+            import msvcrt
+            msvcrt.locking(_lock_fd.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         _lock_fd.write(str(os.getpid()))
         _lock_fd.flush()
         return True

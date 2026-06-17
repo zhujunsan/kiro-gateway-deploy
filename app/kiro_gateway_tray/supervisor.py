@@ -54,6 +54,13 @@ class Supervisor:
                 "然后重新启动 App 完成激活。"
             )
         shared_secret = self.provision_callback(cfg)
+        self.register(cfg, shared_secret)
+
+    def register(self, cfg: AppCfg, shared_secret: str) -> None:
+        """Call the Worker with the shared secret, then persist tunnel creds.
+
+        Shared by the CLI (via _ensure_provisioned) and the tray, which must run
+        its dialogs on the main thread before the tray loop starts."""
         self._cached_secret = shared_secret
         from . import provision
         hostname, run_token = provision.run(cfg, shared_secret)

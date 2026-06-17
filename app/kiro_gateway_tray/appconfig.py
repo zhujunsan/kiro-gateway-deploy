@@ -1,6 +1,7 @@
 """Load/save the user-edited TOML config and map it to gateway env vars."""
 from __future__ import annotations
 
+import os
 import tomllib
 from dataclasses import dataclass, asdict, field
 
@@ -25,6 +26,8 @@ class CloudflareCfg:
     provision_url: str = ""   # Worker URL, set by user once before first activation
     registered_port: int = 0  # port sent to Worker at provision/update-port time
     protocol: str = "http2"   # quic | http2; http2 avoids UDP blocking
+    shared_secret: str = ""   # activation code; persisted so update-port works
+                              # across restarts (config is chmod 0600 on POSIX)
 
 
 @dataclass
@@ -47,7 +50,24 @@ def path():
     return paths.config_file()
 
 
-def load() -> AppCfg:
+_CACHE: AppCfg | None = None
+
+
+def load(*, use_cache: bool = False) -> AppCfg:
+    """Load config from disk. With use_cache=True, return a process-wide cached
+    instance (populated on first load, invalidated by save()). The cache is for
+    read-hot paths like tray menu rendering, which would otherwise re-read and
+    re-parse the TOML on every redraw."""
+    global _CACHE
+    if use_cache and _CACHE is not None:
+        return _CACHE
+    cfg = _load_from_disk()
+    if use_cache:
+        _CACHE = cfg
+    return cfg
+
+
+def _load_from_disk() -> AppCfg:
     paths.ensure_dirs()
     p = path()
     if not p.exists():
@@ -71,8 +91,37 @@ def load() -> AppCfg:
 
 
 def save(cfg: AppCfg) -> None:
+    global _CACHE
     paths.ensure_dirs()
-    path().write_text(tomli_w.dumps(asdict(cfg)), encoding="utf-8")
+    p = path()
+    p.write_text(tomli_w.dumps(asdict(cfg)), encoding="utf-8")
+    # Config holds secrets (proxy_api_key, run_token); restrict to owner on POSIX.
+    if os.name == "posix":
+        try:
+            p.chmod(0o600)
+        except OSError:
+            pass
+    _CACHE = cfg
+
+
+def invalidate_cache() -> None:
+    global _CACHE
+    _CACHE = None
+
+
+def local_url(cfg: AppCfg) -> str:
+    return f"http://127.0.0.1:{cfg.gateway.port}/v1"
+
+
+def tunnel_url(cfg: AppCfg) -> str:
+    if cfg.cloudflare.hostname:
+        return f"https://{cfg.cloudflare.hostname}/v1"
+    return ""
+
+
+def base_url(cfg: AppCfg) -> str:
+    """Prefer the public tunnel URL, fall back to the local one."""
+    return tunnel_url(cfg) or local_url(cfg)
 
 
 def is_provisioned(cfg: AppCfg) -> bool:

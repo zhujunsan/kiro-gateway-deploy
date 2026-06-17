@@ -2,11 +2,6 @@ name = "kiro-provision"
 main = "src/index.js"
 compatibility_date = "2025-01-01"
 
-[[kv_namespaces]]
-binding = "PROVISION_KV"
-# 用 `wrangler kv namespace create PROVISION_KV` 创建后，把返回的 id 填到这里
-id = "<your-kv-namespace-id>"
-
 # 自定义域名：把 Worker 绑到你自己的 zone 的子域名，而不是用默认 *.workers.dev。
 # custom_domain = true 时，wrangler 会自动在该 zone 里建好
 # 路由和代理 DNS 记录（前提是该 zone 已在当前 Cloudflare 账号下）。
