@@ -121,3 +121,88 @@ def test_health_probe_intervals_ordered():
     # Steady cadence must be looser than the active one, and both positive.
     assert supervisor.Supervisor._PROBE_INTERVAL_ACTIVE > 0
     assert supervisor.Supervisor._PROBE_INTERVAL_STEADY > supervisor.Supervisor._PROBE_INTERVAL_ACTIVE
+
+
+def test_probe_now_detects_running(monkeypatch, tmp_path):
+    # An immediate probe (used on menu-open) must flip a started gateway whose
+    # /health answers 200 to "running" and fire the status-change callback.
+    s = _make_sup(monkeypatch, tmp_path)
+    s.gateway.start(None)
+
+    class _Resp:
+        status_code = 200
+
+    monkeypatch.setattr(s._client, "get", lambda *a, **k: _Resp())
+    fired = {"n": 0}
+    s.on_status_change = lambda: fired.__setitem__("n", fired["n"] + 1)
+
+    changed = s.probe_now()
+    assert changed is True
+    assert s.status()["gateway"] == "running"
+    assert fired["n"] == 1
+
+
+def test_probe_now_stopped_when_process_dead(monkeypatch, tmp_path):
+    # Gateway not alive -> probe reports stopped without touching the network.
+    s = _make_sup(monkeypatch, tmp_path)
+
+    def _boom(*a, **k):
+        raise AssertionError("must not probe /health when process is dead")
+
+    monkeypatch.setattr(s._client, "get", _boom)
+    s.probe_now()
+    assert s.status()["gateway"] == "stopped"
+
+
+def test_run_probe_cycle_error_after_threshold(monkeypatch, tmp_path):
+    # After _UNHEALTHY_THRESHOLD consecutive failed probes, state flips to "error".
+    s = _make_sup(monkeypatch, tmp_path)
+    s.gateway.start(None)
+
+    class _Resp:
+        status_code = 503
+
+    monkeypatch.setattr(s._client, "get", lambda *a, **k: _Resp())
+
+    for _ in range(supervisor.Supervisor._UNHEALTHY_THRESHOLD - 1):
+        s._run_probe_cycle()
+    assert s.status()["gateway"] == "starting"
+
+    s._run_probe_cycle()
+    assert s.status()["gateway"] == "error"
+
+
+def test_run_probe_cycle_resets_counters_on_recovery(monkeypatch, tmp_path):
+    # A single healthy probe resets the failure counter and flips to "running".
+    s = _make_sup(monkeypatch, tmp_path)
+    s.gateway.start(None)
+
+    class _Fail:
+        status_code = 503
+
+    class _Ok:
+        status_code = 200
+
+    monkeypatch.setattr(s._client, "get", lambda *a, **k: _Fail())
+    for _ in range(3):
+        s._run_probe_cycle()
+    assert s.status()["gateway"] == "starting"
+
+    monkeypatch.setattr(s._client, "get", lambda *a, **k: _Ok())
+    s._run_probe_cycle()
+    assert s.status()["gateway"] == "running"
+
+
+def test_close_releases_client(monkeypatch, tmp_path):
+    s = _make_sup(monkeypatch, tmp_path)
+    closed = {"n": 0}
+    monkeypatch.setattr(s._client, "close", lambda: closed.__setitem__("n", 1))
+    s.close()
+    assert closed["n"] == 1
+
+
+def test_mark_starting(monkeypatch, tmp_path):
+    s = _make_sup(monkeypatch, tmp_path)
+    assert s.status()["gateway"] == "stopped"
+    s.mark_starting()
+    assert s.status()["gateway"] == "starting"

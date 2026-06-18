@@ -77,4 +77,5 @@ def run() -> int:
     stop.wait()
     print("\n  停止中...")
     sup.stop()
+    sup.close()
     return 0

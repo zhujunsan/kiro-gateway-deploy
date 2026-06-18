@@ -34,36 +34,72 @@ class Supervisor:
         # Cached tunnel connectivity, refreshed by the health loop via the
         # cloudflared /ready probe (not by parsing logs).
         self._tunnel_connected: bool = False
+        # Failure/success run-lengths feeding the health state machine. Kept on
+        # the instance (not as loop-locals) so the on-demand probe_now() and the
+        # background loop drive ONE shared state machine instead of two that
+        # fight over _gw_health.
+        self._consecutive_failures = 0
+        self._consecutive_ok = 0
         # Fired whenever gateway health or tunnel connectivity changes, so the
         # tray can redraw the menu the moment the tunnel comes up (instead of
         # waiting for the next time the user opens the menu).
         self.on_status_change: Callable[[], None] | None = None
         self._health_thread: threading.Thread | None = None
         self._health_stop = threading.Event()
+        # Guards the cached status fields (_gw_health, _tunnel_connected,
+        # counters) so status() reads never tear against a probe's write.
+        self._state_lock = threading.Lock()
+        # Serializes whole probe-and-update cycles so the loop and probe_now
+        # can't interleave into the shared state machine.
+        self._probe_lock = threading.Lock()
+        # Guards config (re)loads so concurrent callers don't double-read disk.
+        self._cfg_lock = threading.Lock()
         # Reused connection pool for localhost health/usage probes.
         self._client = httpx.Client(timeout=3)
 
     def _load(self) -> AppCfg:
-        self._cfg = appconfig.load()
-        # Restore the activation secret persisted at registration time so that
-        # update-port works across restarts (not just within the session that
-        # first provisioned). Falls back to any in-session value.
-        if self._cfg.cloudflare.shared_secret:
-            self._cached_secret = self._cfg.cloudflare.shared_secret
-        return self._cfg
+        with self._cfg_lock:
+            self._cfg = appconfig.load()
+            # Restore the activation secret persisted at registration time so
+            # that update-port works across restarts (not just within the
+            # session that first provisioned). Falls back to any in-session value.
+            if self._cfg.cloudflare.shared_secret:
+                self._cached_secret = self._cfg.cloudflare.shared_secret
+            return self._cfg
+
+    def _get_cfg(self) -> AppCfg:
+        """Return the cached config, loading it once if not yet present."""
+        cfg = self._cfg
+        return cfg if cfg is not None else self._load()
+
+    def close(self) -> None:
+        """Stop the health loop and release the HTTP connection pool.
+
+        Call once on final teardown (app quit), not on stop(): stop() may be
+        followed by start() again (restart), which reuses the client.
+        """
+        self._health_stop.set()
+        try:
+            self._client.close()
+        except Exception:
+            logger.debug("closing supervisor http client failed", exc_info=True)
 
     def _wait_healthy(self, timeout: int = 30) -> bool:
-        cfg = self._cfg or self._load()
-        url = f"{appconfig.gateway_origin(cfg)}/health"
         deadline = time.time() + timeout
         while time.time() < deadline:
-            try:
-                if self._client.get(url, timeout=3).status_code == 200:
-                    return True
-            except httpx.HTTPError:
-                pass
+            if self._probe_gateway_once(timeout=3):
+                return True
             time.sleep(1)
         return False
+
+    def _probe_gateway_once(self, *, timeout: float = 1) -> bool:
+        """One gateway /health probe. True iff it answered 200. Never raises."""
+        cfg = self._get_cfg()
+        url = f"{appconfig.gateway_origin(cfg)}/health"
+        try:
+            return self._client.get(url, timeout=timeout).status_code == 200
+        except Exception:
+            return False
 
     def _ensure_provisioned(self, cfg: AppCfg) -> None:
         """Run provision flow if not yet registered. Updates cfg and saves."""
@@ -126,11 +162,14 @@ class Supervisor:
         cfg = self._load()
         self._ensure_provisioned(cfg)
         self._sync_port_if_changed(cfg)
-        self._gw_health = "starting"
+        with self._state_lock:
+            self._gw_health = "starting"
         self.gateway.start(cfg)
         healthy = self._wait_healthy()
         if healthy:
-            self._gw_health = "running"
+            with self._state_lock:
+                self._gw_health = "running"
+                self._consecutive_ok = 1
         self.tunnel.start(cfg)
         self._start_health_loop()
         return healthy
@@ -139,12 +178,23 @@ class Supervisor:
         self._health_stop.set()
         self.tunnel.stop()
         self.gateway.stop()
-        self._gw_health = "stopped"
-        self._tunnel_connected = False
+        with self._state_lock:
+            self._gw_health = "stopped"
+            self._tunnel_connected = False
+            self._consecutive_failures = 0
+            self._consecutive_ok = 0
 
     def restart(self) -> bool:
         self.stop()
         return self.start()
+
+    def mark_starting(self) -> None:
+        """Optimistically show "starting" before the gateway is actually up.
+
+        Lets the UI give immediate feedback right after launch / setup dialogs
+        instead of briefly showing "stopped"."""
+        with self._state_lock:
+            self._gw_health = "starting"
 
     def _start_health_loop(self) -> None:
         """Start a background thread that probes gateway /health.
@@ -161,49 +211,80 @@ class Supervisor:
         self._health_stop.clear()
 
         def _loop():
-            consecutive_failures = 0
-            consecutive_ok = 0
             while not self._health_stop.is_set():
-                interval = self._PROBE_INTERVAL_ACTIVE
-                prev_gw = self._gw_health
-                prev_tunnel = self._tunnel_connected
-                if not self.gateway.is_alive():
-                    self._gw_health = "stopped"
-                    consecutive_failures = 0
-                    consecutive_ok = 0
-                else:
-                    cfg = self._cfg or self._load()
-                    url = f"{appconfig.gateway_origin(cfg)}/health"
-                    healthy = False
-                    try:
-                        healthy = self._client.get(url, timeout=1).status_code == 200
-                    except Exception:
-                        healthy = False
-                    if healthy:
-                        self._gw_health = "running"
-                        consecutive_failures = 0
-                        consecutive_ok += 1
-                        # Back off only after the gateway has proven stable.
-                        if consecutive_ok >= 2:
-                            interval = self._PROBE_INTERVAL_STEADY
-                    else:
-                        consecutive_ok = 0
-                        consecutive_failures += 1
-                        self._gw_health = (
-                            "error"
-                            if consecutive_failures >= self._UNHEALTHY_THRESHOLD
-                            else "starting"
-                        )
-                self._tunnel_connected = self._probe_tunnel_ready()
-                # Notify the UI only on an actual state transition so we don't
-                # spin the menu redraw on every probe.
-                if (self._gw_health != prev_gw
-                        or self._tunnel_connected != prev_tunnel):
-                    self._fire_status_change()
+                relaxed = self._run_probe_cycle()
+                interval = (
+                    self._PROBE_INTERVAL_STEADY if relaxed
+                    else self._PROBE_INTERVAL_ACTIVE
+                )
                 self._health_stop.wait(interval)
 
         self._health_thread = threading.Thread(target=_loop, daemon=True)
         self._health_thread.start()
+
+    def probe_now(self) -> bool:
+        """Run one gateway+tunnel health probe immediately, off the loop cadence.
+
+        Lets the tray refresh status the instant the user opens the menu instead
+        of waiting for the next scheduled probe. Non-blocking-safe to call from a
+        background thread; fires on_status_change only on an actual transition.
+        Returns True if any cached state changed.
+        """
+        before = self._state_snapshot()
+        self._run_probe_cycle()
+        return self._state_snapshot() != before
+
+    def _state_snapshot(self) -> tuple[str, bool]:
+        with self._state_lock:
+            return (self._gw_health, self._tunnel_connected)
+
+    def _run_probe_cycle(self) -> bool:
+        """Run ONE gateway+tunnel probe and advance the shared state machine.
+
+        Serialized by ``_probe_lock`` so the background loop and an on-demand
+        ``probe_now`` can't interleave half-updates into the one state machine.
+        Returns True when the caller should use the relaxed cadence (gateway
+        down, or running steadily). Fires ``on_status_change`` only on an actual
+        transition.
+        """
+        with self._probe_lock:
+            with self._state_lock:
+                prev_gw = self._gw_health
+                prev_tunnel = self._tunnel_connected
+
+            alive = self.gateway.is_alive()
+            healthy = self._probe_gateway_once() if alive else False
+            tunnel_connected = self._probe_tunnel_ready()
+
+            with self._state_lock:
+                if not alive:
+                    self._gw_health = "stopped"
+                    self._consecutive_failures = 0
+                    self._consecutive_ok = 0
+                    # Nothing is settling when the gateway is down: relax cadence.
+                    relaxed = True
+                elif healthy:
+                    self._gw_health = "running"
+                    self._consecutive_failures = 0
+                    self._consecutive_ok += 1
+                    # Back off only after the gateway has proven stable.
+                    relaxed = self._consecutive_ok >= 2
+                else:
+                    self._consecutive_ok = 0
+                    self._consecutive_failures += 1
+                    self._gw_health = (
+                        "error"
+                        if self._consecutive_failures >= self._UNHEALTHY_THRESHOLD
+                        else "starting"
+                    )
+                    relaxed = False
+                self._tunnel_connected = tunnel_connected
+                changed = (self._gw_health != prev_gw
+                           or self._tunnel_connected != prev_tunnel)
+
+        if changed:
+            self._fire_status_change()
+        return relaxed
 
     def _probe_tunnel_ready(self) -> bool:
         """True if cloudflared reports at least one live edge connection.
@@ -233,14 +314,18 @@ class Supervisor:
     def _tunnel_status(self) -> str:
         if not self.tunnel.is_alive():
             return "stopped"
-        return "running" if self._tunnel_connected else "connecting"
+        with self._state_lock:
+            connected = self._tunnel_connected
+        return "running" if connected else "connecting"
 
     def status(self) -> dict[str, str]:
         """Non-blocking: reads cached health state, never does I/O."""
-        cfg = self._cfg or self._load()
+        cfg = self._get_cfg()
         provisioned = appconfig.is_provisioned(cfg)
+        with self._state_lock:
+            gw_health = self._gw_health
         return {
-            "gateway": self._gw_health,
+            "gateway": gw_health,
             "tunnel": self._tunnel_status(),
             "hostname": cfg.cloudflare.hostname if provisioned else "(未注册)",
         }

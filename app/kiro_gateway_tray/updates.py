@@ -1,7 +1,8 @@
 """Lightweight update check against GitHub Releases.
 
 Behavior (see plan Task 13):
-  - check once on startup, then at most once per 24h (cached on disk)
+  - check on startup and whenever the menu is opened, throttled to at most
+    once per 10 minutes (cached on disk)
   - cache file: <data_dir>/update_check.json
   - all failures are swallowed silently (never bother the user)
   - never auto-downloads; UI just surfaces a "new version" menu line
@@ -18,7 +19,7 @@ import httpx
 
 from . import GITHUB_REPO, __version__, paths
 
-_TTL_SECONDS = 24 * 60 * 60
+_TTL_SECONDS = 10 * 60
 _CACHE_NAME = "update_check.json"
 _RELEASE_API = "https://api.github.com/repos/{repo}/releases/latest"
 _RELEASE_PAGE = "https://github.com/{repo}/releases/latest"

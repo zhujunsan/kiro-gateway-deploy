@@ -119,7 +119,7 @@ def test_provision_username_from_client_id_hash(monkeypatch):
     # No profileArn anywhere -> fall back to clientIdHash.
     monkeypatch.setattr(provision, "_read_kiro_token", lambda _cfg: None)
     monkeypatch.setattr(
-        provision, "_read_client_id_hash", lambda _cfg: "ABCDEF0123456789abcdef"
+        provision, "_read_client_id_hash", lambda _data: "ABCDEF0123456789abcdef"
     )
     # first 12 hex chars, lowercased
     assert provision._get_username(cfg) == "abcdef012345"
@@ -129,7 +129,7 @@ def test_provision_username_missing_hash_raises(monkeypatch):
     from kiro_gateway_tray import provision
     cfg = appconfig.AppCfg()
     monkeypatch.setattr(provision, "_read_kiro_token", lambda _cfg: None)
-    monkeypatch.setattr(provision, "_read_client_id_hash", lambda _cfg: None)
+    monkeypatch.setattr(provision, "_read_client_id_hash", lambda _data: None)
     try:
         provision._get_username(cfg)
         assert False, "expected RuntimeError"
@@ -142,8 +142,8 @@ def test_provision_username_prefers_per_user_client_id(monkeypatch):
     import hashlib
     from kiro_gateway_tray import provision
     cfg = appconfig.AppCfg()
-    monkeypatch.setattr(provision, "_read_per_user_client_id", lambda _cfg: "my-unique-client-id")
-    monkeypatch.setattr(provision, "_read_client_id_hash", lambda _cfg: "ABCDEF0123456789abcdef")
+    monkeypatch.setattr(provision, "_read_per_user_client_id", lambda _cfg, _data: "my-unique-client-id")
+    monkeypatch.setattr(provision, "_read_client_id_hash", lambda _data: "ABCDEF0123456789abcdef")
     expected = hashlib.sha1("my-unique-client-id".encode()).hexdigest()[:12]
     assert provision._get_username(cfg) == expected
 

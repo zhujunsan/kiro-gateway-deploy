@@ -2,13 +2,17 @@
 """Query the gateway's own GET /usage endpoint on localhost."""
 from __future__ import annotations
 
+import atexit
+
 import httpx
 
 from . import appconfig
 
 # Reused connection pool for localhost gateway calls (usage + models). Avoids
-# building a fresh client/connection on every menu refresh.
+# building a fresh client/connection on every menu refresh. Released at process
+# exit so the pool doesn't outlive us during interpreter shutdown.
 _client = httpx.Client(timeout=30.0)
+atexit.register(_client.close)
 
 
 def fetch(timeout: float = 30.0) -> dict:

@@ -47,20 +47,21 @@ def _read_kiro_token(cfg: AppCfg) -> dict | None:
         return None
 
 
-def _read_client_id_hash(cfg: AppCfg) -> str | None:
-    data = _read_kiro_token(cfg)
+def _read_client_id_hash(data: dict | None) -> str | None:
     return data.get("clientIdHash") if data else None
 
 
-def _read_per_user_client_id(cfg: AppCfg) -> str | None:
+def _read_per_user_client_id(cfg: AppCfg, data: dict | None) -> str | None:
     """Read the per-user clientId from the AWS SSO cache file.
 
     kiro-auth-token.json stores clientIdHash, which is the SHA1-derived filename
     of the SSO OIDC cache entry (~/.aws/sso/cache/<clientIdHash>.json).
     That file contains clientId, which is unique per user (unlike clientIdHash
     which is the same for everyone in the same organisation).
+
+    ``data`` is the already-parsed kiro-auth-token.json (passed in so a single
+    provision doesn't re-read it for each lookup).
     """
-    data = _read_kiro_token(cfg)
     if not data:
         return None
     client_id_hash = data.get("clientIdHash")
@@ -123,13 +124,14 @@ def _get_username(cfg: AppCfg) -> str:
     clientId may contain base64 characters, so we SHA-1-hash it and use the
     first _USERNAME_LEN hex digits as a stable, URL-safe slug.
     """
-    client_id = _read_per_user_client_id(cfg)
+    data = _read_kiro_token(cfg)  # read once, reused by both lookups below
+    client_id = _read_per_user_client_id(cfg, data)
     if client_id:
         return hashlib.sha1(client_id.encode()).hexdigest()[:_USERNAME_LEN]
 
     # Fallback: clientIdHash (org-shared — only used when the SSO cache file is
     # missing, e.g. non-standard Kiro installs)
-    cid = _read_client_id_hash(cfg)
+    cid = _read_client_id_hash(data)
     if not cid:
         raise RuntimeError(
             "无法从 Kiro token 文件中读取用户唯一标识（clientIdHash）。\n"

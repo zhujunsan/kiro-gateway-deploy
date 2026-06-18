@@ -33,6 +33,11 @@ class AsyncRefreshCache(Generic[T]):
         self._lock = threading.Lock()
         self._value: T | None = None
         self._inflight = False
+        # Whether any attempt has completed yet. Kept separate from _value so the
+        # cooldown also throttles fetches that legitimately yield None/empty, and
+        # so the very first refresh is never mistaken for "within cooldown" (the
+        # monotonic clock does not start at 0 on macOS/Linux).
+        self._fetched = False
         self._last_fetch = 0.0
 
     def get(self) -> T | None:
@@ -53,7 +58,7 @@ class AsyncRefreshCache(Generic[T]):
                 return
             if (
                 not force
-                and self._value is not None
+                and self._fetched
                 and (now - self._last_fetch) < self._cooldown
             ):
                 return
@@ -68,6 +73,7 @@ class AsyncRefreshCache(Generic[T]):
                 if value is not None:
                     self._value = value
                 self._inflight = False
+                self._fetched = True
                 self._last_fetch = time.monotonic()
             if value is not None and self._on_update is not None:
                 try:

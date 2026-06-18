@@ -149,7 +149,8 @@ def run_gateway_blocking() -> int:
         sys.path.insert(0, str(vendor))
 
     import uvicorn
-    main = __import__("main")
+    import importlib
+    main = importlib.import_module("main")
 
     _setup_child_logging()
     config = uvicorn.Config(

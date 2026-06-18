@@ -36,3 +36,8 @@ def test_check_uses_cache_when_fresh(tmp_path, monkeypatch):
     info = updates.check(current="0.1.0")
     assert info.latest == "9.9.9"
     assert info.update_available is True
+
+
+def test_ttl_is_ten_minutes():
+    # Update checks are throttled to once per 10 minutes.
+    assert updates._TTL_SECONDS == 10 * 60

@@ -25,6 +25,7 @@ from __future__ import annotations
 import os
 import signal
 import sys
+import time
 from pathlib import Path
 
 from . import paths
@@ -130,7 +131,6 @@ def _terminate(pid: int) -> None:
         logger.warning("not permitted to terminate pid {}", pid)
         return
     # Give it a moment to go down gracefully, then SIGKILL if still alive.
-    import time
     for _ in range(20):  # up to ~2s
         if not _pid_is_alive(pid):
             return

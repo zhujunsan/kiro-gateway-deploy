@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import threading
+import time
 import webbrowser
 from typing import Callable
 
@@ -106,6 +107,47 @@ def _first_run_setup(cfg) -> str:
     return secret
 
 
+class _ThrottleGate:
+    """Collapse a burst of triggers into at most one in-flight worker.
+
+    The tray re-runs every menu-line callable on each ``update_menu()``, and a
+    state change can itself trigger another redraw. Without throttling, opening
+    the menu once could spawn a short burst of duplicate probe/check threads.
+    This gate admits a call only when no worker is in flight AND at least
+    ``min_interval`` seconds have passed since the last admission.
+
+    Thread-safe. ``min_interval`` of 0 means "only the in-flight guard applies".
+    """
+
+    def __init__(self, min_interval: float = 0.0) -> None:
+        self._min_interval = min_interval
+        self._busy = False
+        self._last = 0.0
+        self._ever_entered = False
+        self._lock = threading.Lock()
+
+    def try_enter(self, now: float | None = None) -> bool:
+        """Return True if the caller may proceed (and mark a worker in flight)."""
+        t = time.monotonic() if now is None else now
+        with self._lock:
+            if self._busy:
+                return False
+            if (
+                self._min_interval
+                and self._ever_entered
+                and (t - self._last) < self._min_interval
+            ):
+                return False
+            self._busy = True
+            self._last = t
+            self._ever_entered = True
+            return True
+
+    def done(self) -> None:
+        with self._lock:
+            self._busy = False
+
+
 class _UsageCache:
     """Thread-safe cache for the /usage result, rendered by the menu line.
 
@@ -131,25 +173,41 @@ class _UsageCache:
         val = self._cache.get()
         return val if val is not None else "加载中…"
 
-    def refresh(self, icon) -> None:  # icon kept for call-site compatibility
+    def refresh(self, icon=None) -> None:  # icon kept for call-site compatibility
         self._cache.refresh()
 
 
-def run() -> None:
-    """Start the tray loop. Raises TrayUnavailable if no backend works."""
-    try:
+
+class TrayApp:
+    """Encapsulates the tray loop state. All the former dict-as-cell and nested
+    closures live as instance attributes/methods, making throttle and render
+    logic testable in isolation.
+    """
+
+    _PROBE_MIN_INTERVAL = 2.0  # seconds between on-open health probes
+
+    def __init__(self) -> None:
         import pystray
-    except Exception as e:
-        raise TrayUnavailable(str(e))
+        self._pystray = pystray
 
-    sup = Supervisor()
-    sup.provision_callback = _first_run_setup
-    # icon is created near the end of run(); late-bind it so background caches
-    # can request a menu redraw once a fresh value lands.
-    _icon_ref: dict = {"icon": None}
+        self.sup = Supervisor()
+        self.sup.provision_callback = _first_run_setup
+        self._icon = None
 
-    def _request_redraw() -> None:
-        ic = _icon_ref["icon"]
+        self._usage_cache = _UsageCache(on_update=self._request_redraw)
+        self._models_cache = AsyncRefreshCache(
+            usage.fetch_models, cooldown=60, on_update=self._request_redraw,
+        )
+        self.sup.on_status_change = self._request_redraw
+
+        self._update_info = None
+        self._update_gate = _ThrottleGate()
+        self._probe_gate = _ThrottleGate(min_interval=self._PROBE_MIN_INTERVAL)
+
+    # --- redraw / notify helpers ---
+
+    def _request_redraw(self) -> None:
+        ic = self._icon
         if ic is None:
             return
 
@@ -159,250 +217,256 @@ def run() -> None:
             except Exception:
                 pass
 
-        # Menu redraws come from background fetch threads; AppKit must be
-        # touched on the main thread or the process can hard-crash.
         macos_menu.run_on_main_thread(_do)
 
-    usage_cache = _UsageCache(on_update=_request_redraw)
+    def _notify(self, title: str, msg: str) -> None:
+        _notify_mod.notify(self._icon, title, msg)
 
-    # Redraw the menu the instant gateway/tunnel state changes (e.g. tunnel
-    # finishes connecting a second after startup) instead of waiting for the
-    # user to reopen the menu.
-    sup.on_status_change = _request_redraw
-
-    def _notify(icon, title, msg):
-        _notify_mod.notify(icon, title, msg)
-
-    def _refresh_icon(icon):
-        # Swap the menu-bar glyph to match running/stopped state.
+    def _refresh_icon(self) -> None:
         try:
-            icon.icon = make_icon(sup.status()["gateway"] == "running")
+            self._icon.icon = make_icon(self.sup.status()["gateway"] == "running")
         except Exception:
-            pass
+            logger.debug("_refresh_icon failed", exc_info=True)
 
-    def on_start_or_restart(icon, _item):
-        # Same menu slot: "启动" when stopped, "重启" when already running.
-        restarting = sup.status()["gateway"] == "running"
+    # --- menu actions ---
+
+    def _on_start_or_restart(self, icon, _item):
+        restarting = self.sup.status()["gateway"] == "running"
+
         def _work():
             try:
                 if restarting:
-                    sup.restart()
+                    self.sup.restart()
                     verb = "已重启"
                 else:
-                    sup.start()
+                    self.sup.start()
                     verb = "已启动"
                 cfg = appconfig.load()
-                _notify(icon, APP_NAME, f"{verb}\n{_tunnel_url(cfg)}")
+                self._notify(APP_NAME, f"{verb}\n{_tunnel_url(cfg)}")
             except Exception as e:
-                _notify(icon, f"{APP_NAME} 错误", str(e)[:200])
-            _refresh_icon(icon)
+                self._notify(f"{APP_NAME} 错误", str(e)[:200])
+            self._refresh_icon()
             icon.update_menu()
         threading.Thread(target=_work, daemon=True).start()
 
-    def on_stop(icon, _item):
-        sup.stop()
-        _notify(icon, APP_NAME, "网关已停止")
-        _refresh_icon(icon)
+    def _on_stop(self, icon, _item):
+        self.sup.stop()
+        self._notify(APP_NAME, "网关已停止")
+        self._refresh_icon()
         icon.update_menu()
 
-    def _copy(icon, value, label):
+    def _copy(self, value: str, label: str) -> None:
         try:
             platform_compat.copy_to_clipboard(value)
-            _notify(icon, APP_NAME, f"已复制{label}")
+            self._notify(APP_NAME, f"已复制{label}")
         except Exception:
-            _notify(icon, label, value)
+            self._notify(label, value)
 
-    def on_copy_local_url(icon, _item):
+    def _on_copy_local_url(self, _icon, _item):
         cfg = appconfig.load(use_cache=True)
-        _copy(icon, _local_url(cfg), "本地 URL")
+        self._copy(_local_url(cfg), "本地 URL")
 
-    def on_copy_tunnel_url(icon, _item):
+    def _on_copy_tunnel_url(self, _icon, _item):
         cfg = appconfig.load(use_cache=True)
-        _copy(icon, _tunnel_url(cfg), "Tunnel URL")
+        self._copy(_tunnel_url(cfg), "Tunnel URL")
 
-    def on_copy_password(icon, _item):
+    def _on_copy_password(self, _icon, _item):
         cfg = appconfig.load(use_cache=True)
-        _copy(icon, cfg.gateway.proxy_api_key, "网关 密码")
+        self._copy(cfg.gateway.proxy_api_key, "网关 密码")
 
-    def on_open_config(_icon, _item):
+    def _on_open_config(self, _icon, _item):
         webbrowser.open(paths.config_file().as_uri())
 
-    def on_open_logs(_icon, _item):
+    def _on_open_logs(self, _icon, _item):
         webbrowser.open(paths.log_dir().as_uri())
 
-    def on_quit(icon, _item):
-        sup.stop()
+    def _on_quit(self, icon, _item):
+        self.sup.stop()
+        self.sup.close()
         icon.stop()
 
-    # --- status line text callables (re-evaluated each time menu shows) ---
-    # \t makes macOS NSMenuItem right-align the text after the tab.
-    def gateway_line(_item):
-        s = sup.status()
+    def _on_update(self, _icon, _item):
+        info = self._update_info
+        if info:
+            webbrowser.open(info.release_url)
+
+    def _on_open_release(self, _icon, _item):
+        webbrowser.open(
+            f"https://github.com/{GITHUB_REPO}/releases/tag/v{__version__}"
+        )
+
+    def _on_copy_model(self, model_id):
+        def _handler(_icon, _item):
+            self._copy(model_id, f"模型 {model_id}")
+        return _handler
+
+    # --- menu line callables (re-evaluated each time menu shows) ---
+
+    def _gateway_line(self, _item):
+        self._on_menu_open()
+        s = self.sup.status()
         return f"🖥 网关: 本地 Kiro Gateway\t{_STATUS_ZH.get(s['gateway'], s['gateway'])}"
 
-    def tunnel_line(_item):
-        s = sup.status()
+    def _tunnel_line(self, _item):
+        s = self.sup.status()
         return f"🌐 隧道: Cloudflare Tunnel\t{_STATUS_ZH.get(s['tunnel'], s['tunnel'])}"
 
-    def usage_line(_item):
-        gw = sup.status()["gateway"]
+    def _usage_line(self, _item):
+        gw = self.sup.status()["gateway"]
         if gw != "running":
             return f"📊 额度: ({_STATUS_ZH.get(gw, gw)})"
-        usage_cache.refresh(icon)
-        return f"📊 额度: {usage_cache.display()}"
+        self._usage_cache.refresh()
+        return f"📊 额度: {self._usage_cache.display()}"
 
-    # --- copy items: show actual value + clipboard tag ---
-    def local_url_line(_item):
+    def _local_url_line(self, _item):
         cfg = appconfig.load(use_cache=True)
         return f"🔗 本地 URL: {_local_url(cfg)}\t复制"
 
-    def tunnel_url_line(_item):
+    def _tunnel_url_line(self, _item):
         cfg = appconfig.load(use_cache=True)
         url = _tunnel_url(cfg) or "未配置"
         return f"🔗 隧道 URL: {url}\t复制"
 
-    def password_line(_item):
+    def _password_line(self, _item):
         cfg = appconfig.load(use_cache=True)
         key = cfg.gateway.proxy_api_key
         masked = key[:1] + "***" + key[-1:] if len(key) >= 2 else "***"
         return f"🔑 网关 密码: {masked}\t复制"
 
-    # --- models submenu: dynamic list loaded from /v1/models ---
-    # cooldown breaks the refresh->on_update->update_menu->refresh feedback loop
-    # (the model list changes rarely, so 60s is plenty).
-    models_cache = AsyncRefreshCache(usage.fetch_models, cooldown=60, on_update=_request_redraw)
-
-    def _on_copy_model(model_id):
-        def _handler(icon, _item):
-            _copy(icon, model_id, f"模型 {model_id}")
-        return _handler
-
-    def _models_submenu_items():
-        gw_status = sup.status()["gateway"]
+    def _models_submenu_items(self):
+        pystray = self._pystray
+        gw_status = self.sup.status()["gateway"]
         if gw_status != "running":
             label = _STATUS_ZH.get(gw_status, gw_status)
             return [pystray.MenuItem(f"等待服务就绪（{label}）…", None, enabled=False)]
-        models_cache.refresh()
-        items = models_cache.get()
+        self._models_cache.refresh()
+        items = self._models_cache.get()
         if items is None:
             return [pystray.MenuItem("加载中…", None, enabled=False)]
         if not items:
             return [pystray.MenuItem("无可用模型", None, enabled=False)]
         return [
-            pystray.MenuItem(f"{m}\t复制", _on_copy_model(m))
+            pystray.MenuItem(f"{m}\t复制", self._on_copy_model(m))
             for m in items
         ]
 
-    def start_line(_item):
-        if sup.status()["gateway"] == "running":
+    def _start_line(self, _item):
+        if self.sup.status()["gateway"] == "running":
             return "🔄 重启"
         return "▶️ 启动"
 
-    # --- update notice (Task 13): only shown when a newer release exists ---
-    # _update_info is filled by a background check kicked off at startup
-    # (see updates.check below). Default None = nothing to show.
-    _update = {"info": None}
+    def _update_visible(self, _item) -> bool:
+        return self._update_info is not None
 
-    def _kick_update_check():
+    def _update_line(self, _item) -> str:
+        info = self._update_info
+        return f"🔔 有新版本 {info.latest}，点击下载" if info else ""
+
+    # --- update check + probe throttle ---
+
+    def _kick_update_check(self) -> None:
+        if not self._update_gate.try_enter():
+            return
+
         def _work():
             try:
                 from . import updates
                 info = updates.check()
                 if info.update_available:
-                    _update["info"] = info
-                    icon.update_menu()
+                    self._update_info = info
+                    self._request_redraw()
             except Exception:
-                logger.debug("update check failed", exc_info=True)  # never bother the user
+                logger.debug("update check failed", exc_info=True)
+            finally:
+                self._update_gate.done()
         threading.Thread(target=_work, daemon=True).start()
 
-    def update_visible(_item) -> bool:
-        return _update["info"] is not None
+    def _on_menu_open(self) -> None:
+        if self._probe_gate.try_enter():
+            def _probe():
+                try:
+                    self.sup.probe_now()
+                except Exception:
+                    logger.debug("probe_now failed", exc_info=True)
+                finally:
+                    self._probe_gate.done()
+            threading.Thread(target=_probe, daemon=True).start()
+        self._kick_update_check()
 
-    def update_line(_item) -> str:
-        info = _update["info"]
-        return f"🔔 有新版本 {info.latest}，点击下载" if info else ""
+    # --- build the menu and run the loop ---
 
-    def on_update(icon, _item):
-        info = _update["info"]
-        if info:
-            webbrowser.open(info.release_url)
-
-    def on_open_release(_icon, _item):
-        webbrowser.open(
-            f"https://github.com/{GITHUB_REPO}/releases/tag/v{__version__}"
+    def _build_menu(self):
+        pystray = self._pystray
+        return pystray.Menu(
+            pystray.MenuItem(self._update_line, self._on_update, visible=self._update_visible),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem(self._gateway_line, None, enabled=False),
+            pystray.MenuItem(self._tunnel_line, None, enabled=False),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem(self._usage_line, None, enabled=False),
+            pystray.MenuItem(
+                "🤖 模型列表",
+                pystray.Menu(self._models_submenu_items),
+            ),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem(self._local_url_line, self._on_copy_local_url),
+            pystray.MenuItem(self._tunnel_url_line, self._on_copy_tunnel_url),
+            pystray.MenuItem(self._password_line, self._on_copy_password),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("📄 打开配置文件", self._on_open_config),
+            pystray.MenuItem("📁 打开日志目录", self._on_open_logs),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem(f"ℹ️ 当前版本 v{__version__}", self._on_open_release),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem(self._start_line, self._on_start_or_restart),
+            pystray.MenuItem("⏹️ 停止", self._on_stop),
+            pystray.MenuItem("⏏️ 退出", self._on_quit),
         )
 
-    menu = pystray.Menu(
-        # Update notice goes first; the separator below it auto-collapses when
-        # the notice is hidden (pystray drops leading/adjacent separators).
-        pystray.MenuItem(update_line, on_update, visible=update_visible),
-        pystray.Menu.SEPARATOR,
-        pystray.MenuItem(gateway_line, None, enabled=False),
-        pystray.MenuItem(tunnel_line, None, enabled=False),
-        pystray.Menu.SEPARATOR,
-        pystray.MenuItem(usage_line, None, enabled=False),
-        pystray.MenuItem(
-            "🤖 模型列表",
-            pystray.Menu(_models_submenu_items),
-        ),
-        pystray.Menu.SEPARATOR,
-        pystray.MenuItem(local_url_line, on_copy_local_url),
-        pystray.MenuItem(tunnel_url_line, on_copy_tunnel_url),
-        pystray.MenuItem(password_line, on_copy_password),
-        pystray.Menu.SEPARATOR,
-        pystray.MenuItem("📄 打开配置文件", on_open_config),
-        pystray.MenuItem("📁 打开日志目录", on_open_logs),
-        pystray.Menu.SEPARATOR,
-        pystray.MenuItem(f"ℹ️ 当前版本 v{__version__}", on_open_release),
-        pystray.Menu.SEPARATOR,
-        pystray.MenuItem(start_line, on_start_or_restart),
-        pystray.MenuItem("⏹️ 停止", on_stop),
-        pystray.MenuItem("⏏️ 退出", on_quit),
-    )
+    def run(self) -> None:
+        pystray = self._pystray
 
-    # --- first-run guided setup BEFORE tray loop (main thread, dialogs work) ---
-    # Only the dialog interaction must happen on the main thread (macOS AppKit).
-    # The actual HTTP provisioning call (sup.register) is deferred to the
-    # background _startup thread so the tray icon appears immediately after the
-    # user finishes filling in the forms.
-    cfg = appconfig.load()
-    _pending_register: list = []  # holds [secret] when first-run register is deferred
-    if not appconfig.is_provisioned(cfg):
-        try:
-            secret = _first_run_setup(cfg)
-            cfg = appconfig.load()  # reload after provision_url was saved
-            _pending_register.append(secret)
-        except Exception as e:
-            print(f"[kiro-gateway-tray setup error] {e}", file=sys.stderr)
-            logger.exception("first-run setup failed")
-            dialogs.alert(f"{APP_NAME} 错误", str(e)[:300])
-            return
+        # --- first-run guided setup BEFORE tray loop (main thread for macOS AppKit)
+        cfg = appconfig.load()
+        pending_secret: str | None = None
+        if not appconfig.is_provisioned(cfg):
+            try:
+                pending_secret = _first_run_setup(cfg)
+                cfg = appconfig.load()  # reload after provision_url was saved
+            except Exception as e:
+                print(f"[kiro-gateway-tray setup error] {e}", file=sys.stderr)
+                logger.exception("first-run setup failed")
+                dialogs.alert(f"{APP_NAME} 错误", str(e)[:300])
+                return
 
-    def _startup():
-        import time
-        time.sleep(0.5)
-        try:
-            if _pending_register:
-                # First-run: register with the Worker (HTTP) in background so
-                # the tray icon is already visible during this potentially slow step.
-                secret = _pending_register[0]
-                cfg_reg = appconfig.load()
-                sup.register(cfg_reg, secret)
-            sup.start()
-        except Exception as e:
-            print(f"[kiro-gateway-tray startup error] {e}", file=sys.stderr)
-            logger.exception("supervisor start failed")
-            _notify(icon, f"{APP_NAME} 错误", str(e)[:200])
-        _refresh_icon(icon)
-        icon.update_menu()
+        def _startup():
+            time.sleep(0.5)
+            try:
+                if pending_secret is not None:
+                    cfg_reg = appconfig.load()
+                    self.sup.register(cfg_reg, pending_secret)
+                self.sup.start()
+            except Exception as e:
+                print(f"[kiro-gateway-tray startup error] {e}", file=sys.stderr)
+                logger.exception("supervisor start failed")
+                self._notify(f"{APP_NAME} 错误", str(e)[:200])
+            self._refresh_icon()
+            self._icon.update_menu()
 
-    # Show the tray immediately in "starting" state so the user sees feedback
-    # right after completing the setup dialogs (or on normal launch).
-    sup._gw_health = "starting"
-    icon = pystray.Icon("kiro-gateway-tray", make_icon(False), "Kiro Gateway", menu)
-    _icon_ref["icon"] = icon
-    macos_menu.install_retina_icon_fix()  # macOS only; sharp menu-bar glyph + template tint
-    macos_menu.install_menu_gray_suffix()  # macOS only; right-aligned gray text after \t
-    threading.Thread(target=_startup, daemon=True).start()
-    _kick_update_check()        # startup check; updates.check() handles 24h caching
-    icon.run()
+        self.sup.mark_starting()
+        menu = self._build_menu()
+        self._icon = pystray.Icon("kiro-gateway-tray", make_icon(False), "Kiro Gateway", menu)
+        macos_menu.install_retina_icon_fix()
+        macos_menu.install_menu_gray_suffix()
+        threading.Thread(target=_startup, daemon=True).start()
+        self._kick_update_check()
+        self._icon.run()
+
+
+def run() -> None:
+    """Start the tray loop. Raises TrayUnavailable if no backend works."""
+    try:
+        import pystray  # noqa: F401 — ensure importable before constructing TrayApp
+    except Exception as e:
+        raise TrayUnavailable(str(e))
+    TrayApp().run()
