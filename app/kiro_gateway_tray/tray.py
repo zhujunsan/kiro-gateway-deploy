@@ -242,6 +242,9 @@ def run() -> None:
         return f"🌐 隧道: Cloudflare Tunnel\t{_STATUS_ZH.get(s['tunnel'], s['tunnel'])}"
 
     def usage_line(_item):
+        gw = sup.status()["gateway"]
+        if gw != "running":
+            return f"📊 额度: ({_STATUS_ZH.get(gw, gw)})"
         usage_cache.refresh(icon)
         return f"📊 额度: {usage_cache.display()}"
 
@@ -272,6 +275,10 @@ def run() -> None:
         return _handler
 
     def _models_submenu_items():
+        gw_status = sup.status()["gateway"]
+        if gw_status != "running":
+            label = _STATUS_ZH.get(gw_status, gw_status)
+            return [pystray.MenuItem(f"等待服务就绪（{label}）…", None, enabled=False)]
         models_cache.refresh()
         items = models_cache.get()
         if items is None:
@@ -345,12 +352,17 @@ def run() -> None:
     )
 
     # --- first-run guided setup BEFORE tray loop (main thread, dialogs work) ---
+    # Only the dialog interaction must happen on the main thread (macOS AppKit).
+    # The actual HTTP provisioning call (sup.register) is deferred to the
+    # background _startup thread so the tray icon appears immediately after the
+    # user finishes filling in the forms.
     cfg = appconfig.load()
+    _pending_register: list = []  # holds [secret] when first-run register is deferred
     if not appconfig.is_provisioned(cfg):
         try:
             secret = _first_run_setup(cfg)
             cfg = appconfig.load()  # reload after provision_url was saved
-            sup.register(cfg, secret)
+            _pending_register.append(secret)
         except Exception as e:
             print(f"[kiro-gateway-tray setup error] {e}", file=sys.stderr)
             logger.exception("first-run setup failed")
@@ -361,6 +373,12 @@ def run() -> None:
         import time
         time.sleep(0.5)
         try:
+            if _pending_register:
+                # First-run: register with the Worker (HTTP) in background so
+                # the tray icon is already visible during this potentially slow step.
+                secret = _pending_register[0]
+                cfg_reg = appconfig.load()
+                sup.register(cfg_reg, secret)
             sup.start()
         except Exception as e:
             print(f"[kiro-gateway-tray startup error] {e}", file=sys.stderr)
@@ -369,6 +387,9 @@ def run() -> None:
         _refresh_icon(icon)
         icon.update_menu()
 
+    # Show the tray immediately in "starting" state so the user sees feedback
+    # right after completing the setup dialogs (or on normal launch).
+    sup._gw_health = "starting"
     icon = pystray.Icon("kiro-gateway-tray", make_icon(False), "Kiro Gateway", menu)
     _icon_ref["icon"] = icon
     macos_menu.install_retina_icon_fix()  # macOS only; sharp menu-bar glyph + template tint
