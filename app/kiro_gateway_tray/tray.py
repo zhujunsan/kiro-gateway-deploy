@@ -41,10 +41,12 @@ def _base_url(cfg) -> str:
 
 
 def _first_run_setup(cfg) -> str:
-    """Guided setup. One page for Cloudflare credentials.
+    """Guided setup. Cloudflare credentials + Kiro profileArn.
 
     Gateway API key is auto-generated (strong random).
-    Auto-reads profile_arn from Kiro token file.
+    profileArn is entered by the user (the gateway only writes it back into the
+    token file after a successful run, so it is usually unreadable on first run);
+    api_region is parsed from the entered ARN.
     Returns the shared secret for provisioning.
     """
     from . import provision as _prov
@@ -77,14 +79,25 @@ def _first_run_setup(cfg) -> str:
     cfg.cloudflare.provision_url = url
     appconfig.save(cfg)
 
-    # --- Auto-generate Gateway API key ---
-    auto_arn = _prov.read_profile_arn(cfg)
-    if auto_arn and not cfg.gateway.profile_arn:
-        cfg.gateway.profile_arn = auto_arn
-    auto_region = _prov.read_api_region(cfg)
-    if auto_region:
-        cfg.gateway.api_region = auto_region
+    # --- Page: Kiro profileArn (entered manually) ---
+    # profileArn 由 Kiro Gateway 成功运行后才写回 kiro-auth-token.json，首次初始化
+    # 通常读不到，需要用户手动粘贴。api_region 从该 ARN 中解析得到。
+    default_arn = _prov.read_profile_arn(cfg)
+    profile_arn = dialogs.prompt_input(
+        "Kiro Tray - Profile ARN",
+        "请输入 Kiro profileArn：\n\n"
+        "形如 arn:aws:codewhisperer:us-east-1:123456789012:profile/XXXX\n"
+        "（首次使用时 Kiro Gateway 尚未写回，需要手动填写）",
+        default=default_arn,
+    ).strip()
+    if not profile_arn:
+        raise RuntimeError("profileArn 不能为空。")
+    cfg.gateway.profile_arn = profile_arn
+    region = _prov.region_from_arn(profile_arn)
+    if region:
+        cfg.gateway.api_region = region
 
+    # --- Auto-generate Gateway API key ---
     if not cfg.gateway.proxy_api_key or cfg.gateway.proxy_api_key == "change-me":
         cfg.gateway.proxy_api_key = dialogs.generate_api_key()
     appconfig.save(cfg)
@@ -136,11 +149,18 @@ def run() -> None:
 
     def _request_redraw() -> None:
         ic = _icon_ref["icon"]
-        if ic is not None:
+        if ic is None:
+            return
+
+        def _do():
             try:
                 ic.update_menu()
             except Exception:
                 pass
+
+        # Menu redraws come from background fetch threads; AppKit must be
+        # touched on the main thread or the process can hard-crash.
+        macos_menu.run_on_main_thread(_do)
 
     usage_cache = _UsageCache(on_update=_request_redraw)
 
@@ -242,7 +262,9 @@ def run() -> None:
         return f"🔑 Gateway 密码: {masked}\t复制"
 
     # --- models submenu: dynamic list loaded from /v1/models ---
-    models_cache = AsyncRefreshCache(usage.fetch_models, on_update=_request_redraw)
+    # cooldown breaks the refresh->on_update->update_menu->refresh feedback loop
+    # (the model list changes rarely, so 60s is plenty).
+    models_cache = AsyncRefreshCache(usage.fetch_models, cooldown=60, on_update=_request_redraw)
 
     def _on_copy_model(model_id):
         def _handler(icon, _item):

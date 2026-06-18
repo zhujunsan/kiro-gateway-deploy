@@ -11,6 +11,24 @@ from __future__ import annotations
 import sys
 
 
+def run_on_main_thread(fn) -> None:
+    """Marshal ``fn`` onto the macOS main thread.
+
+    AppKit (NSMenu, NSStatusItem) must only be touched from the main thread;
+    calling it from a worker thread can hard-crash the process with no Python
+    traceback. Off macOS, or if the bridge is unavailable, run ``fn`` inline.
+    """
+    if sys.platform != "darwin":
+        fn()
+        return
+    try:
+        from Foundation import NSOperationQueue
+    except Exception:
+        fn()
+        return
+    NSOperationQueue.mainQueue().addOperationWithBlock_(fn)
+
+
 def install_menu_gray_suffix() -> None:
     """Post-process each NSMenu after it's built. For every item whose title
     contains ``\\t``:

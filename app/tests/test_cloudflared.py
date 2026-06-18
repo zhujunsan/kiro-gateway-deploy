@@ -31,6 +31,8 @@ def test_connection_detection_constants():
 def test_provision_username_from_client_id_hash(monkeypatch):
     from kiro_gateway_tray import provision
     cfg = appconfig.AppCfg()
+    # No profileArn anywhere -> fall back to clientIdHash.
+    monkeypatch.setattr(provision, "_read_kiro_token", lambda _cfg: None)
     monkeypatch.setattr(
         provision, "_read_client_id_hash", lambda _cfg: "ABCDEF0123456789abcdef"
     )
@@ -41,12 +43,43 @@ def test_provision_username_from_client_id_hash(monkeypatch):
 def test_provision_username_missing_hash_raises(monkeypatch):
     from kiro_gateway_tray import provision
     cfg = appconfig.AppCfg()
+    monkeypatch.setattr(provision, "_read_kiro_token", lambda _cfg: None)
     monkeypatch.setattr(provision, "_read_client_id_hash", lambda _cfg: None)
     try:
         provision._get_username(cfg)
         assert False, "expected RuntimeError"
     except RuntimeError as e:
         assert "clientIdHash" in str(e)
+
+
+def test_provision_username_prefers_config_profile_arn(monkeypatch):
+    from kiro_gateway_tray import provision
+    cfg = appconfig.AppCfg()
+    # User-entered profileArn (config) wins over the token file, which on first
+    # run usually has no profileArn yet.
+    cfg.gateway.profile_arn = "arn:aws:codewhisperer:us-east-1:123:profile/N9AM3D34PMRR"
+    monkeypatch.setattr(provision, "_read_kiro_token", lambda _cfg: None)
+    assert provision._get_username(cfg) == "n9am3d34pmrr"
+
+
+def test_provision_config_profile_arn_overrides_token(monkeypatch):
+    from kiro_gateway_tray import provision
+    cfg = appconfig.AppCfg()
+    cfg.gateway.profile_arn = "arn:aws:codewhisperer:eu-west-1:999:profile/CFG"
+    monkeypatch.setattr(
+        provision, "_read_kiro_token",
+        lambda _cfg: {"profileArn": "arn:aws:codewhisperer:us-east-1:111:profile/TOK"},
+    )
+    assert provision.read_profile_arn(cfg) == cfg.gateway.profile_arn
+    assert provision.read_api_region(cfg) == "eu-west-1"
+
+
+def test_region_from_arn():
+    from kiro_gateway_tray import provision
+    arn = "arn:aws:codewhisperer:ap-northeast-1:123456789012:profile/ABC"
+    assert provision.region_from_arn(arn) == "ap-northeast-1"
+    assert provision.region_from_arn("") == ""
+    assert provision.region_from_arn("not-an-arn") == ""
 
 
 def test_provision_read_profile_arn_and_region(monkeypatch):
