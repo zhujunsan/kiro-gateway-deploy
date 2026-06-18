@@ -7,7 +7,7 @@ import threading
 import webbrowser
 from typing import Callable
 
-from . import appconfig, dialogs, macos_menu, paths, platform_compat, usage
+from . import __version__, appconfig, dialogs, macos_menu, paths, platform_compat, usage
 from .async_cache import AsyncRefreshCache
 from .icon import make_icon
 from .log import logger
@@ -316,6 +316,7 @@ def run() -> None:
         pystray.MenuItem("📄 打开配置文件", on_open_config),
         pystray.MenuItem("📁 打开日志目录", on_open_logs),
         pystray.Menu.SEPARATOR,
+        pystray.MenuItem(f"ℹ️ 当前版本 v{__version__}", None, enabled=False),
         pystray.MenuItem(start_line, on_start_or_restart),
         pystray.MenuItem("⏹️ 停止", on_stop),
         pystray.MenuItem("🚪 退出", on_quit),
