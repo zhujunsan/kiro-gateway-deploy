@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.1.14 (2026-06-18)
+
+**New**
+- 本仓库现在同时是一个 Homebrew tap：根目录新增 `Casks/kiro-gateway-tray.rb`（区分 arm64 / Intel 两套 url + sha256），macOS 用户可经 `brew tap zhujunsan/kiro-gateway-deploy https://github.com/zhujunsan/kiro-gateway-deploy && brew install --cask kiro-gateway-tray` 安装。
+- 新增 `app/scripts/bump_cask.py`：按 `on_arm` / `on_intel` 块分别改写 cask 的 `version` 与 `sha256`，并校验哈希格式、缺锚点即报错，附带单元测试。
+- 发布流程新增 `bump-cask` CI job：发版后自动从 Release 拉取两个 DMG 的 `.sha256`，改写 cask 并提交推回默认分支，cask 哈希无需手工维护。
+
+**Changed**
+- README（根目录与 `app/`）补充 Homebrew 安装、未签名首次打开去隔离、升级命令说明。
+- 同步上游网关镜像 tag 至 `main-e974e17`（`docker/docker-compose.yml`）。
+
 ## v0.1.13 (2026-06-18)
 
 **Changed**

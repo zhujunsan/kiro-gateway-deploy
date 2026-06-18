@@ -39,6 +39,21 @@ Cursor 支持自定义 OpenAI 兼容的 API 地址，但有几个坑：
    - Windows：`KiroGatewayTray-<ver>-windows-amd64-setup.exe` → 双击运行安装向导
    - Linux：`kiro-gateway-tray-<ver>-linux-x86_64.AppImage` → `chmod +x`，双击或直接运行
 
+   > macOS 也可以用 Homebrew 安装（本仓库即是 tap）：
+   >
+   > ```bash
+   > brew tap zhujunsan/kiro-gateway-deploy https://github.com/zhujunsan/kiro-gateway-deploy
+   > brew install --cask kiro-gateway-tray
+   > ```
+   >
+   > App 暂未签名/公证，首次打开前需去掉隔离标记（或在「系统设置 → 隐私与安全性」点「仍要打开」）：
+   >
+   > ```bash
+   > xattr -dr com.apple.quarantine "/Applications/KiroGatewayTray.app"
+   > ```
+   >
+   > 升级：`brew update && brew upgrade --cask kiro-gateway-tray`
+
 2. 首次运行 App → 自动弹出引导对话框，只需填两项：
    - **Provision 服务地址**：管理员提供的隧道签发 URL（已填过则不再问）
    - **激活码**：管理员发给你的共享密钥

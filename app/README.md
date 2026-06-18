@@ -15,6 +15,10 @@
    - Windows: `KiroGatewayTray-<ver>-windows-amd64-setup.exe` → 双击运行安装向导
    - Linux: `kiro-gateway-tray-<ver>-linux-x86_64.AppImage` → `chmod +x`，双击或直接运行
 
+   > macOS 可用 Homebrew（本仓库即 tap）：
+   > `brew tap zhujunsan/kiro-gateway-deploy https://github.com/zhujunsan/kiro-gateway-deploy && brew install --cask kiro-gateway-tray`。
+   > 未签名期间首次打开需 `xattr -dr com.apple.quarantine "/Applications/KiroGatewayTray.app"`。
+
 2. 首次运行 App → 自动弹出引导对话框（托盘模式弹窗 / CLI 模式命令行提示），
    只需填两项：
    - **Provision 服务地址**：管理员提供的隧道签发 URL（已填过则不再问）
