@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.1.15 (2026-06-18)
+
+**Changed**
+- Homebrew cask 的未签名提示由 `caveats` 改为 `postflight`：仅在 App 成功安装后才打印去隔离命令，安装失败时不再显示。
+- README（根目录与 `app/`）补充新版 Homebrew 默认拒绝第三方 tap 的处理方式，安装命令追加 `brew trust zhujunsan/kiro-gateway-deploy`。
+
+**Fixed**
+- 发布工作流安装 `create-dmg` 前先 `brew trust` 预装的无关 tap，消除 Homebrew 5.2/6.0 的 "not trusted" 告警。
+
 ## v0.1.14 (2026-06-18)
 
 **New**

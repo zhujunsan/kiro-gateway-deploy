@@ -16,7 +16,8 @@
    - Linux: `kiro-gateway-tray-<ver>-linux-x86_64.AppImage` → `chmod +x`，双击或直接运行
 
    > macOS 可用 Homebrew（本仓库即 tap）：
-   > `brew tap zhujunsan/kiro-gateway-deploy https://github.com/zhujunsan/kiro-gateway-deploy && brew install --cask kiro-gateway-tray`。
+   > `brew tap zhujunsan/kiro-gateway-deploy https://github.com/zhujunsan/kiro-gateway-deploy && brew trust zhujunsan/kiro-gateway-deploy && brew install --cask kiro-gateway-tray`。
+   > 新版 Homebrew 默认拒绝第三方 tap，报 `untrusted tap` 时先跑 `brew trust zhujunsan/kiro-gateway-deploy`。
    > 未签名期间首次打开需 `xattr -dr com.apple.quarantine "/Applications/KiroGatewayTray.app"`。
 
 2. 首次运行 App → 自动弹出引导对话框（托盘模式弹窗 / CLI 模式命令行提示），

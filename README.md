@@ -43,8 +43,11 @@ Cursor 支持自定义 OpenAI 兼容的 API 地址，但有几个坑：
    >
    > ```bash
    > brew tap zhujunsan/kiro-gateway-deploy https://github.com/zhujunsan/kiro-gateway-deploy
+   > brew trust zhujunsan/kiro-gateway-deploy
    > brew install --cask kiro-gateway-tray
    > ```
+   >
+   > 新版 Homebrew 默认拒绝加载第三方 tap，若安装时报 `Refusing to load cask ... from untrusted tap`，先执行上面的 `brew trust zhujunsan/kiro-gateway-deploy`（或 `brew trust --cask zhujunsan/kiro-gateway-deploy/kiro-gateway-tray`）再重试。
    >
    > App 暂未签名/公证，首次打开前需去掉隔离标记（或在「系统设置 → 隐私与安全性」点「仍要打开」）：
    >

@@ -70,7 +70,11 @@ jobs:
 
       - name: Install packaging tools (macOS – create-dmg)
         if: env.IS_RELEASE == 'true' && runner.os == 'macOS'
-        run: brew install create-dmg
+        run: |
+          # Pre-installed runner taps we don't use trigger a "not trusted" warning
+          # (HOMEBREW_REQUIRE_TAP_TRUST, default in Homebrew 5.2/6.0). Trust them to silence it.
+          brew trust aws/tap azure/bicep || true
+          brew install create-dmg
 
       - name: Fetch appimagetool (Linux)
         if: env.IS_RELEASE == 'true' && runner.os == 'Linux'
