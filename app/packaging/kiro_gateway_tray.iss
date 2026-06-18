@@ -1,4 +1,4 @@
-; Kiro Tray - Windows Installer
+; Kiro Gateway Tray - Windows Installer
 ; Usage (from make_dist.py, paths are absolute):
 ;   ISCC /DAppVersion=X.Y.Z /DDistDir=<abs>\dist\KiroGatewayTray /DOutputDir=<abs>\release kiro_gateway_tray.iss
 
@@ -13,13 +13,13 @@
 #endif
 
 [Setup]
-AppName=Kiro Tray
+AppName=Kiro Gateway Tray
 AppVersion={#AppVersion}
 AppPublisher=kiro-gateway-deploy
 AppPublisherURL=https://github.com/zhujunsan/kiro-gateway-deploy
 AppSupportURL=https://github.com/zhujunsan/kiro-gateway-deploy/issues
 DefaultDirName={autopf}\KiroGatewayTray
-DefaultGroupName=Kiro Tray
+DefaultGroupName=Kiro Gateway Tray
 DisableProgramGroupPage=yes
 OutputDir={#OutputDir}
 OutputBaseFilename=KiroGatewayTray-{#AppVersion}-windows-amd64-setup
@@ -36,11 +36,11 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Source: "{#DistDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{group}\Kiro Tray"; Filename: "{app}\KiroGatewayTray.exe"
-Name: "{commondesktop}\Kiro Tray"; Filename: "{app}\KiroGatewayTray.exe"; Tasks: desktopicon
+Name: "{group}\Kiro Gateway Tray"; Filename: "{app}\KiroGatewayTray.exe"
+Name: "{commondesktop}\Kiro Gateway Tray"; Filename: "{app}\KiroGatewayTray.exe"; Tasks: desktopicon
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Run]
-Filename: "{app}\KiroGatewayTray.exe"; Description: "{cm:LaunchProgram,Kiro Tray}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\KiroGatewayTray.exe"; Description: "{cm:LaunchProgram,Kiro Gateway Tray}"; Flags: nowait postinstall skipifsilent

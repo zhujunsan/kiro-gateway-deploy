@@ -209,13 +209,14 @@ class Supervisor:
         """True if cloudflared reports at least one live edge connection.
 
         Probes the metrics /ready endpoint (200 = ready, 503 = not yet). Any
-        error (process down, port not up yet) counts as not-ready."""
+        error (process down, port not up yet) counts as not-ready. Uses the port
+        cloudflared actually bound (which may differ from the configured one if
+        that was busy), not the config value."""
         if not self.tunnel.is_alive():
             return False
-        cfg = self._cfg or self._load()
         try:
             return self._client.get(
-                appconfig.tunnel_ready_url(cfg), timeout=1
+                f"http://127.0.0.1:{self.tunnel.metrics_port}/ready", timeout=1
             ).status_code == 200
         except Exception:
             return False

@@ -17,7 +17,7 @@ def _base_url(cfg) -> str:
 
 def _first_run_setup_cli(cfg) -> str:
     """CLI guided setup: prompt for provision_url (if empty) + shared secret."""
-    print("\n=== Kiro Tray 首次配置 ===")
+    print("\n=== Kiro Gateway Tray 首次配置 ===")
     if not cfg.cloudflare.provision_url:
         print("请输入 Worker 服务地址（provision URL）：", end="", flush=True)
         url = input().strip()

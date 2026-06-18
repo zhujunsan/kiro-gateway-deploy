@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import platform
+import socket
 import subprocess
 import sys
 import threading
 from pathlib import Path
 
 from . import paths
+from . import proc_guard
 from .appconfig import AppCfg
+from .log import logger
 
 
 def _current_target() -> str:
@@ -59,6 +62,36 @@ def _build_log_writer():
     return lambda line: logger.info(line)
 
 
+def _port_is_free(port: int) -> bool:
+    """True if a TCP listener can bind 127.0.0.1:<port> right now."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(("127.0.0.1", port))
+            return True
+        except OSError:
+            return False
+
+
+def _pick_metrics_port(preferred: int) -> int:
+    """Return the preferred metrics port if free, else an OS-assigned free one.
+
+    cloudflared treats a failed metrics bind as fatal and exits, so a stale
+    process (or anything else) holding the configured port would silently kill
+    the tunnel on the next start. Falling back to a free port keeps the tunnel
+    alive; the supervisor probes whatever port we actually bound.
+    """
+    if _port_is_free(preferred):
+        return preferred
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        chosen = s.getsockname()[1]
+    logger.warning(
+        "cloudflared metrics port {} is busy; falling back to {}",
+        preferred, chosen,
+    )
+    return chosen
+
+
 def binary_path() -> Path:
     name = _binary_name()
     for d in _candidate_dirs():
@@ -90,7 +123,11 @@ class CloudflaredProcess:
         run_token = cfg.cloudflare.run_token
         if not run_token:
             raise RuntimeError("cloudflare.run_token 未设置，请先完成首启注册。")
-        self._metrics_port = cfg.cloudflare.metrics_port
+        # Reap any cloudflared that survived a previous hard-kill of the tray
+        # FIRST, so the preferred metrics port is freed before we pick one;
+        # otherwise we'd needlessly fall back off a port the orphan is vacating.
+        proc_guard.kill_orphan()
+        self._metrics_port = _pick_metrics_port(cfg.cloudflare.metrics_port)
         cmd = [str(binary_path()), "tunnel", "--no-autoupdate"]
         cmd += ["--metrics", f"127.0.0.1:{self._metrics_port}"]
         protocol = getattr(cfg.cloudflare, "protocol", "") or "http2"
@@ -102,7 +139,10 @@ class CloudflaredProcess:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            **proc_guard.spawn_kwargs(),
         )
+        proc_guard.after_spawn(self._proc)
+        proc_guard.record_pid(self._proc.pid)
         self._reader = threading.Thread(target=self._watch_output, daemon=True)
         self._reader.start()
 
@@ -122,6 +162,7 @@ class CloudflaredProcess:
                 self._proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 self._proc.kill()
+        proc_guard.clear_pid()
 
     def is_alive(self) -> bool:
         return bool(self._proc and self._proc.poll() is None)

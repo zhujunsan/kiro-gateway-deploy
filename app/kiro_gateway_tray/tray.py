@@ -7,10 +7,11 @@ import threading
 import webbrowser
 from typing import Callable
 
-from . import __version__, GITHUB_REPO, appconfig, dialogs, macos_menu, paths, platform_compat, usage
+from . import __version__, GITHUB_REPO, appconfig, dialogs, macos_menu, notify as _notify_mod, paths, platform_compat, usage
 from .async_cache import AsyncRefreshCache
 from .icon import make_icon
 from .log import logger
+from .notify import APP_NAME
 from .supervisor import Supervisor
 
 
@@ -54,13 +55,13 @@ def _first_run_setup(cfg) -> str:
     # --- Page: Cloudflare (provision_url + shared secret) ---
     if sys.platform == "darwin":
         url, secret = dialogs.osascript_form_cf(
-            "Kiro Tray - 隧道配置",
+            f"{APP_NAME} - 隧道配置",
             default_url=cfg.cloudflare.provision_url or "",
         )
     else:
         if not cfg.cloudflare.provision_url:
             url = dialogs.prompt_input(
-                "Kiro Tray - 隧道配置",
+                f"{APP_NAME} - 隧道配置",
                 "请输入 Provision 服务地址：\n\n"
                 "由管理员提供的隧道签发服务 URL。",
             ).strip()
@@ -69,7 +70,7 @@ def _first_run_setup(cfg) -> str:
         else:
             url = cfg.cloudflare.provision_url
         secret = dialogs.prompt_input(
-            "Kiro Tray - 隧道配置",
+            f"{APP_NAME} - 隧道配置",
             f"请输入激活码（共享密钥）：\n\nWorker: {url}",
             hidden=True,
         ).strip()
@@ -84,7 +85,7 @@ def _first_run_setup(cfg) -> str:
     # 通常读不到，需要用户手动粘贴。api_region 从该 ARN 中解析得到。
     default_arn = _prov.read_profile_arn(cfg)
     profile_arn = dialogs.prompt_input(
-        "Kiro Tray - Profile ARN",
+        f"{APP_NAME} - Profile ARN",
         "请输入 Kiro profileArn：\n\n"
         "形如 arn:aws:codewhisperer:us-east-1:123456789012:profile/XXXX\n"
         "（首次使用时 Kiro Gateway 尚未写回，需要手动填写）",
@@ -170,10 +171,7 @@ def run() -> None:
     sup.on_status_change = _request_redraw
 
     def _notify(icon, title, msg):
-        try:
-            icon.notify(msg, title)
-        except Exception:
-            pass
+        _notify_mod.notify(icon, title, msg)
 
     def _refresh_icon(icon):
         # Swap the menu-bar glyph to match running/stopped state.
@@ -194,23 +192,23 @@ def run() -> None:
                     sup.start()
                     verb = "已启动"
                 cfg = appconfig.load()
-                _notify(icon, "Kiro Tray", f"{verb}\n{_tunnel_url(cfg)}")
+                _notify(icon, APP_NAME, f"{verb}\n{_tunnel_url(cfg)}")
             except Exception as e:
-                _notify(icon, "Kiro Tray 错误", str(e)[:200])
+                _notify(icon, f"{APP_NAME} 错误", str(e)[:200])
             _refresh_icon(icon)
             icon.update_menu()
         threading.Thread(target=_work, daemon=True).start()
 
     def on_stop(icon, _item):
         sup.stop()
-        _notify(icon, "Kiro Tray", "网关已停止")
+        _notify(icon, APP_NAME, "网关已停止")
         _refresh_icon(icon)
         icon.update_menu()
 
     def _copy(icon, value, label):
         try:
             platform_compat.copy_to_clipboard(value)
-            _notify(icon, "Kiro Tray", f"已复制{label}")
+            _notify(icon, APP_NAME, f"已复制{label}")
         except Exception:
             _notify(icon, label, value)
 
@@ -377,7 +375,7 @@ def run() -> None:
         except Exception as e:
             print(f"[kiro-gateway-tray setup error] {e}", file=sys.stderr)
             logger.exception("first-run setup failed")
-            dialogs.alert("Kiro Tray 错误", str(e)[:300])
+            dialogs.alert(f"{APP_NAME} 错误", str(e)[:300])
             return
 
     def _startup():
@@ -394,7 +392,7 @@ def run() -> None:
         except Exception as e:
             print(f"[kiro-gateway-tray startup error] {e}", file=sys.stderr)
             logger.exception("supervisor start failed")
-            _notify(icon, "Kiro Tray 错误", str(e)[:200])
+            _notify(icon, f"{APP_NAME} 错误", str(e)[:200])
         _refresh_icon(icon)
         icon.update_menu()
 

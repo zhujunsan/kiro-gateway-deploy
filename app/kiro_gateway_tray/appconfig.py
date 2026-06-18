@@ -118,13 +118,6 @@ def gateway_origin(cfg: AppCfg) -> str:
     return f"http://127.0.0.1:{cfg.gateway.port}"
 
 
-def tunnel_ready_url(cfg: AppCfg) -> str:
-    """cloudflared metrics readiness endpoint. Returns 200 once at least one
-    edge connection is registered, 503 otherwise — a log-free way to tell the
-    tunnel is actually up."""
-    return f"http://127.0.0.1:{cfg.cloudflare.metrics_port}/ready"
-
-
 def local_url(cfg: AppCfg) -> str:
     return f"{gateway_origin(cfg)}/v1"
 

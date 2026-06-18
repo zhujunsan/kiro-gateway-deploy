@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.1.12 (2026-06-18)
+
+**New**
+- 新增 `proc_guard` 模块，对 cloudflared 子进程做孤儿进程防护：进程 PID 落盘，下次启动前清扫上次残留且确为 cloudflared 的进程（含 PID 复用校验）；Linux 用 `PR_SET_PDEATHSIG`、Windows 用 Job Object（kill-on-close）实现父进程退出即连带终止子进程。
+- 新增 `notify` 模块统一桌面通知：macOS 改用进程内 `NSUserNotificationCenter` 投递，使通知横幅显示本应用的图标与名称，而非「脚本编辑器」；非 macOS 或不可用时回退到 pystray 原生通知。
+
+**Changed**
+- 全应用品牌名统一为「Kiro Gateway Tray」：托盘菜单、CLI 首启提示、单实例提示、Windows 安装包（Inno Setup）与 Linux 桌面项均同步更名。
+
+**Fixed**
+- cloudflared metrics 端口被占用时不再导致隧道启动失败：配置端口可用则沿用，被占用时自动回退到空闲端口；托盘 `/ready` 探测改用 cloudflared 实际绑定的端口，避免回退后探测打到错误端口而误报未连通。此前 App 重启遇到残留进程占用 20241 端口会让隧道静默退出，外部无法访问。
+
 ## v0.1.11 (2026-06-18)
 
 **Changed**

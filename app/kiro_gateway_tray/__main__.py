@@ -58,7 +58,7 @@ def main() -> int:
     _setup_logging()  # parent-process log sink (tray.log); child has its own
 
     if not _acquire_lock():
-        print("Kiro Tray 已在运行中，不允许启动多个实例。", file=sys.stderr)
+        print("Kiro Gateway Tray 已在运行中，不允许启动多个实例。", file=sys.stderr)
         logger.warning("another instance is already running; refusing to start")
         return 1
 

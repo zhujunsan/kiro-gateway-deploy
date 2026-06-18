@@ -107,7 +107,7 @@ def build_linux_appimage() -> Path:
     # .desktop file (required by AppImage spec)
     (appdir / "kiro-gateway-tray.desktop").write_text(
         "[Desktop Entry]\n"
-        "Name=Kiro Tray\n"
+        "Name=Kiro Gateway Tray\n"
         "Exec=kiro-gateway-tray\n"
         "Icon=kiro-gateway-tray\n"
         "Type=Application\n"
