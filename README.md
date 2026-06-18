@@ -24,7 +24,7 @@ Cursor 支持自定义 OpenAI 兼容的 API 地址，但有几个坑：
    - **Cloudflare Tunnel**：不需要自己的服务器，但要一个托管在 Cloudflare 的域名（域名可在别处买，改 NS 到 Cloudflare 免费版即可）。
    - **自建 frps 转发**：你自己有一台带公网 IP 的服务器并跑了 frps，用 frpc 把网关反代出去。大陆服务器也能用。
 
-2. **只能走 OpenAI 兼容协议，且 `claude-*` 模型名有特殊处理**：Cursor 只允许自定义 OpenAI 地址，不能自定义 Anthropic 地址。而且对 `claude` 开头的模型名做了特殊路由——即使你把它加到自定义模型列表里，请求仍然不走你的 OpenAI 兼容地址。所以需要给模型起别名（`kiro-sonnet-4.6`、`kiro-opus-4.6` 等），让 Cursor 认为这是一个未知模型，走你的自定义地址。另外上游 `ListModels` 里没有 opus 4.8，也顺手补上了。
+2. **只能走 OpenAI 兼容协议，且 `claude-*` 模型名有特殊处理**：Cursor 只允许自定义 OpenAI 地址，不能自定义 Anthropic 地址。而且对 `claude` 开头的模型名做了特殊路由——即使你把它加到自定义模型列表里，请求仍然不走你的 OpenAI 兼容地址。所以需要给模型起别名，让 Cursor 认为这是一个未知模型，走你的自定义地址。注意别名里也不能出现 `opus`/`sonnet`/`haiku` 这类 Anthropic 特有名称（Cursor 同样会嗅探并特殊处理），因此用 `kiro-o-4.6`、`kiro-s-4.6`、`kiro-h-4.5` 这种单字母代号。另外上游 `ListModels` 里没有 opus 4.8，也顺手补上了。
 
 3. **用量查询**：用了这个以后就不直接用 Kiro 客户端了，看不到额度消耗。所以加了一个 `GET /usage` 端点，能随时查订阅用量。
 
@@ -145,12 +145,14 @@ curl -H "Authorization: Bearer $PROXY_API_KEY" \
 | 别名 | 实际模型 |
 |---|---|
 | `auto-kiro` | `auto` |
-| `kiro-opus-4.8` | `claude-opus-4.8` |
-| `kiro-opus-4.7` | `claude-opus-4.7` |
-| `kiro-opus-4.6` | `claude-opus-4.6` |
-| `kiro-sonnet-4.6` | `claude-sonnet-4.6` |
-| `kiro-sonnet-4.5` | `claude-sonnet-4.5` |
-| `kiro-haiku-4.5` | `claude-haiku-4.5` |
+| `kiro-o-4.8` | `claude-opus-4.8` |
+| `kiro-o-4.7` | `claude-opus-4.7` |
+| `kiro-o-4.6` | `claude-opus-4.6` |
+| `kiro-o-4.5` | `claude-opus-4.5` |
+| `kiro-s-4.6` | `claude-sonnet-4.6` |
+| `kiro-s-4.5` | `claude-sonnet-4.5` |
+| `kiro-s-4` | `claude-sonnet-4` |
+| `kiro-h-4.5` | `claude-haiku-4.5` |
 
 要修改别名，编辑 fork（[`zhujunsan/kiro-gateway`](https://github.com/zhujunsan/kiro-gateway)）`kiro/config.py` 里的 `MODEL_ALIASES`，推送后 CI 产出新镜像 tag，再改 `docker-compose.yml` 的 `image:`。
 
