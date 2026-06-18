@@ -132,7 +132,7 @@ def _get_username(cfg: AppCfg) -> str:
     cid = _read_client_id_hash(cfg)
     if not cid:
         raise RuntimeError(
-            "无法从 Kiro token 文件中读取用户唯一标识。\n"
+            "无法从 Kiro token 文件中读取用户唯一标识（clientIdHash）。\n"
             "请确认已用 Kiro IDE 登录（~/.aws/sso/cache/kiro-auth-token.json 存在）。"
         )
     return cid[:_USERNAME_LEN].lower()

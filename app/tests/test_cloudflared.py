@@ -52,14 +52,15 @@ def test_provision_username_missing_hash_raises(monkeypatch):
         assert "clientIdHash" in str(e)
 
 
-def test_provision_username_prefers_config_profile_arn(monkeypatch):
+def test_provision_username_prefers_per_user_client_id(monkeypatch):
+    """Per-user clientId (unique per user) takes precedence over org-shared clientIdHash."""
+    import hashlib
     from kiro_gateway_tray import provision
     cfg = appconfig.AppCfg()
-    # User-entered profileArn (config) wins over the token file, which on first
-    # run usually has no profileArn yet.
-    cfg.gateway.profile_arn = "arn:aws:codewhisperer:us-east-1:123:profile/N9AM3D34PMRR"
-    monkeypatch.setattr(provision, "_read_kiro_token", lambda _cfg: None)
-    assert provision._get_username(cfg) == "n9am3d34pmrr"
+    monkeypatch.setattr(provision, "_read_per_user_client_id", lambda _cfg: "my-unique-client-id")
+    monkeypatch.setattr(provision, "_read_client_id_hash", lambda _cfg: "ABCDEF0123456789abcdef")
+    expected = hashlib.sha1("my-unique-client-id".encode()).hexdigest()[:12]
+    assert provision._get_username(cfg) == expected
 
 
 def test_provision_config_profile_arn_overrides_token(monkeypatch):
