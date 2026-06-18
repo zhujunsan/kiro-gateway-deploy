@@ -21,6 +21,13 @@ def test_binary_path_missing_raises(monkeypatch):
         assert "cloudflared" in str(e).lower()
 
 
+def test_connection_detection_constants():
+    # Guards the fragile stdout-string contract; if cloudflared rewords these,
+    # this is the single place to update (see CloudflaredProcess docstring).
+    assert cloudflared.CloudflaredProcess._LOG_CONNECTED == "Registered tunnel connection"
+    assert cloudflared.CloudflaredProcess._LOG_DISCONNECTED == "Unregistered tunnel connection"
+
+
 def test_provision_username_from_client_id_hash(monkeypatch):
     from kiro_gateway_tray import provision
     cfg = appconfig.AppCfg()

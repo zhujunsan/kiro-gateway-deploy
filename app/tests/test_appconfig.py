@@ -82,6 +82,7 @@ def test_url_helpers(tmp_path, monkeypatch):
     monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
     cfg = appconfig.load()
     cfg.gateway.port = 64005
+    assert appconfig.gateway_origin(cfg) == "http://127.0.0.1:64005"
     assert appconfig.local_url(cfg) == "http://127.0.0.1:64005/v1"
     assert appconfig.tunnel_url(cfg) == ""
     # base_url falls back to local when no tunnel hostname

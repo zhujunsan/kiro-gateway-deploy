@@ -47,7 +47,7 @@ class Supervisor:
 
     def _wait_healthy(self, timeout: int = 30) -> bool:
         cfg = self._cfg or self._load()
-        url = f"http://127.0.0.1:{cfg.gateway.port}/health"
+        url = f"{appconfig.gateway_origin(cfg)}/health"
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:
@@ -163,7 +163,7 @@ class Supervisor:
                     consecutive_ok = 0
                 else:
                     cfg = self._cfg or self._load()
-                    url = f"http://127.0.0.1:{cfg.gateway.port}/health"
+                    url = f"{appconfig.gateway_origin(cfg)}/health"
                     healthy = False
                     try:
                         healthy = self._client.get(url, timeout=1).status_code == 200

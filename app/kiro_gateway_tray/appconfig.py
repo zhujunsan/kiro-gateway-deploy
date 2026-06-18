@@ -109,8 +109,15 @@ def invalidate_cache() -> None:
     _CACHE = None
 
 
+def gateway_origin(cfg: AppCfg) -> str:
+    """Base origin of the locally-running gateway (no path), e.g.
+    ``http://127.0.0.1:64005``. Single source for the localhost host:port so
+    health/usage/models probes don't each hardcode it."""
+    return f"http://127.0.0.1:{cfg.gateway.port}"
+
+
 def local_url(cfg: AppCfg) -> str:
-    return f"http://127.0.0.1:{cfg.gateway.port}/v1"
+    return f"{gateway_origin(cfg)}/v1"
 
 
 def tunnel_url(cfg: AppCfg) -> str:

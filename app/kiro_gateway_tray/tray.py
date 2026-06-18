@@ -305,7 +305,7 @@ def run() -> None:
         pystray.Menu.SEPARATOR,
         pystray.MenuItem(usage_line, None, enabled=False),
         pystray.MenuItem(
-            "🤖  模型列表",
+            "🤖 模型列表",
             pystray.Menu(_models_submenu_items),
         ),
         pystray.Menu.SEPARATOR,
@@ -313,12 +313,12 @@ def run() -> None:
         pystray.MenuItem(tunnel_url_line, on_copy_tunnel_url),
         pystray.MenuItem(password_line, on_copy_password),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem("📄  打开配置文件", on_open_config),
-        pystray.MenuItem("📁  打开日志目录", on_open_logs),
+        pystray.MenuItem("📄 打开配置文件", on_open_config),
+        pystray.MenuItem("📁 打开日志目录", on_open_logs),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem(start_line, on_start_or_restart),
-        pystray.MenuItem("⏹️  停止", on_stop),
-        pystray.MenuItem("🚪  退出", on_quit),
+        pystray.MenuItem("⏹️ 停止", on_stop),
+        pystray.MenuItem("🚪 退出", on_quit),
     )
 
     # --- first-run guided setup BEFORE tray loop (main thread, dialogs work) ---

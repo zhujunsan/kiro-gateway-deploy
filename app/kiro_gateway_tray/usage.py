@@ -13,7 +13,7 @@ _client = httpx.Client(timeout=30.0)
 
 def fetch(timeout: float = 30.0) -> dict:
     cfg = appconfig.load()
-    url = f"http://127.0.0.1:{cfg.gateway.port}/usage"
+    url = f"{appconfig.gateway_origin(cfg)}/usage"
     headers = {"Authorization": f"Bearer {cfg.gateway.proxy_api_key}"}
     resp = _client.get(url, headers=headers, timeout=timeout)
     if resp.status_code != 200:
@@ -62,7 +62,7 @@ def format_menu_line(data: dict) -> str:
 def fetch_models(timeout: float = 10.0) -> list[str]:
     """Return sorted list of model IDs from the gateway's /v1/models endpoint."""
     cfg = appconfig.load()
-    url = f"http://127.0.0.1:{cfg.gateway.port}/v1/models"
+    url = f"{appconfig.gateway_origin(cfg)}/v1/models"
     headers = {"Authorization": f"Bearer {cfg.gateway.proxy_api_key}"}
     resp = _client.get(url, headers=headers, timeout=timeout)
     if resp.status_code != 200:
