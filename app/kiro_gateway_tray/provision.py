@@ -171,8 +171,12 @@ def run(cfg: AppCfg, shared_secret: str) -> tuple[str, str]:
     return hostname, run_token
 
 
-def update_port(cfg: AppCfg, shared_secret: str) -> bool:
-    """Tell the Worker to update the tunnel ingress port. Returns True if changed."""
+def update_port(cfg: AppCfg, shared_secret: str) -> int:
+    """Tell the Worker to update the tunnel ingress port.
+
+    Returns the port the Worker reports as actually in effect (it may clamp an
+    invalid value to its default), so the caller can persist the truth rather
+    than the value it asked for."""
     username = _get_username(cfg)
     url = _base_url(cfg) + "/update-port"
 
@@ -191,4 +195,5 @@ def update_port(cfg: AppCfg, shared_secret: str) -> bool:
     if resp.status_code != 200:
         raise RuntimeError(f"update-port 失败 {resp.status_code}: {resp.text[:200]}")
 
-    return resp.json().get("changed", False)
+    # Older Workers don't echo the port back; fall back to the requested value.
+    return int(resp.json().get("port", cfg.gateway.port))

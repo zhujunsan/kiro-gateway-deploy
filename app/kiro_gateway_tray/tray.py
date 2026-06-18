@@ -7,7 +7,7 @@ import threading
 import webbrowser
 from typing import Callable
 
-from . import __version__, appconfig, dialogs, macos_menu, paths, platform_compat, usage
+from . import __version__, GITHUB_REPO, appconfig, dialogs, macos_menu, paths, platform_compat, usage
 from .async_cache import AsyncRefreshCache
 from .icon import make_icon
 from .log import logger
@@ -164,6 +164,11 @@ def run() -> None:
 
     usage_cache = _UsageCache(on_update=_request_redraw)
 
+    # Redraw the menu the instant gateway/tunnel state changes (e.g. tunnel
+    # finishes connecting a second after startup) instead of waiting for the
+    # user to reopen the menu.
+    sup.on_status_change = _request_redraw
+
     def _notify(icon, title, msg):
         try:
             icon.notify(msg, title)
@@ -219,7 +224,7 @@ def run() -> None:
 
     def on_copy_password(icon, _item):
         cfg = appconfig.load(use_cache=True)
-        _copy(icon, cfg.gateway.proxy_api_key, "Gateway 密码")
+        _copy(icon, cfg.gateway.proxy_api_key, "网关 密码")
 
     def on_open_config(_icon, _item):
         webbrowser.open(paths.config_file().as_uri())
@@ -262,7 +267,7 @@ def run() -> None:
         cfg = appconfig.load(use_cache=True)
         key = cfg.gateway.proxy_api_key
         masked = key[:1] + "***" + key[-1:] if len(key) >= 2 else "***"
-        return f"🔑 Gateway 密码: {masked}\t复制"
+        return f"🔑 网关 密码: {masked}\t复制"
 
     # --- models submenu: dynamic list loaded from /v1/models ---
     # cooldown breaks the refresh->on_update->update_menu->refresh feedback loop
@@ -324,6 +329,11 @@ def run() -> None:
         if info:
             webbrowser.open(info.release_url)
 
+    def on_open_release(_icon, _item):
+        webbrowser.open(
+            f"https://github.com/{GITHUB_REPO}/releases/tag/v{__version__}"
+        )
+
     menu = pystray.Menu(
         # Update notice goes first; the separator below it auto-collapses when
         # the notice is hidden (pystray drops leading/adjacent separators).
@@ -345,10 +355,11 @@ def run() -> None:
         pystray.MenuItem("📄 打开配置文件", on_open_config),
         pystray.MenuItem("📁 打开日志目录", on_open_logs),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem(f"ℹ️ 当前版本 v{__version__}", None, enabled=False),
+        pystray.MenuItem(f"ℹ️ 当前版本 v{__version__}", on_open_release),
+        pystray.Menu.SEPARATOR,
         pystray.MenuItem(start_line, on_start_or_restart),
         pystray.MenuItem("⏹️ 停止", on_stop),
-        pystray.MenuItem("🚪 退出", on_quit),
+        pystray.MenuItem("⏏️ 退出", on_quit),
     )
 
     # --- first-run guided setup BEFORE tray loop (main thread, dialogs work) ---

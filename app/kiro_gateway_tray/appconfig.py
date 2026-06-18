@@ -28,6 +28,8 @@ class CloudflareCfg:
     protocol: str = "http2"   # quic | http2; http2 avoids UDP blocking
     shared_secret: str = ""   # activation code; persisted so update-port works
                               # across restarts (config is chmod 0600 on POSIX)
+    metrics_port: int = 20241  # cloudflared metrics server; probed at /ready to
+                               # detect tunnel connectivity without parsing logs
 
 
 @dataclass
@@ -114,6 +116,13 @@ def gateway_origin(cfg: AppCfg) -> str:
     ``http://127.0.0.1:64005``. Single source for the localhost host:port so
     health/usage/models probes don't each hardcode it."""
     return f"http://127.0.0.1:{cfg.gateway.port}"
+
+
+def tunnel_ready_url(cfg: AppCfg) -> str:
+    """cloudflared metrics readiness endpoint. Returns 200 once at least one
+    edge connection is registered, 503 otherwise — a log-free way to tell the
+    tunnel is actually up."""
+    return f"http://127.0.0.1:{cfg.cloudflare.metrics_port}/ready"
 
 
 def local_url(cfg: AppCfg) -> str:

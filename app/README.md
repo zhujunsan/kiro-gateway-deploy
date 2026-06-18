@@ -4,7 +4,7 @@
 进程内跑网关，子进程跑 cloudflared 把本机网关经 Cloudflare 网络暴露为
 `https://kg-<你的用户名>.example.com/v1`，供 Cursor 直接使用。
 
-> 与仓库根目录的 Docker 部署是两条独立的线，互不影响。
+> 与 `docker/` 目录下的 Docker Compose 部署是两条独立的线，互不影响。
 
 ## 如何使用
 
@@ -75,6 +75,7 @@ python packaging/make_dist.py           # 产物在 app/release/
 | cloudflare | hostname | 自动写入，勿手改 |
 | cloudflare | run_token | 自动写入，勿手改 |
 | cloudflare | protocol | 隧道协议，`http2`（默认，避开 UDP 封锁）或 `quic` |
+| cloudflare | metrics_port | cloudflared 本地 metrics 端口，托盘探测 `/ready` 判断隧道是否连通，默认 20241；端口被占用时可改 |
 | gateway_extra | FAKE_REASONING | 是否注入伪造的思考标签，默认 "false" |
 | gateway_extra | AUTO_TRIM_PAYLOAD | 超限时自动裁剪请求体（false 则直接报错），默认 "true" |
 | gateway_extra | KIRO_MAX_PAYLOAD_BYTES | 请求体上限字节数（硬限约 615KB），默认 "600000" |

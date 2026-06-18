@@ -91,7 +91,7 @@ def test_persisted_secret_enables_port_sync_across_restart(monkeypatch, tmp_path
     def fake_update_port(cfg, secret):
         calls["update_port"] += 1
         assert secret == "persisted-secret"
-        return True
+        return 64010
 
     monkeypatch.setattr(pmod, "update_port", fake_update_port)
     s.start()

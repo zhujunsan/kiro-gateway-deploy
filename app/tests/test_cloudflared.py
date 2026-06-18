@@ -21,11 +21,48 @@ def test_binary_path_missing_raises(monkeypatch):
         assert "cloudflared" in str(e).lower()
 
 
-def test_connection_detection_constants():
-    # Guards the fragile stdout-string contract; if cloudflared rewords these,
-    # this is the single place to update (see CloudflaredProcess docstring).
-    assert cloudflared.CloudflaredProcess._LOG_CONNECTED == "Registered tunnel connection"
-    assert cloudflared.CloudflaredProcess._LOG_DISCONNECTED == "Unregistered tunnel connection"
+def test_start_pins_metrics_port(monkeypatch, tmp_path):
+    # cloudflared must be launched with a fixed --metrics address so the
+    # /ready probe has a stable target; the configured port must be used.
+    import kiro_gateway_tray.cloudflared as cf
+
+    monkeypatch.setattr(cf, "binary_path", lambda: Path("/fake/cloudflared"))
+
+    captured = {}
+
+    class _FakeProc:
+        stdout = None
+        def poll(self): return None
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return _FakeProc()
+
+    monkeypatch.setattr(cf.subprocess, "Popen", fake_popen)
+
+    cfg = appconfig.AppCfg()
+    cfg.cloudflare.run_token = "eyJ_test"
+    cfg.cloudflare.metrics_port = 20299
+    cfg.cloudflare.protocol = "http2"
+
+    proc = cf.CloudflaredProcess()
+    proc.start(cfg)
+
+    cmd = captured["cmd"]
+    assert "--metrics" in cmd
+    assert cmd[cmd.index("--metrics") + 1] == "127.0.0.1:20299"
+    assert proc.metrics_port == 20299
+
+
+def test_start_requires_run_token():
+    import kiro_gateway_tray.cloudflared as cf
+    cfg = appconfig.AppCfg()
+    cfg.cloudflare.run_token = ""
+    try:
+        cf.CloudflaredProcess().start(cfg)
+        assert False, "expected RuntimeError"
+    except RuntimeError as e:
+        assert "run_token" in str(e)
 
 
 def test_provision_username_from_client_id_hash(monkeypatch):

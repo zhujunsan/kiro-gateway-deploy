@@ -125,6 +125,23 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11.9"
+
+      - name: Extract changelog for this tag
+        id: changelog
+        working-directory: app
+        run: |
+          notes=$(python scripts/extract_changelog.py "${GITHUB_REF_NAME}")
+          {
+            echo "body<<__CHANGELOG_EOF__"
+            echo "$notes"
+            echo "__CHANGELOG_EOF__"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Download all artifacts
         uses: actions/download-artifact@v7
         with:
@@ -134,4 +151,6 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           files: artifacts/**/*
+          body: ${{ steps.changelog.outputs.body }}
+          append_body: true
           generate_release_notes: true

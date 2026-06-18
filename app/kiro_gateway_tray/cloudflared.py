@@ -72,28 +72,27 @@ def binary_path() -> Path:
 
 
 class CloudflaredProcess:
-    """Runs `cloudflared tunnel run --token <run_token>` as a child process."""
+    """Runs `cloudflared tunnel run --token <run_token>` as a child process.
 
-    # FRAGILE: connection state is inferred from cloudflared's English stdout.
-    # A cloudflared version that rewords these log lines (or a localized build)
-    # would silently break is_connected(). If the tray shows "连接中" forever
-    # while the tunnel actually works, check these against the pinned
-    # cloudflared version's output and update here. Pinned version lives in
-    # scripts/fetch_cloudflared.py (CLOUDFLARED_VERSION).
-    _LOG_CONNECTED = "Registered tunnel connection"
-    _LOG_DISCONNECTED = "Unregistered tunnel connection"
+    Connection state is determined by probing cloudflared's own metrics
+    ``/ready`` endpoint (HTTP 200 once at least one edge connection is
+    registered), not by parsing stdout. The metrics server is pinned to a fixed
+    port via ``--metrics`` so the probe target is stable. stdout is still
+    captured verbatim to a rotating log file for debugging.
+    """
 
     def __init__(self) -> None:
         self._proc: subprocess.Popen | None = None
-        self._connected = False
         self._reader: threading.Thread | None = None
+        self._metrics_port: int = 20241
 
     def start(self, cfg: AppCfg) -> None:
         run_token = cfg.cloudflare.run_token
         if not run_token:
             raise RuntimeError("cloudflare.run_token 未设置，请先完成首启注册。")
-        self._connected = False
+        self._metrics_port = cfg.cloudflare.metrics_port
         cmd = [str(binary_path()), "tunnel", "--no-autoupdate"]
+        cmd += ["--metrics", f"127.0.0.1:{self._metrics_port}"]
         protocol = getattr(cfg.cloudflare, "protocol", "") or "http2"
         if protocol:
             cmd += ["--protocol", protocol]
@@ -108,17 +107,13 @@ class CloudflaredProcess:
         self._reader.start()
 
     def _watch_output(self) -> None:
-        """Read cloudflared output, detect connection status, and write to log file."""
+        """Mirror cloudflared stdout to the rotating log file (debug only)."""
         proc = self._proc
         if not proc or not proc.stdout:
             return
         logger = _build_log_writer()
         for line in proc.stdout:
             logger(line.rstrip("\n"))
-            if self._LOG_CONNECTED in line:
-                self._connected = True
-            elif self._LOG_DISCONNECTED in line:
-                self._connected = False
 
     def stop(self) -> None:
         if self._proc and self._proc.poll() is None:
@@ -127,10 +122,10 @@ class CloudflaredProcess:
                 self._proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 self._proc.kill()
-        self._connected = False
 
     def is_alive(self) -> bool:
         return bool(self._proc and self._proc.poll() is None)
 
-    def is_connected(self) -> bool:
-        return self._connected
+    @property
+    def metrics_port(self) -> int:
+        return self._metrics_port

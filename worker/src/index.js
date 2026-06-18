@@ -9,7 +9,7 @@
 //
 // POST /update-port
 //   body: { shared_secret, username, port }
-//   → 200 { ok: true }
+//   → 200 { ok: true, changed, port }   (port = value actually in effect)
 //
 // Required Worker Secrets (set via wrangler secret put):
 //   SHARED_SECRET   — the secret distributed to users out-of-band
@@ -153,12 +153,37 @@ async function provision(env, username, port) {
   return { hostname, run_token: tunnel.token };
 }
 
+async function getIngressPort(env, tunnelId) {
+  // Returns the localhost port currently configured for this tunnel, or null
+  // if it can't be determined (no config yet, unexpected shape).
+  try {
+    const cfg = await cfFetch(
+      env,
+      `/accounts/${env.CF_ACCOUNT_ID}/cfd_tunnel/${tunnelId}/configurations`
+    );
+    const ingress = cfg?.config?.ingress || [];
+    for (const rule of ingress) {
+      const m = /^https?:\/\/localhost:(\d+)$/.exec(rule.service || "");
+      if (m) return parseInt(m[1], 10);
+    }
+  } catch {
+    // fall through
+  }
+  return null;
+}
+
 async function updatePort(env, username, port) {
   const { hostname, tunnelName } = tunnelMeta(env, username);
   const tunnel = await findTunnelByName(env, tunnelName);
   if (!tunnel) throw new Error(`tunnel ${tunnelName} not found`);
-  await setIngress(env, tunnel.id, hostname, port);
-  return { ok: true };
+  const current = await getIngressPort(env, tunnel.id);
+  const changed = current !== port;
+  if (changed) {
+    await setIngress(env, tunnel.id, hostname, port);
+  }
+  // Echo back the port that is actually in effect so the client can persist
+  // the truth (Worker may clamp invalid ports to the default).
+  return { ok: true, changed, port };
 }
 
 // --- request handler ---

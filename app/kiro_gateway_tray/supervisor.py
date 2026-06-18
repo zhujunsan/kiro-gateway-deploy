@@ -31,6 +31,13 @@ class Supervisor:
         self.provision_callback: Callable[[AppCfg], str] | None = None
         # Cached gateway health status (never block the main/UI thread)
         self._gw_health: str = "stopped"
+        # Cached tunnel connectivity, refreshed by the health loop via the
+        # cloudflared /ready probe (not by parsing logs).
+        self._tunnel_connected: bool = False
+        # Fired whenever gateway health or tunnel connectivity changes, so the
+        # tray can redraw the menu the moment the tunnel comes up (instead of
+        # waiting for the next time the user opens the menu).
+        self.on_status_change: Callable[[], None] | None = None
         self._health_thread: threading.Thread | None = None
         self._health_stop = threading.Event()
         # Reused connection pool for localhost health/usage probes.
@@ -107,10 +114,10 @@ class Supervisor:
             return
         from . import provision
         try:
-            provision.update_port(cfg, secret)
-            cfg.cloudflare.registered_port = cfg.gateway.port
+            effective_port = provision.update_port(cfg, secret)
+            cfg.cloudflare.registered_port = effective_port
             appconfig.save(cfg)
-            logger.info("synced tunnel port to {} via Worker", cfg.gateway.port)
+            logger.info("synced tunnel port to {} via Worker", effective_port)
         except Exception as e:
             print(f"[kiro-gateway-tray] update-port 失败: {e}", file=sys.stderr)
             logger.exception("update-port failed")
@@ -133,6 +140,7 @@ class Supervisor:
         self.tunnel.stop()
         self.gateway.stop()
         self._gw_health = "stopped"
+        self._tunnel_connected = False
 
     def restart(self) -> bool:
         self.stop()
@@ -157,6 +165,8 @@ class Supervisor:
             consecutive_ok = 0
             while not self._health_stop.is_set():
                 interval = self._PROBE_INTERVAL_ACTIVE
+                prev_gw = self._gw_health
+                prev_tunnel = self._tunnel_connected
                 if not self.gateway.is_alive():
                     self._gw_health = "stopped"
                     consecutive_failures = 0
@@ -184,17 +194,45 @@ class Supervisor:
                             if consecutive_failures >= self._UNHEALTHY_THRESHOLD
                             else "starting"
                         )
+                self._tunnel_connected = self._probe_tunnel_ready()
+                # Notify the UI only on an actual state transition so we don't
+                # spin the menu redraw on every probe.
+                if (self._gw_health != prev_gw
+                        or self._tunnel_connected != prev_tunnel):
+                    self._fire_status_change()
                 self._health_stop.wait(interval)
 
         self._health_thread = threading.Thread(target=_loop, daemon=True)
         self._health_thread.start()
 
+    def _probe_tunnel_ready(self) -> bool:
+        """True if cloudflared reports at least one live edge connection.
+
+        Probes the metrics /ready endpoint (200 = ready, 503 = not yet). Any
+        error (process down, port not up yet) counts as not-ready."""
+        if not self.tunnel.is_alive():
+            return False
+        cfg = self._cfg or self._load()
+        try:
+            return self._client.get(
+                appconfig.tunnel_ready_url(cfg), timeout=1
+            ).status_code == 200
+        except Exception:
+            return False
+
+    def _fire_status_change(self) -> None:
+        cb = self.on_status_change
+        if cb is None:
+            return
+        try:
+            cb()
+        except Exception:
+            logger.debug("on_status_change callback failed", exc_info=True)
+
     def _tunnel_status(self) -> str:
         if not self.tunnel.is_alive():
             return "stopped"
-        if hasattr(self.tunnel, 'is_connected') and callable(self.tunnel.is_connected):
-            return "running" if self.tunnel.is_connected() else "connecting"
-        return "running"
+        return "running" if self._tunnel_connected else "connecting"
 
     def status(self) -> dict[str, str]:
         """Non-blocking: reads cached health state, never does I/O."""
