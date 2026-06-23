@@ -22,6 +22,8 @@ class Supervisor:
     # health probe cadence: tight while settling, relaxed once steady-running
     _PROBE_INTERVAL_ACTIVE = 3      # seconds, while starting/unhealthy
     _PROBE_INTERVAL_STEADY = 15     # seconds, once consistently running
+    # automatically restart cloudflared if stuck in connecting/disconnected state for this long (seconds)
+    _TUNNEL_RECONNECT_TIMEOUT = 60
 
     def __init__(self, gateway=None, tunnel=None) -> None:
         self.gateway = gateway or GatewayProcess()
@@ -34,6 +36,8 @@ class Supervisor:
         # Cached tunnel connectivity, refreshed by the health loop via the
         # cloudflared /ready probe (not by parsing logs).
         self._tunnel_connected: bool = False
+        # Timestamp since when the tunnel has been disconnected while running
+        self._tunnel_disconnected_since: float | None = None
         # Failure/success run-lengths feeding the health state machine. Kept on
         # the instance (not as loop-locals) so the on-demand probe_now() and the
         # background loop drive ONE shared state machine instead of two that
@@ -183,6 +187,7 @@ class Supervisor:
             self._tunnel_connected = False
             self._consecutive_failures = 0
             self._consecutive_ok = 0
+            self._tunnel_disconnected_since = None
 
     def restart(self) -> bool:
         self.stop()
@@ -254,7 +259,32 @@ class Supervisor:
 
             alive = self.gateway.is_alive()
             healthy = self._probe_gateway_once() if alive else False
+            tunnel_alive = self.tunnel.is_alive()
             tunnel_connected = self._probe_tunnel_ready()
+
+            should_restart_tunnel = False
+            with self._state_lock:
+                if not tunnel_alive or tunnel_connected:
+                    self._tunnel_disconnected_since = None
+                else:
+                    if self._tunnel_disconnected_since is None:
+                        self._tunnel_disconnected_since = time.time()
+                    elif time.time() - self._tunnel_disconnected_since > self._TUNNEL_RECONNECT_TIMEOUT:
+                        should_restart_tunnel = True
+                        self._tunnel_disconnected_since = None
+
+            if should_restart_tunnel:
+                logger.warning(
+                    "Cloudflare tunnel has been disconnected for more than {}s; restarting...",
+                    self._TUNNEL_RECONNECT_TIMEOUT
+                )
+                try:
+                    self.tunnel.stop()
+                    cfg = self._get_cfg()
+                    self.tunnel.start(cfg)
+                except Exception:
+                    logger.exception("Failed to restart cloudflared tunnel")
+                tunnel_connected = False
 
             with self._state_lock:
                 if not alive:

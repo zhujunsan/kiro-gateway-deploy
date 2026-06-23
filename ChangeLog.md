@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.1.16 (2026-06-23)
+
+**New**
+- 守护进程新增 cloudflared 隧道断连自动重启：隧道存活但 `/ready` 探测持续不通超过 60s 时，自动 stop/start 重建隧道，避免长时间卡在 connecting/disconnected 状态需手动干预（附单元测试）。
+
+**Changed**
+- 托盘默认配置不再按字节自动裁剪超大请求：`AUTO_TRIM_PAYLOAD` 默认改为 `"false"` 并移除 `KIRO_MAX_PAYLOAD_BYTES`。Kiro 上下文上限按 token 计（约 200k），字节阈值无法可靠对齐；超限时网关直接返回 `400 context_length_exceeded`，交由客户端（如 Cursor）自行压缩上下文重试。已存在的 `config.toml` 不受影响。
+- 同步上游网关镜像 tag 至 `main-67a1a94`（`docker/docker-compose.yml`），并将 `UPSTREAM_SHA` 同步至对应 commit。该版本将 Kiro 的 `CONTENT_LENGTH_EXCEEDS_THRESHOLD` 规范化为标准 `context_length_exceeded`（OpenAI 400 invalid_request_error）及 Anthropic invalid_request_error 形状，便于客户端识别上下文溢出。
+- README（`app/`）同步上述裁剪相关配置说明。
+
 ## v0.1.15 (2026-06-18)
 
 **Changed**

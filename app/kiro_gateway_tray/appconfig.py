@@ -38,8 +38,10 @@ class AppCfg:
     cloudflare: CloudflareCfg = field(default_factory=CloudflareCfg)
     gateway_extra: dict = field(default_factory=lambda: {
         "FAKE_REASONING": "false",
-        "AUTO_TRIM_PAYLOAD": "true",
-        "KIRO_MAX_PAYLOAD_BYTES": "600000",
+        # 关闭按字节自动裁剪：Kiro 的上下文上限是按 token 算的（~200k），
+        # 字节阈值无法可靠对齐。超限时让 gateway 回 400 context_length_exceeded，
+        # 由客户端（如 Cursor）自行压缩上下文重试。
+        "AUTO_TRIM_PAYLOAD": "false",
         "TRUNCATION_RECOVERY": "true",
         "WEB_SEARCH_ENABLED": "false",
         "FIRST_TOKEN_TIMEOUT": "30",

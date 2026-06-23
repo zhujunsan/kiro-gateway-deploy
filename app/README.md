@@ -82,8 +82,8 @@ python packaging/make_dist.py           # 产物在 app/release/
 | cloudflare | protocol | 隧道协议，`http2`（默认，避开 UDP 封锁）或 `quic` |
 | cloudflare | metrics_port | cloudflared 本地 metrics 端口，托盘探测 `/ready` 判断隧道是否连通，默认 20241；端口被占用时可改 |
 | gateway_extra | FAKE_REASONING | 是否注入伪造的思考标签，默认 "false" |
-| gateway_extra | AUTO_TRIM_PAYLOAD | 超限时自动裁剪请求体（false 则直接报错），默认 "true" |
-| gateway_extra | KIRO_MAX_PAYLOAD_BYTES | 请求体上限字节数（硬限约 615KB），默认 "600000" |
+| gateway_extra | AUTO_TRIM_PAYLOAD | 超限时按字节自动裁剪请求体；默认 "false"，让超限请求直接返回 400 context_length_exceeded，由客户端（如 Cursor）自行压缩上下文重试。注意 Kiro 上下文上限按 token 算（约 200k），字节裁剪无法可靠对齐 |
+| gateway_extra | KIRO_MAX_PAYLOAD_BYTES | 仅在 AUTO_TRIM_PAYLOAD="true" 时生效的字节裁剪阈值；默认模板已不写此项（默认不裁剪），需要兜底裁剪时再手动加 |
 | gateway_extra | TRUNCATION_RECOVERY | 响应被截断时自动通知模型续写，默认 "true" |
 | gateway_extra | WEB_SEARCH_ENABLED | 是否自动注入 web_search 工具，默认 "false" |
 | gateway_extra | FIRST_TOKEN_TIMEOUT | 等待首个 token 的超时秒数，默认 "30" |

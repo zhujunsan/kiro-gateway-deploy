@@ -1,3 +1,4 @@
+import time
 from kiro_gateway_tray import supervisor, appconfig
 
 
@@ -206,3 +207,43 @@ def test_mark_starting(monkeypatch, tmp_path):
     assert s.status()["gateway"] == "stopped"
     s.mark_starting()
     assert s.status()["gateway"] == "starting"
+
+
+def test_run_probe_cycle_auto_restarts_tunnel_on_timeout(monkeypatch, tmp_path):
+    s = _make_sup(monkeypatch, tmp_path)
+    s.start()
+
+    # Gateway is alive and healthy, tunnel is alive but not ready
+    s.gateway.started = True
+    s.tunnel.started = True
+
+    class _Resp:
+        status_code = 200
+
+    monkeypatch.setattr(s._client, "get", lambda *a, **k: _Resp())
+    monkeypatch.setattr(s, "_probe_tunnel_ready", lambda: False)
+
+    # First probe: sets the disconnected timestamp
+    s._run_probe_cycle()
+    assert s._tunnel_disconnected_since is not None
+    initial_ts = s._tunnel_disconnected_since
+
+    # Check that it didn't restart yet
+    restarted = []
+    monkeypatch.setattr(s.tunnel, "stop", lambda: restarted.append("stop"))
+    monkeypatch.setattr(s.tunnel, "start", lambda cfg: restarted.append("start"))
+
+    # Run probe again with no time advancement: should not restart
+    s._run_probe_cycle()
+    assert not restarted
+    assert s._tunnel_disconnected_since == initial_ts
+
+    # Mock time advancement beyond _TUNNEL_RECONNECT_TIMEOUT
+    fake_time = initial_ts + s._TUNNEL_RECONNECT_TIMEOUT + 5
+    monkeypatch.setattr(time, "time", lambda: fake_time)
+
+    s._run_probe_cycle()
+    assert "stop" in restarted
+    assert "start" in restarted
+    assert s._tunnel_disconnected_since is None
+
