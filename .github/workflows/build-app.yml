@@ -120,6 +120,10 @@ jobs:
         with:
           name: kiro-gateway-tray-${{ matrix.os }}-${{ matrix.arch }}
           path: app/release/*
+          # These artifacts are only a hand-off to the release job; the published
+          # GitHub Release keeps the permanent copy. Expire fast to avoid piling up
+          # billable Actions storage.
+          retention-days: 1
 
   release:
     name: publish release
