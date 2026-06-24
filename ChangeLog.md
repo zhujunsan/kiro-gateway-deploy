@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.1.20 (2026-06-24)
+
+**Fixed**
+- macOS 开机自启登录项恢复显示 `KiroGatewayTray`：v0.1.18 改用 `open -a <bundle>` 启动导致登录项名称变成 `open`（launchd 从 `ProgramArguments[0]` 推断条目名）；现回退到直接运行 App 内可执行文件，登录项正确显示应用名。`AssociatedBundleIdentifiers` 键仅对已签名 App 有效，一并移除。
+
 ## v0.1.19 (2026-06-24)
 
 **New**
