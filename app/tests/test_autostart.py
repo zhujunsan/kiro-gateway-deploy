@@ -1,8 +1,5 @@
 # app/tests/test_autostart.py
 import sys
-from pathlib import Path
-
-import pytest
 
 from kiro_gateway_tray import autostart
 
@@ -27,7 +24,9 @@ def test_launch_argv_frozen_linux_prefers_appimage(monkeypatch):
 
 
 def test_launch_argv_frozen_macos_opens_app_bundle(monkeypatch):
-    bundle = Path("/Applications/KiroGatewayTray.app")
+    # Use a plain string (not Path) so str() stays POSIX-style on Windows CI;
+    # the production code calls str() on whatever _macos_app_bundle returns.
+    bundle = "/Applications/KiroGatewayTray.app"
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     monkeypatch.setattr(sys, "platform", "darwin")
     monkeypatch.setattr(autostart, "_macos_app_bundle", lambda: bundle)
