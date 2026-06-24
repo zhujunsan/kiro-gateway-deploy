@@ -47,7 +47,14 @@ def _vendor_root() -> Path:
 
 
 def _apply_env(cfg: AppCfg) -> None:
-    for k, v in appconfig.to_gateway_env(cfg).items():
+    env = appconfig.to_gateway_env(cfg)
+    # DEBUG_DIR depends on the runtime log path, so it can't live in the static
+    # appconfig defaults. Point it at a *subdirectory* of the log dir: in
+    # "errors" mode the gateway rmtree's and recreates DEBUG_DIR on each failed
+    # request, so it must never be the log dir itself. Respect a user override
+    # if one was set explicitly under [gateway_extra].
+    env.setdefault("DEBUG_DIR", str(paths.log_dir() / "debug_logs"))
+    for k, v in env.items():
         os.environ[k] = v
 
 
@@ -131,7 +138,7 @@ def _setup_child_logging() -> None:
         log.handlers = [intercept]
         log.propagate = False
 
-    _loguru.add(log_file, rotation="2 MB", retention=3, encoding="utf-8", enqueue=True)
+    _loguru.add(log_file, rotation="2 MB", retention=5, encoding="utf-8", enqueue=True)
 
 
 def run_gateway_blocking() -> int:

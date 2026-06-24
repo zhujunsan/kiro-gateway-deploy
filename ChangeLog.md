@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.1.17 (2026-06-24)
+
+**New**
+- 新增开机自启支持：托盘菜单加入「🚀 开机自启」开关，跨平台实现（macOS LaunchAgent、Windows 注册表 Run 项、Linux XDG autostart），免管理员权限（附单元测试）。
+- 托盘「复制模型名」菜单将 `kiro*` 别名单独分组到「别名（Cursor 内使用）」分隔区，与原始模型名区分展示。
+- 托盘默认开启失败请求抓包与详细日志：`DEBUG_MODE=errors`（仅在请求失败时把请求体/响应落盘到日志目录下 `debug_logs/`，正常请求零额外开销）+ `LOG_LEVEL=DEBUG`，便于排查 Cursor 报错（如 "Invalid tool use format"）。已存在的 `config.toml` 在加载时自动回填这两项默认值。
+
+**Changed**
+- 网关日志保留份数由 3 提升至 5（`rotation=2 MB`，约 10MB 上限），配合详细日志保留更多排查历史。
+- Cloudflare provision 向导步骤提示由 `(1/2)(2/2)` 更正为 `(1/3)(2/3)(3/3)`，与实际三步（Worker 地址 → 激活码 → Profile ARN）一致。
+- macOS 应用 bundle identifier 调整为 `top.botsonny.kiro-gateway-tray`。
+
 ## v0.1.16 (2026-06-23)
 
 **New**

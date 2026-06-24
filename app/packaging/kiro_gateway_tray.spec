@@ -78,7 +78,7 @@ if sys.platform == "darwin":
         coll,
         name=f"{_name}.app",
         icon=_bundle_icon,
-        bundle_identifier="net.zhujunsan.kiro-gateway-tray",
+        bundle_identifier="top.botsonny.kiro-gateway-tray",
         info_plist={
             "LSUIElement": True,            # menu-bar only; no Dock icon
             "NSHighResolutionCapable": True,

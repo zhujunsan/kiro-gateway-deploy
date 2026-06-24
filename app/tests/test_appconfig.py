@@ -34,6 +34,9 @@ def test_to_env_maps_known_keys(tmp_path, monkeypatch):
     assert env["SERVER_HOST"] == "127.0.0.1"
     assert env["SERVER_PORT"] == "64005"
     assert env["FAKE_REASONING"] == "false"
+    # Debug capture defaults: verbose logs + on-error payload dump.
+    assert env["LOG_LEVEL"] == "DEBUG"
+    assert env["DEBUG_MODE"] == "errors"
 
 
 def test_legacy_fake_reasoning_migrates_to_extra(tmp_path, monkeypatch):
@@ -49,6 +52,34 @@ def test_legacy_fake_reasoning_migrates_to_extra(tmp_path, monkeypatch):
     assert again.gateway_extra["FAKE_REASONING"] == "true"
     env = appconfig.to_gateway_env(again)
     assert env["FAKE_REASONING"] == "true"
+
+
+def test_debug_defaults_backfilled_for_old_configs(tmp_path, monkeypatch):
+    monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
+    cfg = appconfig.load()
+    p = appconfig.path()
+    # Old config written before LOG_LEVEL/DEBUG_MODE existed.
+    p.write_text(
+        '[gateway_extra]\nAUTO_TRIM_PAYLOAD = "false"\n',
+        encoding="utf-8",
+    )
+    again = appconfig.load()
+    assert again.gateway_extra["LOG_LEVEL"] == "DEBUG"
+    assert again.gateway_extra["DEBUG_MODE"] == "errors"
+
+
+def test_user_debug_values_are_not_overridden(tmp_path, monkeypatch):
+    monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
+    cfg = appconfig.load()
+    p = appconfig.path()
+    p.write_text(
+        '[gateway_extra]\nLOG_LEVEL = "INFO"\nDEBUG_MODE = "off"\n',
+        encoding="utf-8",
+    )
+    again = appconfig.load()
+    # setdefault must not clobber explicit user choices.
+    assert again.gateway_extra["LOG_LEVEL"] == "INFO"
+    assert again.gateway_extra["DEBUG_MODE"] == "off"
 
 
 def test_is_provisioned(tmp_path, monkeypatch):

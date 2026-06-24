@@ -47,6 +47,12 @@ class AppCfg:
         "FIRST_TOKEN_TIMEOUT": "30",
         "FIRST_TOKEN_MAX_RETRIES": "3",
         "STREAMING_READ_TIMEOUT": "300",
+        # 默认开启详细日志 + 失败请求抓包，便于排查 Cursor 报错（如
+        # "Invalid tool use format"）。DEBUG_MODE=errors 只在请求失败时把
+        # 请求体/响应落盘，正常请求零额外开销；落盘目录由 gateway.py 在运行时
+        # 指到 log 目录下的 debug_logs/（DEBUG_DIR）。
+        "LOG_LEVEL": "DEBUG",
+        "DEBUG_MODE": "errors",
     })
 
 
@@ -87,6 +93,12 @@ def _load_from_disk() -> AppCfg:
     legacy_fake = raw_gateway.pop("fake_reasoning", None)
     if legacy_fake is not None and "FAKE_REASONING" not in extra:
         extra["FAKE_REASONING"] = "true" if legacy_fake else "false"
+    # Backfill debug-capture defaults for configs written before these keys
+    # existed, so updating the app turns them on without a fresh install. This
+    # runs on every load: removing a key won't stick (it gets re-added), which
+    # is intentional — these are managed defaults, not user-tunable here.
+    extra.setdefault("LOG_LEVEL", "DEBUG")
+    extra.setdefault("DEBUG_MODE", "errors")
     return AppCfg(
         gateway=GatewayCfg(**{**asdict(GatewayCfg()), **raw_gateway}),
         cloudflare=CloudflareCfg(**{**asdict(CloudflareCfg()), **(raw.get("cloudflare") or {})}),

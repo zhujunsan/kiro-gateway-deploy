@@ -84,7 +84,7 @@ def osascript_form_cf(title: str, default_url: str = "") -> tuple[str, str]:
     """
     script = (
         f'display dialog "请输入 Provision 服务地址：\\n\\n由管理员提供的隧道签发服务 URL" '
-        f'with title "{escape_applescript(title)} (1/2)" '
+        f'with title "{escape_applescript(title)} (1/3)" '
         f'default answer "{escape_applescript(default_url)}" '
         f'buttons {{"取消", "下一步"}} default button "下一步"'
     )
@@ -102,7 +102,7 @@ def osascript_form_cf(title: str, default_url: str = "") -> tuple[str, str]:
 
     script2 = (
         f'display dialog "Worker: {escape_applescript(url)}\\n\\n请输入激活码（共享密钥）：" '
-        f'with title "{escape_applescript(title)} (2/2)" '
+        f'with title "{escape_applescript(title)} (2/3)" '
         f'default answer "" '
         f'with hidden answer '
         f'buttons {{"上一步", "完成"}} default button "完成"'

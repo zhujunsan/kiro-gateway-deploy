@@ -8,7 +8,7 @@ import time
 import webbrowser
 from typing import Callable
 
-from . import __version__, GITHUB_REPO, appconfig, dialogs, macos_menu, notify as _notify_mod, paths, platform_compat, usage
+from . import __version__, GITHUB_REPO, appconfig, autostart, dialogs, macos_menu, notify as _notify_mod, paths, platform_compat, usage
 from .async_cache import AsyncRefreshCache
 from .icon import make_icon
 from .log import logger
@@ -86,7 +86,7 @@ def _first_run_setup(cfg) -> str:
     # 通常读不到，需要用户手动粘贴。api_region 从该 ARN 中解析得到。
     default_arn = _prov.read_profile_arn(cfg)
     profile_arn = dialogs.prompt_input(
-        f"{APP_NAME} - Profile ARN",
+        f"{APP_NAME} - Profile ARN (3/3)",
         "请输入 Kiro profileArn：\n\n"
         "形如 arn:aws:codewhisperer:us-east-1:123456789012:profile/XXXX\n"
         "（首次使用时 Kiro Gateway 尚未写回，需要手动填写）",
@@ -295,6 +295,24 @@ class TrayApp:
             f"https://github.com/{GITHUB_REPO}/releases/tag/v{__version__}"
         )
 
+    def _on_toggle_autostart(self, icon, _item):
+        want = not autostart.is_enabled()
+        try:
+            autostart.set_enabled(want)
+        except Exception as e:
+            logger.exception("toggle autostart failed")
+            self._notify(f"{APP_NAME} 错误", f"设置开机自启失败：{str(e)[:160]}")
+            icon.update_menu()
+            return
+        if want:
+            extra = ""
+            if sys.platform == "darwin":
+                extra = "\n可在「系统设置 → 通用 → 登录项」中管理。"
+            self._notify(APP_NAME, f"已开启开机自启，下次登录将自动启动。{extra}")
+        else:
+            self._notify(APP_NAME, "已关闭开机自启。")
+        icon.update_menu()
+
     def _on_copy_model(self, model_id):
         def _handler(_icon, _item):
             self._copy(model_id, f"模型 {model_id}")
@@ -333,6 +351,10 @@ class TrayApp:
         masked = key[:1] + "***" + key[-1:] if len(key) >= 2 else "***"
         return f"🔑 网关 密码: {masked}\t复制"
 
+    def _autostart_line(self, _item):
+        state = "✓ 已开启" if autostart.is_enabled() else "✗ 未开启"
+        return f"🚀 开机自启\t{state}"
+
     def _models_submenu_items(self):
         pystray = self._pystray
         gw_status = self.sup.status()["gateway"]
@@ -345,10 +367,23 @@ class TrayApp:
             return [pystray.MenuItem("加载中…", None, enabled=False)]
         if not items:
             return [pystray.MenuItem("无可用模型", None, enabled=False)]
-        return [
+        regular = [m for m in items if not m.startswith("kiro")]
+        aliases = [m for m in items if m.startswith("kiro")]
+        menu_items = [
             pystray.MenuItem(f"{m}\t复制", self._on_copy_model(m))
-            for m in items
+            for m in regular
         ]
+        if aliases:
+            if menu_items:
+                menu_items.append(pystray.Menu.SEPARATOR)
+            menu_items.append(
+                pystray.MenuItem("别名（Cursor 内使用）", None, enabled=False)
+            )
+            menu_items.extend(
+                pystray.MenuItem(f"{m}\t复制", self._on_copy_model(m))
+                for m in aliases
+            )
+        return menu_items
 
     def _start_line(self, _item):
         if self.sup.status()["gateway"] == "running":
@@ -416,6 +451,7 @@ class TrayApp:
             pystray.MenuItem("📄 打开配置文件", self._on_open_config),
             pystray.MenuItem("📁 打开日志目录", self._on_open_logs),
             pystray.Menu.SEPARATOR,
+            pystray.MenuItem(self._autostart_line, self._on_toggle_autostart),
             pystray.MenuItem(f"ℹ️ 当前版本 v{__version__}", self._on_open_release),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(self._start_line, self._on_start_or_restart),
