@@ -1,5 +1,6 @@
 # app/tests/test_autostart.py
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -26,12 +27,10 @@ def test_launch_argv_frozen_linux_prefers_appimage(monkeypatch):
 
 
 def test_launch_argv_frozen_macos_opens_app_bundle(monkeypatch):
+    bundle = Path("/Applications/KiroGatewayTray.app")
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     monkeypatch.setattr(sys, "platform", "darwin")
-    monkeypatch.setattr(
-        sys, "executable",
-        "/Applications/KiroGatewayTray.app/Contents/MacOS/KiroGatewayTray",
-    )
+    monkeypatch.setattr(autostart, "_macos_app_bundle", lambda: bundle)
     argv = autostart._launch_argv()
     assert argv == [
         "/usr/bin/open", "-g", "-j", "-a",
