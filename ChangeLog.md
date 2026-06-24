@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.1.18 (2026-06-24)
+
+**Changed**
+- macOS 开机自启改善「登录项」显示：LaunchAgent 改为通过 `open -a` 启动 `.app` 包（而非包内裸可执行文件），并在 plist 中加入 `AssociatedBundleIdentifiers`，使「系统设置 → 通用 → 登录项」尽量显示应用名称与图标，而非通用 exec 图标。注意：应用当前未签名，图标为尽力而为，「身份不明的开发者」提示需 Apple 签名/公证后才会消失；升级后需重新勾选一次开机自启以重写 plist。
+
 ## v0.1.17 (2026-06-24)
 
 **New**

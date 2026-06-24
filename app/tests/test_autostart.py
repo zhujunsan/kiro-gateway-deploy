@@ -25,11 +25,26 @@ def test_launch_argv_frozen_linux_prefers_appimage(monkeypatch):
     assert autostart._launch_argv() == ["/home/u/Apps/kiro.AppImage"]
 
 
-def test_launch_argv_frozen_macos_uses_executable(monkeypatch):
+def test_launch_argv_frozen_macos_opens_app_bundle(monkeypatch):
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     monkeypatch.setattr(sys, "platform", "darwin")
-    monkeypatch.setattr(sys, "executable", "/Applications/KiroGatewayTray.app/x")
-    assert autostart._launch_argv() == ["/Applications/KiroGatewayTray.app/x"]
+    monkeypatch.setattr(
+        sys, "executable",
+        "/Applications/KiroGatewayTray.app/Contents/MacOS/KiroGatewayTray",
+    )
+    argv = autostart._launch_argv()
+    assert argv == [
+        "/usr/bin/open", "-g", "-j", "-a",
+        "/Applications/KiroGatewayTray.app",
+    ]
+
+
+def test_launch_argv_frozen_macos_falls_back_without_bundle(monkeypatch):
+    # No .app ancestor (unexpected layout) → fall back to the bare executable.
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(sys, "executable", "/opt/local/bin/kiro")
+    assert autostart._launch_argv() == ["/opt/local/bin/kiro"]
 
 
 def test_quote_handles_spaces():
@@ -47,6 +62,7 @@ def test_macos_roundtrip(monkeypatch, tmp_path):
     body = plist.read_text()
     assert autostart.BUNDLE_ID in body
     assert "<key>RunAtLoad</key>" in body
+    assert "<key>AssociatedBundleIdentifiers</key>" in body
     assert autostart.is_enabled() is True
     autostart.set_enabled(False)
     assert plist.exists() is False

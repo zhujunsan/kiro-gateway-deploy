@@ -39,7 +39,30 @@ def _launch_argv() -> list[str]:
     if sys.platform.startswith("linux"):
         # AppImage mount path changes every run; $APPIMAGE is the stable file.
         return [os.environ.get("APPIMAGE") or sys.executable]
+    if sys.platform == "darwin":
+        # Launch the .app bundle (via `open`) rather than the bare Mach-O at
+        # Contents/MacOS/…, so macOS attributes the login item to the app and
+        # shows its name + icon in System Settings instead of a generic exec
+        # glyph. `-g` keeps us in the background, `-j` launches hidden (we are
+        # an LSUIElement menu-bar app anyway).
+        bundle = _macos_app_bundle()
+        if bundle is not None:
+            return ["/usr/bin/open", "-g", "-j", "-a", str(bundle)]
     return [sys.executable]
+
+
+def _macos_app_bundle() -> Path | None:
+    """Path to the enclosing ``.app`` bundle when running frozen on macOS.
+
+    ``sys.executable`` is ``…/KiroGatewayTray.app/Contents/MacOS/<exe>``; the
+    bundle is three levels up. Returns ``None`` if we can't find a ``.app``
+    ancestor (e.g. running from source or an unexpected layout)."""
+    if sys.platform != "darwin" or not getattr(sys, "frozen", False):
+        return None
+    for parent in Path(sys.executable).resolve().parents:
+        if parent.suffix == ".app":
+            return parent
+    return None
 
 
 def _quote(arg: str) -> str:
@@ -63,6 +86,12 @@ def _macos_plist_contents() -> str:
     args_xml = "\n".join(
         f"        <string>{_xml_escape(a)}</string>" for a in _launch_argv()
     )
+    # Associate the agent with the app bundle so System Settings → Login Items
+    # shows the app's name + icon instead of a generic exec glyph. Apple only
+    # guarantees this when the launched binary and the app share a Developer ID
+    # signature; this app is currently unsigned, so the icon is best-effort
+    # (LaunchServices can often still resolve it by bundle id) and the
+    # "unidentified developer" line will remain until the app is signed.
     return (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
@@ -74,6 +103,10 @@ def _macos_plist_contents() -> str:
         "    <key>ProgramArguments</key>\n"
         "    <array>\n"
         f"{args_xml}\n"
+        "    </array>\n"
+        "    <key>AssociatedBundleIdentifiers</key>\n"
+        "    <array>\n"
+        f"        <string>{BUNDLE_ID}</string>\n"
         "    </array>\n"
         "    <key>RunAtLoad</key>\n"
         "    <true/>\n"
