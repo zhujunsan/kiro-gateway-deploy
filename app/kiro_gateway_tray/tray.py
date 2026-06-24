@@ -390,7 +390,40 @@ class TrayApp:
             return "🔄 重启"
         return "▶️ 启动"
 
+    def _version_line(self, _item) -> str:
+        self._ensure_update_info_sync()
+        self._kick_update_check()
+        from . import updates
+        line = f"ℹ️ 当前版本 v{__version__}"
+        cached = updates._read_cache() or {}
+        latest = cached.get("latest")
+        if not latest:
+            return f"{line}\t检查中…"
+        latest_ver = latest.lstrip("vV")
+        if updates._is_newer(__version__, latest):
+            return f"{line}\t可升级 {latest_ver}"
+        if updates._is_newer(latest, __version__):
+            return f"{line}\t高于发布版 {latest_ver}"
+        return f"{line}\t已是最新"
+
+    def _ensure_update_info_sync(self) -> None:
+        """Apply cached update info immediately (no network)."""
+        if self._update_info is not None:
+            return
+        try:
+            from . import updates
+            info = updates.peek_cached()
+            if info is not None:
+                self._update_info = info
+        except Exception:
+            logger.debug("update cache peek failed", exc_info=True)
+
     def _update_visible(self, _item) -> bool:
+        # Evaluated before other menu lines (update item is first). Sync peek
+        # here so the line can appear on the first open without waiting for the
+        # async GitHub fetch kicked off below.
+        self._ensure_update_info_sync()
+        self._kick_update_check()
         return self._update_info is not None
 
     def _update_line(self, _item) -> str:
@@ -401,17 +434,29 @@ class TrayApp:
 
     def _kick_update_check(self) -> None:
         if not self._update_gate.try_enter():
+            logger.debug("update check skipped (in flight)")
             return
 
         def _work():
             try:
                 from . import updates
+                stale = updates._should_check()
+                if stale:
+                    logger.info("update check: querying GitHub releases")
                 info = updates.check()
+                logger.info(
+                    "update check: current={} latest={} available={}",
+                    info.current,
+                    info.latest,
+                    info.update_available,
+                )
                 if info.update_available:
+                    prev = self._update_info
                     self._update_info = info
-                    self._request_redraw()
+                    if prev is None or prev.latest != info.latest:
+                        self._request_redraw()
             except Exception:
-                logger.debug("update check failed", exc_info=True)
+                logger.warning("update check failed", exc_info=True)
             finally:
                 self._update_gate.done()
         threading.Thread(target=_work, daemon=True).start()
@@ -426,7 +471,6 @@ class TrayApp:
                 finally:
                     self._probe_gate.done()
             threading.Thread(target=_probe, daemon=True).start()
-        self._kick_update_check()
 
     # --- build the menu and run the loop ---
 
@@ -452,7 +496,7 @@ class TrayApp:
             pystray.MenuItem("📁 打开日志目录", self._on_open_logs),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(self._autostart_line, self._on_toggle_autostart),
-            pystray.MenuItem(f"ℹ️ 当前版本 v{__version__}", self._on_open_release),
+            pystray.MenuItem(self._version_line, self._on_open_release),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(self._start_line, self._on_start_or_restart),
             pystray.MenuItem("⏹️ 停止", self._on_stop),

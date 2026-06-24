@@ -41,3 +41,23 @@ def test_check_uses_cache_when_fresh(tmp_path, monkeypatch):
 def test_ttl_is_ten_minutes():
     # Update checks are throttled to once per 10 minutes.
     assert updates._TTL_SECONDS == 10 * 60
+
+
+def test_peek_cached_no_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
+    assert updates.peek_cached(current="0.1.0") is None
+
+
+def test_peek_cached_newer_version(tmp_path, monkeypatch):
+    monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
+    updates._write_cache(latest="v9.9.9")
+    info = updates.peek_cached(current="0.1.0")
+    assert info is not None
+    assert info.latest == "v9.9.9"
+    assert info.update_available is True
+
+
+def test_peek_cached_same_version(tmp_path, monkeypatch):
+    monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
+    updates._write_cache(latest="v0.2.0")
+    assert updates.peek_cached(current="0.2.0") is None

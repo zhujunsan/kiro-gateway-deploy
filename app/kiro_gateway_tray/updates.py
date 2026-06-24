@@ -81,6 +81,24 @@ def _fetch_latest() -> str | None:
     return resp.json().get("tag_name")
 
 
+def peek_cached(current: str | None = None) -> UpdateInfo | None:
+    """Return update info from the on-disk cache only (no network).
+
+    Used by the tray menu so the "new version" line can appear on the first
+    menu open without waiting for a background fetch to finish.
+    """
+    current = current or __version__
+    latest = (_read_cache() or {}).get("latest")
+    if not latest or not _is_newer(current, latest):
+        return None
+    return UpdateInfo(
+        current=current,
+        latest=latest,
+        update_available=True,
+        release_url=_RELEASE_PAGE.format(repo=GITHUB_REPO),
+    )
+
+
 def check(current: str | None = None, force: bool = False) -> UpdateInfo:
     """Return update info. Uses cache unless stale (or force=True).
 

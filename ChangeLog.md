@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.1.19 (2026-06-24)
+
+**New**
+- 托盘「当前版本」菜单行新增更新状态后缀：根据本地缓存与 GitHub 最新发布对比，显示「检查中…」「可升级 X.Y.Z」「已是最新」或「高于发布版 X.Y.Z」（本地构建版本高于线上时）。新增 `updates.peek_cached()`，缓存命中时首次打开菜单即可立即显示，无需等待后台网络请求。
+
+**Changed**
+- 同步上游网关镜像 tag 至 `main-27a36ee`（`docker/docker-compose.yml`），并将 `UPSTREAM_SHA` 同步至对应 commit。该版本清洗 Cursor 发出的含换行符复合工具 ID（`call_<uuid>\nfc_<hash>`），避免 Kiro 返回 `REQUEST_BODY_INVALID` / Invalid tool use format 导致客户端卡住。
+- 更新检查日志细化：记录是否真正发起 GitHub 查询、当前/最新版本与是否有更新，并仅在最新版本号变化时才触发菜单重绘，减少无谓刷新。
+
 ## v0.1.18 (2026-06-24)
 
 **Changed**
