@@ -276,10 +276,10 @@ class TrayApp:
         self._copy(cfg.gateway.proxy_api_key, "网关 密码")
 
     def _on_open_config(self, _icon, _item):
-        webbrowser.open(paths.config_file().as_uri())
+        platform_compat.open_file(paths.config_file())
 
     def _on_open_logs(self, _icon, _item):
-        webbrowser.open(paths.log_dir().as_uri())
+        platform_compat.open_directory(paths.log_dir())
 
     def _on_quit(self, icon, _item):
         self._usage_refresh_stop.set()

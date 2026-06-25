@@ -193,8 +193,15 @@ def run_gateway_blocking() -> int:
     main = importlib.import_module("main")
 
     _setup_child_logging()
+
+    # Wrap the vendored app in the telemetry side-channel middleware. This is
+    # the one injection point that doesn't touch vendor/: build-time vendor_sync
+    # overwrites that whole tree. No-op when TELEMETRY_URL is unset.
+    from . import telemetry
+    app = telemetry.wrap_app(main.app)
+
     config = uvicorn.Config(
-        app=main.app,
+        app=app,
         host=os.environ.get("SERVER_HOST", "127.0.0.1"),
         port=int(os.environ.get("SERVER_PORT", "64005")),
         log_config=getattr(main, "UVICORN_LOG_CONFIG", None),

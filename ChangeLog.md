@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.2.0 (2026-06-25)
+
+**New**
+- 新增完整遥测系统（`telemetry.py`）：ASGI 中间件在网关层透明采集 AI 请求（模型、token 用量、延迟），使用 10 分钟时间桶聚合后批量上报至 Worker `/telemetry` 接口；上报失败时自动持久化到本地 `pending.jsonl`，下次批次自动重试，零数据丢失。
+- `appconfig.py` 新增 `TelemetryCfg` dataclass，`TELEMETRY_URL` 由 `provision_url` 自动推导，无需手动配置；同步扩展 `AppConfig` 加载与持久化以携带遥测字段。
+- `provision.py` 从 `/provision` 响应解析 `telemetry_secret`，新增 `refresh_telemetry_secret()` 方法，支持 provision 后单独刷新密钥。
+- `supervisor.py` 在完成 provision 后自动将 `telemetry_secret` 写入本地 config，确保重启后密钥可用。
+- `gateway.py` 在网关 ASGI 应用启动时用 `TelemetryMiddleware` 包装，遥测采集对网关逻辑完全透明。
+- Worker（`worker/src/index.js`）新增 `/telemetry` 数据接收、`/telemetry-secret` 密钥下发、`/q/*` 查询路由，以及 scheduled cron 任务每小时将原始事件聚合写入 `usage_daily` 表。
+- 新增 `worker/schema.sql`：D1 遥测数据库 DDL，包含 `telemetry_events`（原始事件）和 `usage_daily`（按日/模型聚合）两张表。
+- `worker/wrangler.toml`：绑定 D1 数据库（`TELEMETRY_DB`）并配置 cron 触发器（`0 * * * *`）。
+- `platform_compat.py` 补充遥测相关 mock，提升平台隔离性。
+- 新增测试 `test_telemetry.py`，覆盖中间件采集、批量上报、本地 pending 重试全流程；更新 `test_appconfig.py`（新增 `TelemetryCfg` 测试）和 `test_supervisor.py`（provision 后 telemetry_secret 保存验证）。
+
+**Changed**
+- `tray.py` 联动调整，适配遥测配置初始化与启动流程。
+- Worker `secrets.json.example` 补充 `TELEMETRY_HMAC_SECRET` 示例字段。
+
+**Documentation**
+- 新增 `docs/2026-06-25-telemetry-design.md`：遥测系统完整设计文档，含架构图、数据流、安全机制与部署说明。
+- 更新 `docs/cloudflare-setup.md`：补充 D1 建库、`schema.sql` 初始化、`telemetry-secret` 配置等操作步骤。
+- 更新 `worker/README.md`：新增遥测接口说明与 cron 聚合说明。
+
 ## v0.1.26 (2026-06-25)
 
 **Fixed**

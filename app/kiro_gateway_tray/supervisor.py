@@ -128,13 +128,18 @@ class Supervisor:
         its dialogs on the main thread before the tray loop starts."""
         self._cached_secret = shared_secret
         from . import provision
-        hostname, run_token = provision.run(cfg, shared_secret)
+        hostname, run_token, telemetry_secret = provision.run(cfg, shared_secret)
         cfg.cloudflare.hostname = hostname
         cfg.cloudflare.run_token = run_token
         cfg.cloudflare.registered_port = cfg.gateway.port
         # Persist the secret so port-sync survives restarts. Safe-ish: config is
         # chmod 0600 on POSIX. See appconfig.save().
         cfg.cloudflare.shared_secret = shared_secret
+        # First-dispatch of the telemetry pre-shared key (design §8). The Worker
+        # only returns it when configured; don't clobber an existing value with
+        # an empty one (e.g. older Worker, or re-provision after rotation).
+        if telemetry_secret:
+            cfg.telemetry.secret = telemetry_secret
         appconfig.save(cfg)
 
     def _sync_port_if_changed(self, cfg: AppCfg) -> None:

@@ -8,3 +8,14 @@ compatibility_date = "2025-01-01"
 [[routes]]
 pattern = "kiro-gateway-provision.example.com"
 custom_domain = true
+
+# 遥测用 D1 数据库（设计文档第十三节）。先 `wrangler d1 create kiro-telemetry`，
+# 把输出的 database_id 填到下面，再 `wrangler d1 execute kiro-telemetry --remote --file=./schema.sql` 建表。
+[[d1_databases]]
+binding = "TELEMETRY_DB"
+database_name = "kiro-telemetry"
+database_id = "<wrangler d1 create 输出的 id>"
+
+# Cron Trigger：每小时把 usage_rollup 卷成 usage_daily（错峰到第 7 分钟）。
+[triggers]
+crons = ["7 * * * *"]

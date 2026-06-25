@@ -9,6 +9,26 @@ import subprocess
 import sys
 
 
+def open_file(path) -> None:
+    """Open a file with the default application."""
+    if sys.platform == "darwin":
+        subprocess.run(["open", str(path)], check=False)
+    elif sys.platform == "win32":
+        subprocess.run(["start", "", str(path)], shell=True, check=False)
+    else:
+        subprocess.run(["xdg-open", str(path)], check=False)
+
+
+def open_directory(path) -> None:
+    """Open a directory in the system file manager."""
+    if sys.platform == "darwin":
+        subprocess.run(["open", str(path)], check=False)
+    elif sys.platform == "win32":
+        subprocess.run(["explorer", str(path)], check=False)
+    else:
+        subprocess.run(["xdg-open", str(path)], check=False)
+
+
 def copy_to_clipboard(value: str) -> None:
     """Copy text to the OS clipboard. Raises on failure so callers can fall back."""
     if sys.platform == "darwin":

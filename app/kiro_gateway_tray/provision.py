@@ -140,8 +140,13 @@ def _get_username(cfg: AppCfg) -> str:
     return cid[:_USERNAME_LEN].lower()
 
 
-def run(cfg: AppCfg, shared_secret: str) -> tuple[str, str]:
-    """Call the Worker and return (hostname, run_token). Idempotent."""
+def run(cfg: AppCfg, shared_secret: str) -> tuple[str, str, str]:
+    """Call the Worker and return (hostname, run_token, telemetry_secret). Idempotent.
+
+    ``telemetry_secret`` is the first-dispatch of the usage-telemetry pre-shared
+    key (design §8 "密钥分发与轮换"). It is only present when the Worker has
+    TELEMETRY_SECRET configured; older Workers omit it, in which case "" is
+    returned and the caller leaves the existing config value untouched."""
     username = _get_username(cfg)
     url = _base_url(cfg) + "/provision"
 
@@ -163,6 +168,7 @@ def run(cfg: AppCfg, shared_secret: str) -> tuple[str, str]:
     data = resp.json()
     hostname = data["hostname"]
     run_token = data.get("run_token")
+    telemetry_secret = data.get("telemetry_secret") or ""
 
     if not run_token:
         raise RuntimeError(
@@ -170,7 +176,41 @@ def run(cfg: AppCfg, shared_secret: str) -> tuple[str, str]:
             "请联系管理员检查 KV 数据。"
         )
 
-    return hostname, run_token
+    return hostname, run_token, telemetry_secret
+
+
+def refresh_telemetry_secret(provision_url: str, shared_secret: str, username: str) -> str:
+    """Fetch the current telemetry secret from POST /telemetry-secret.
+
+    Called by the gateway child process after /telemetry returns 401 (the local
+    secret rotated server-side). Authenticated with the activation code
+    ``shared_secret`` — NOT the telemetry secret — because the whole point is
+    that the telemetry secret is already stale (design §8). The Worker only
+    echoes the current secret; it never rebuilds the tunnel.
+
+    ``provision_url`` is the same base used by /provision (the telemetry refresh
+    endpoint is same-origin). Returns the new secret, or "" on any failure
+    (auth error, network, not-configured) so the caller can decide to keep
+    spooling rather than crash.
+    """
+    if not provision_url or not shared_secret or not username:
+        return ""
+    url = provision_url.rstrip("/") + "/telemetry-secret"
+    try:
+        resp = httpx.post(
+            url,
+            json={"shared_secret": shared_secret, "username": username},
+            timeout=_HTTP_TIMEOUT,
+            trust_env=False,
+        )
+    except httpx.HTTPError:
+        return ""
+    if resp.status_code != 200:
+        return ""
+    try:
+        return (resp.json().get("telemetry_secret") or "")
+    except Exception:
+        return ""
 
 
 def update_port(cfg: AppCfg, shared_secret: str) -> int:

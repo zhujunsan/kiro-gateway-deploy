@@ -130,3 +130,47 @@ def test_shared_secret_persists(tmp_path, monkeypatch):
     appconfig.save(cfg)
     again = appconfig.load()
     assert again.cloudflare.shared_secret == "act-code-123"
+
+
+def test_telemetry_url_derived_from_provision_url(tmp_path, monkeypatch):
+    # Scheme A: telemetry shares the provision Worker/domain. With no explicit
+    # endpoint_url but a provisioned URL, the report URL is derived as
+    # provision_url + /telemetry, so telemetry auto-enables after activation.
+    monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
+    cfg = appconfig.load()
+    cfg.cloudflare.provision_url = "https://kiro-gateway-provision.botsonny.top"
+    cfg.cloudflare.shared_secret = "act-code"
+    env = appconfig.to_gateway_env(cfg)
+    assert env["TELEMETRY_URL"] == "https://kiro-gateway-provision.botsonny.top/telemetry"
+    # Refresh chain still wired from the same provision_url.
+    assert env["TELEMETRY_PROVISION_URL"] == "https://kiro-gateway-provision.botsonny.top"
+    assert env["TELEMETRY_SHARED_SECRET"] == "act-code"
+
+
+def test_telemetry_url_strips_trailing_slash(tmp_path, monkeypatch):
+    monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
+    cfg = appconfig.load()
+    cfg.cloudflare.provision_url = "https://w.example.com/"
+    env = appconfig.to_gateway_env(cfg)
+    assert env["TELEMETRY_URL"] == "https://w.example.com/telemetry"
+
+
+def test_telemetry_explicit_endpoint_wins_over_derivation(tmp_path, monkeypatch):
+    # An explicit endpoint_url is the override escape hatch and must not be
+    # replaced by the provision_url derivation.
+    monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
+    cfg = appconfig.load()
+    cfg.telemetry.endpoint_url = "https://custom.example.com/telemetry"
+    cfg.cloudflare.provision_url = "https://kiro-gateway-provision.botsonny.top"
+    env = appconfig.to_gateway_env(cfg)
+    assert env["TELEMETRY_URL"] == "https://custom.example.com/telemetry"
+
+
+def test_telemetry_not_injected_when_both_empty(tmp_path, monkeypatch):
+    # No endpoint_url and no provision_url ⇒ telemetry stays dormant.
+    monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
+    cfg = appconfig.load()
+    assert cfg.telemetry.endpoint_url == ""
+    assert cfg.cloudflare.provision_url == ""
+    env = appconfig.to_gateway_env(cfg)
+    assert "TELEMETRY_URL" not in env

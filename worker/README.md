@@ -18,6 +18,7 @@
 | CF_ZONE_ID | example.com 的 Zone ID |
 | DOMAIN_SUFFIX | example.com |
 | HOSTNAME_PREFIX | kg |
+| TELEMETRY_SECRET | 客户端上报 `/telemetry` 用的预共享密钥，独立于 SHARED_SECRET。可用 `openssl rand -hex 32` 生成 |
 
 ## 更新 SHARED_SECRET（换批用户时）
 
@@ -25,6 +26,41 @@
 wrangler secret put SHARED_SECRET   # 可用 openssl rand -hex 16 生成一个新激活码
 wrangler deploy
 ```
+
+## 遥测（Telemetry）
+
+遥测复用本 worker（方案 A），新增三块能力（详见 `docs/2026-06-25-telemetry-design.md`）：
+
+- `POST /telemetry`：用 `Authorization: Bearer <TELEMETRY_SECRET>` 鉴权（恒定时间比较），把上报的桶写入 D1 `usage_rollup`（`ON CONFLICT DO UPDATE` 覆盖，last-write-wins）。返回 `{ ok, accepted }`。
+- `GET|POST /q/<name>`：只读查询，仅开放写死的参数化固定查询（`daily-by-user` / `model-distribution` / `active-users` / `user-totals`），默认查 `usage_daily`，结果缓存 60 分钟。**`/q/*` 不在 worker 内校验密钥，由 Cloudflare Access 在边缘保护**。
+- `scheduled()`（cron）：每小时把 `usage_rollup` 卷成 `usage_daily`（按天 × user × model 聚合，幂等可重入）。
+
+### 密钥分发与轮换
+
+`TELEMETRY_SECRET` 不写死在客户端，分发与轮换通过两个变化完成（设计文档第八节）：
+
+- **首次下发（provision 附带）**：`/provision` 成功响应额外带 `telemetry_secret`（值取 `env.TELEMETRY_SECRET`；未配置则省略该字段，不影响隧道创建）。客户端写入本地 config。
+- **刷新（/telemetry-secret）**：客户端上报 `/telemetry` 收到 401（本地密钥过期）后，调 `POST /telemetry-secret` 拉最新密钥。该端点用激活码 `shared_secret`（body 内，恒定时间比较）鉴权而非 `TELEMETRY_SECRET`（否则会死锁），成功返回 `{ telemetry_secret }`；**只读 env 返回密钥，绝不创建/删除/修改任何 tunnel 或 DNS**——与 `/provision` 的幂等重建彻底分离，不会断连。`TELEMETRY_SECRET` 未配置时返回 500 `{error:"telemetry not configured"}`。
+- 轮换运维：`wrangler secret put TELEMETRY_SECRET` + `wrangler deploy` 即可，客户端无需发版（下次 401 后自动经 `/telemetry-secret` 拉到新值）。
+
+### 部署提示
+
+```bash
+cd worker
+# 1) 创建 D1 并建表
+wrangler d1 create kiro-telemetry           # 把输出的 database_id 填进 wrangler.toml
+wrangler d1 execute kiro-telemetry --remote --file=./schema.sql
+
+# 2) 设置上报密钥（也可一并写进 secrets.json 用 bulk 导入）
+wrangler secret put TELEMETRY_SECRET        # openssl rand -hex 32
+
+# 3) 部署（wrangler.toml 已含 [[d1_databases]] 与 [triggers] crons）
+wrangler deploy
+```
+
+### 保护查询路径 /q
+
+在 Zero Trust 控制台给 `kiro-gateway-provision.<域名>` 的 **Path `/q`** 加一条 self-hosted application + Service Auth 策略，签发 Service Token，把 `CF-Access-Client-Id/Secret` 填进 Grafana Infinity datasource。`/telemetry` 与 `/provision` 不受此 Access 影响（靠 path 限定）。
 
 ## 注意事项
 

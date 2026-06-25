@@ -54,9 +54,9 @@ def test_start_not_provisioned_with_callback(monkeypatch, tmp_path):
         appconfig.save(cfg)
         raise StopIteration("mock provision complete")
 
-    # Patch provision.run to avoid real HTTP call
+    # Patch provision.run to avoid real HTTP call (returns 3-tuple incl. telemetry_secret)
     import kiro_gateway_tray.provision as pmod
-    monkeypatch.setattr(pmod, "run", lambda cfg, secret: ("kg-cb.example.com", "eyJ_cb"))
+    monkeypatch.setattr(pmod, "run", lambda cfg, secret: ("kg-cb.example.com", "eyJ_cb", ""))
     s.provision_callback = lambda cfg: "fake-secret"
     s.start()
     assert s.gateway.is_alive() is True
