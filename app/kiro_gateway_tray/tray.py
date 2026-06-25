@@ -184,6 +184,7 @@ class TrayApp:
     """
 
     _PROBE_MIN_INTERVAL = 2.0  # seconds between on-open health probes
+    _USAGE_REFRESH_INTERVAL = 60  # seconds between background usage refreshes
 
     def __init__(self) -> None:
         import pystray
@@ -202,6 +203,7 @@ class TrayApp:
         self._update_info = None
         self._update_gate = _ThrottleGate()
         self._probe_gate = _ThrottleGate(min_interval=self._PROBE_MIN_INTERVAL)
+        self._usage_refresh_stop = threading.Event()
 
     # --- redraw / notify helpers ---
 
@@ -280,6 +282,7 @@ class TrayApp:
         webbrowser.open(paths.log_dir().as_uri())
 
     def _on_quit(self, icon, _item):
+        self._usage_refresh_stop.set()
         self.sup.stop()
         self.sup.close()
         icon.stop()
@@ -317,7 +320,11 @@ class TrayApp:
             self._copy(model_id, f"模型 {model_id}")
         return _handler
 
-    # --- menu line callables (re-evaluated each time menu shows) ---
+    # --- menu line callables ---
+    # NOTE: on macOS these are NOT re-evaluated when the menu opens (the NSMenu
+    # is static once set via setMenu_). They run only during update_menu(), i.e.
+    # on a redraw. Anything that must stay live (usage, status) is driven by a
+    # background refresh + _request_redraw, not by the user opening the menu.
 
     def _gateway_line(self, _item):
         self._on_menu_open()
@@ -471,6 +478,29 @@ class TrayApp:
                     self._probe_gate.done()
             threading.Thread(target=_probe, daemon=True).start()
 
+    def _start_usage_refresh_loop(self) -> None:
+        """Periodically refresh the usage cache while the gateway is running.
+
+        On macOS the tray menu is a static NSMenu installed via setMenu_: opening
+        it does NOT re-evaluate the Python label callables, so _usage_line's
+        refresh() only ever ran during update_menu() — which, once the gateway
+        settles and stops emitting status transitions, is never called again.
+        The menu line then freezes for hours. This loop is the missing driver:
+        it ticks the cache on its own cadence and lets the cache's on_update fire
+        a redraw, so the displayed quota tracks the account in near real time
+        regardless of whether the user opens the menu.
+        """
+        def _loop():
+            while not self._usage_refresh_stop.wait(self._USAGE_REFRESH_INTERVAL):
+                if self.sup.status()["gateway"] != "running":
+                    continue
+                try:
+                    self._usage_cache.refresh()
+                except Exception:
+                    logger.debug("usage refresh tick failed", exc_info=True)
+
+        threading.Thread(target=_loop, daemon=True).start()
+
     # --- build the menu and run the loop ---
 
     def _build_menu(self):
@@ -539,6 +569,7 @@ class TrayApp:
         macos_menu.install_menu_gray_suffix()
         threading.Thread(target=_startup, daemon=True).start()
         self._kick_update_check()
+        self._start_usage_refresh_loop()
         self._icon.run()
 
 
