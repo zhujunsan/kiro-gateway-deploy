@@ -11,18 +11,28 @@ from . import appconfig
 # Reused connection pool for localhost gateway calls (usage + models). Avoids
 # building a fresh client/connection on every menu refresh. Released at process
 # exit so the pool doesn't outlive us during interpreter shutdown.
-_client = httpx.Client(timeout=30.0)
+# trust_env=False: these calls always target 127.0.0.1, but httpx (unlike
+# requests) does NOT bypass localhost for HTTP(S)_PROXY env vars. A system/corp
+# proxy without 127.0.0.1 in NO_PROXY would otherwise hijack every probe and
+# make a healthy gateway look unreachable.
+_client = httpx.Client(timeout=30.0, trust_env=False)
 atexit.register(_client.close)
 
 
-def fetch(timeout: float = 30.0) -> dict:
+def _authed_get(path: str, timeout: float) -> httpx.Response:
+    """GET a localhost gateway endpoint with the proxy API key. Raises on non-200,
+    including the status code and the start of the response body for diagnosis."""
     cfg = appconfig.load()
-    url = f"{appconfig.gateway_origin(cfg)}/usage"
+    url = f"{appconfig.gateway_origin(cfg)}{path}"
     headers = {"Authorization": f"Bearer {cfg.gateway.proxy_api_key}"}
     resp = _client.get(url, headers=headers, timeout=timeout)
     if resp.status_code != 200:
-        raise RuntimeError(f"/usage returned {resp.status_code}: {resp.text[:200]}")
-    return resp.json()
+        raise RuntimeError(f"{path} returned {resp.status_code}: {resp.text[:200]}")
+    return resp
+
+
+def fetch(timeout: float = 30.0) -> dict:
+    return _authed_get("/usage", timeout).json()
 
 
 def format_summary(data: dict) -> str:
@@ -65,11 +75,5 @@ def format_menu_line(data: dict) -> str:
 
 def fetch_models(timeout: float = 10.0) -> list[str]:
     """Return sorted list of model IDs from the gateway's /v1/models endpoint."""
-    cfg = appconfig.load()
-    url = f"{appconfig.gateway_origin(cfg)}/v1/models"
-    headers = {"Authorization": f"Bearer {cfg.gateway.proxy_api_key}"}
-    resp = _client.get(url, headers=headers, timeout=timeout)
-    if resp.status_code != 200:
-        raise RuntimeError(f"/v1/models returned {resp.status_code}")
-    data = resp.json().get("data") or []
+    data = _authed_get("/v1/models", timeout).json().get("data") or []
     return sorted(m["id"] for m in data if "id" in m)

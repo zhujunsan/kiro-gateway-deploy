@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.1.25 (2026-06-25)
+
+**Changed**
+- 网关子进程改为通过独立环境变量传递配置，不再写入托盘父进程的 `os.environ`，避免 `PROXY_API_KEY`/`PROFILE_ARN` 等密钥长期驻留并泄漏给后续派生的子进程。
+- `usage` 模块抽出统一的鉴权请求辅助函数，`/usage` 与 `/v1/models` 复用同一套错误处理，非 200 时均带状态码与响应体片段便于排查。
+
+**Fixed**
+- 本地回环探测（网关 `/health`、`/usage`、`/v1/models` 及 cloudflared `/ready`）的 httpx 客户端禁用环境代理（`trust_env=False`）：httpx 不像 requests 那样自动跳过 localhost，配置了系统/公司代理且 `NO_PROXY` 未含 `127.0.0.1` 时会被代理劫持，导致网关明明在运行却显示连接中/获取失败。访问 GitHub 的更新检查仍走代理不变。
+- 网关子进程早期 stdout/stderr 重定向到日志目录下 `gateway-bootstrap.log`：子进程在导入 vendored 网关前的崩溃（vendor 缺失、env 错误、依赖导入失败）此前会消失在无窗口 App 看不到的 stderr 中，现可落盘排查。
+
 ## v0.1.24 (2026-06-25)
 
 **Changed**

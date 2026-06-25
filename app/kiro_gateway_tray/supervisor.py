@@ -59,7 +59,10 @@ class Supervisor:
         # Guards config (re)loads so concurrent callers don't double-read disk.
         self._cfg_lock = threading.Lock()
         # Reused connection pool for localhost health/usage probes.
-        self._client = httpx.Client(timeout=3)
+        # trust_env=False: probes always hit 127.0.0.1, but httpx does not bypass
+        # localhost for HTTP(S)_PROXY; a system proxy would otherwise route these
+        # to a proxy and make a healthy gateway/tunnel look down.
+        self._client = httpx.Client(timeout=3, trust_env=False)
 
     def _load(self) -> AppCfg:
         with self._cfg_lock:

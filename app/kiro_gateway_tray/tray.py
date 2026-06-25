@@ -153,7 +153,15 @@ class _UsageCache:
         def _fetch() -> str:
             try:
                 return usage.format_menu_line(usage.fetch())
-            except Exception:
+            except Exception as e:
+                # 网关 /health 通过不代表 /usage 能成功：后者要带 Kiro token
+                # 回源上游，token 失效/上游抖动/启动就绪窗口都会失败。这里把
+                # 失败结果缓存 60 秒（避免每次重绘猛打上游）是合理的，但异常详情
+                # 必须落盘，否则根因不可查。usage.fetch() 在非 200 时抛的
+                # RuntimeError 已含状态码与响应体前 200 字符；把它拼进消息正文，
+                # 再用 opt(exception=True) 附上堆栈（loguru 不认 logging 的
+                # exc_info 参数，须用 opt(exception=)）。
+                logger.opt(exception=True).warning("usage fetch failed: {}", e)
                 return "获取失败"
 
         self._cache = AsyncRefreshCache(_fetch, cooldown=self._COOLDOWN, on_update=on_update)

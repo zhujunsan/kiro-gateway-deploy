@@ -46,7 +46,8 @@ def _vendor_root() -> Path:
     )
 
 
-def _apply_env(cfg: AppCfg) -> None:
+def _gateway_env(cfg: AppCfg) -> dict[str, str]:
+    """Build the gateway's env vars (does not touch os.environ)."""
     env = appconfig.to_gateway_env(cfg)
     # DEBUG_DIR depends on the runtime log path, so it can't live in the static
     # appconfig defaults. Point it at a *subdirectory* of the log dir: in
@@ -54,7 +55,19 @@ def _apply_env(cfg: AppCfg) -> None:
     # request, so it must never be the log dir itself. Respect a user override
     # if one was set explicitly under [gateway_extra].
     env.setdefault("DEBUG_DIR", str(paths.log_dir() / "debug_logs"))
-    for k, v in env.items():
+    return env
+
+
+def _apply_env(cfg: AppCfg) -> None:
+    """Apply the gateway env to this process's os.environ.
+
+    Used by the child (config.py + uvicorn read os.environ at import/run time).
+    The parent process must NOT use this — it would leak secrets like
+    PROXY_API_KEY/PROFILE_ARN into the tray's own long-lived environment and any
+    subprocess it later spawns. The parent passes a per-launch env to Popen
+    instead (see GatewayProcess.start).
+    """
+    for k, v in _gateway_env(cfg).items():
         os.environ[k] = v
 
 
@@ -74,13 +87,15 @@ class GatewayProcess:
 
     def __init__(self) -> None:
         self._proc: subprocess.Popen | None = None
+        self._bootstrap_log = None
 
     def start(self, cfg: AppCfg) -> None:
-        _apply_env(cfg)
         paths.ensure_dirs()
-        # The child inherits os.environ (the gateway config) and the data dir as
-        # CWD; the env is applied to this process so the child sees it too.
-        env = dict(os.environ)
+        # Pass the gateway config to the child via Popen(env=...) rather than
+        # mutating our own os.environ: the tray is long-lived, and leaking
+        # secrets (PROXY_API_KEY/PROFILE_ARN) into its environment would expose
+        # them to every later subprocess it spawns.
+        env = {**os.environ, **_gateway_env(cfg)}
         if not getattr(sys, "frozen", False):
             # Source mode: CWD is the data dir, so the package isn't importable
             # via `-m` unless its parent (app/) is on PYTHONPATH. Frozen mode
@@ -90,11 +105,28 @@ class GatewayProcess:
             env["PYTHONPATH"] = (
                 f"{app_root}{os.pathsep}{existing}" if existing else str(app_root)
             )
+        # Capture the child's stdout/stderr to a file. The child only installs
+        # its own loguru sink AFTER importing the vendored gateway, so any early
+        # crash (missing vendor, bad env, import error) would otherwise vanish
+        # into the parent's stderr — invisible in a windowless .app. This file
+        # keeps those bootstrap failures diagnosable.
+        bootstrap_path = paths.log_dir() / "gateway-bootstrap.log"
+        self._bootstrap_log = open(bootstrap_path, "w", encoding="utf-8")
         self._proc = subprocess.Popen(
             _child_command(),
             cwd=str(paths.data_dir()),
             env=env,
+            stdout=self._bootstrap_log,
+            stderr=subprocess.STDOUT,
         )
+
+    def _close_bootstrap_log(self) -> None:
+        if self._bootstrap_log is not None:
+            try:
+                self._bootstrap_log.close()
+            except OSError:
+                pass
+            self._bootstrap_log = None
 
     def stop(self) -> None:
         if self._proc and self._proc.poll() is None:
@@ -104,6 +136,7 @@ class GatewayProcess:
             except subprocess.TimeoutExpired:
                 self._proc.kill()
         self._proc = None
+        self._close_bootstrap_log()
 
     def is_alive(self) -> bool:
         return bool(self._proc and self._proc.poll() is None)
