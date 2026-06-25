@@ -42,13 +42,17 @@ def test_update_visible_peeks_cache_before_async(tmp_path, monkeypatch):
     assert app._update_info is not None
 
 
-def test_version_line_shows_ahead_of_release(tmp_path, monkeypatch):
+def test_version_line_shows_latest_when_cache_is_stale(tmp_path, monkeypatch):
+    # Cache left over from before an upgrade points at an older release than the
+    # running app. We must NOT surface "高于发布版"; show "已是最新" instead.
     monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
     updates._write_cache(latest="v0.1.17")
+    monkeypatch.setattr("kiro_gateway_tray.tray.__version__", "0.1.23")
 
     app = _make_app()
     line = app._version_line(None)
-    assert "高于发布版 0.1.17" in line
+    assert "已是最新" in line
+    assert "高于发布版" not in line
 
 
 def test_version_line_shows_upgrade_available(tmp_path, monkeypatch):

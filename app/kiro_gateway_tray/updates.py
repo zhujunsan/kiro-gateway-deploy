@@ -2,10 +2,17 @@
 
 Behavior (see plan Task 13):
   - check on startup and whenever the menu is opened, throttled to at most
-    once per 10 minutes (cached on disk)
+    once per 4 hours (cached on disk)
   - cache file: <data_dir>/update_check.json
   - all failures are swallowed silently (never bother the user)
   - never auto-downloads; UI just surfaces a "new version" menu line
+
+Cache staleness rules (avoid the "高于发布版" confusion after an upgrade):
+  - a failed fetch still bumps ``checked_at`` so we don't hammer the (anonymous,
+    60 req/hour) GitHub API and trip rate limiting
+  - the cache records the app version that wrote it; after an upgrade the
+    version mismatch forces a fresh check instead of trusting a pre-upgrade
+    ``latest`` that may predate the new release
 """
 from __future__ import annotations
 
@@ -19,7 +26,7 @@ import httpx
 
 from . import GITHUB_REPO, __version__, paths
 
-_TTL_SECONDS = 10 * 60
+_TTL_SECONDS = 4 * 60 * 60
 _CACHE_NAME = "update_check.json"
 _RELEASE_API = "https://api.github.com/repos/{repo}/releases/latest"
 _RELEASE_PAGE = "https://github.com/{repo}/releases/latest"
@@ -59,7 +66,11 @@ def _write_cache(latest: str | None) -> None:
     try:
         paths.ensure_dirs()
         _cache_file().write_text(
-            json.dumps({"latest": latest, "checked_at": time.time()}),
+            json.dumps({
+                "latest": latest,
+                "checked_at": time.time(),
+                "app_version": __version__,
+            }),
             encoding="utf-8",
         )
     except Exception:
@@ -69,6 +80,11 @@ def _write_cache(latest: str | None) -> None:
 def _should_check() -> bool:
     cached = _read_cache()
     if not cached:
+        return True
+    # Just upgraded: the cache was written by a different app version, so its
+    # ``latest`` may predate the release for the version we're now running.
+    # Force a fresh check instead of waiting out the TTL.
+    if cached.get("app_version") != __version__:
         return True
     return (time.time() - cached.get("checked_at", 0)) >= _TTL_SECONDS
 
@@ -111,8 +127,13 @@ def check(current: str | None = None, force: bool = False) -> UpdateInfo:
             latest = _fetch_latest()
             if latest is not None:
                 _write_cache(latest)
-            else:                       # failed fetch: fall back to cache if any
+            else:
+                # Failed fetch (network error or 403 rate limit). Fall back to
+                # the cached value but still bump ``checked_at`` so we honour
+                # the TTL instead of retrying on every menu open and burning
+                # the anonymous 60 req/hour budget.
                 latest = (_read_cache() or {}).get("latest")
+                _write_cache(latest)
         else:
             latest = (_read_cache() or {}).get("latest")
     except Exception:

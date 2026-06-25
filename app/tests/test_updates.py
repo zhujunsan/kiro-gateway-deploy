@@ -1,4 +1,7 @@
 # app/tests/test_updates.py
+import json
+import time
+
 from kiro_gateway_tray import updates
 
 
@@ -38,9 +41,9 @@ def test_check_uses_cache_when_fresh(tmp_path, monkeypatch):
     assert info.update_available is True
 
 
-def test_ttl_is_ten_minutes():
-    # Update checks are throttled to once per 10 minutes.
-    assert updates._TTL_SECONDS == 10 * 60
+def test_ttl_is_four_hours():
+    # Update checks are throttled to once per 4 hours.
+    assert updates._TTL_SECONDS == 4 * 60 * 60
 
 
 def test_peek_cached_no_file(tmp_path, monkeypatch):
@@ -61,3 +64,33 @@ def test_peek_cached_same_version(tmp_path, monkeypatch):
     monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
     updates._write_cache(latest="v0.2.0")
     assert updates.peek_cached(current="0.2.0") is None
+
+
+def test_failed_fetch_bumps_checked_at(tmp_path, monkeypatch):
+    # A failed fetch (e.g. 403 rate limit) must still mark the cache as checked
+    # so we don't retry on every menu open and exhaust the API budget.
+    monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
+    updates._write_cache(latest="0.1.0")
+    # Force the next call to attempt a fetch, then make the fetch "fail".
+    monkeypatch.setattr(updates, "_should_check", lambda: True)
+    monkeypatch.setattr(updates, "_fetch_latest", lambda: None)
+
+    before = time.time()
+    updates.check(current="0.1.0")
+    cached = updates._read_cache()
+    assert cached["checked_at"] >= before
+    # Restore real _should_check; cache should now look fresh.
+    monkeypatch.undo()
+    monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
+    assert updates._should_check() is False
+
+
+def test_upgrade_forces_recheck(tmp_path, monkeypatch):
+    # Cache written by an older app version must trigger a fresh check even
+    # within the TTL window.
+    monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
+    updates._write_cache(latest="0.1.0")
+    cached = updates._read_cache()
+    cached["app_version"] = "0.0.1"
+    updates._cache_file().write_text(json.dumps(cached), encoding="utf-8")
+    assert updates._should_check() is True

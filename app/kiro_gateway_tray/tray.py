@@ -53,47 +53,38 @@ def _first_run_setup(cfg) -> str:
     """
     from . import provision as _prov
 
-    # --- Page: Cloudflare (provision_url + shared secret) ---
-    if sys.platform == "darwin":
-        url, secret = dialogs.osascript_form_cf(
-            f"{APP_NAME} - 隧道配置",
-            default_url=cfg.cloudflare.provision_url or "",
-        )
-    else:
-        if not cfg.cloudflare.provision_url:
-            url = dialogs.prompt_input(
-                f"{APP_NAME} - 隧道配置",
-                "请输入 Provision 服务地址：\n\n"
-                "由管理员提供的隧道签发服务 URL。",
-            ).strip()
-            if not url:
-                raise RuntimeError("Provision 服务地址不能为空。")
-        else:
-            url = cfg.cloudflare.provision_url
-        secret = dialogs.prompt_input(
-            f"{APP_NAME} - 隧道配置",
-            f"请输入激活码（共享密钥）：\n\nWorker: {url}",
-            hidden=True,
-        ).strip()
-        if not secret:
-            raise RuntimeError("激活码不能为空。")
-
+    # --- Page 1/3: Provision 服务地址 (URL, validated) ---
+    url = dialogs.prompt_validated(
+        f"{APP_NAME} - 隧道配置 (1/3)",
+        "请输入 Provision 服务地址：\n\n由管理员提供的隧道签发服务 URL。",
+        validate=dialogs.validate_url,
+        default=cfg.cloudflare.provision_url or "",
+    )
     cfg.cloudflare.provision_url = url
     appconfig.save(cfg)
 
-    # --- Page: Kiro profileArn (entered manually) ---
+    # --- Page 2/3: 激活码（共享密钥, hidden, validated） ---
+    secret = dialogs.prompt_validated(
+        f"{APP_NAME} - 隧道配置 (2/3)",
+        f"请输入激活码（共享密钥）：\n\nWorker: {url}",
+        validate=dialogs.validate_secret,
+        hidden=True,
+    )
+
+    # --- Page 3/3: Kiro profileArn (multiline, validated) ---
     # profileArn 由 Kiro Gateway 成功运行后才写回 kiro-auth-token.json，首次初始化
-    # 通常读不到，需要用户手动粘贴。api_region 从该 ARN 中解析得到。
+    # 通常读不到，需要用户手动粘贴。ARN 很长，用多行可换行的输入框便于核对；
+    # api_region 从该 ARN 中解析得到。
     default_arn = _prov.read_profile_arn(cfg)
-    profile_arn = dialogs.prompt_input(
+    profile_arn = dialogs.prompt_validated(
         f"{APP_NAME} - Profile ARN (3/3)",
         "请输入 Kiro profileArn：\n\n"
         "形如 arn:aws:codewhisperer:us-east-1:123456789012:profile/XXXX\n"
         "（首次使用时 Kiro Gateway 尚未写回，需要手动填写）",
+        validate=dialogs.validate_profile_arn,
         default=default_arn,
-    ).strip()
-    if not profile_arn:
-        raise RuntimeError("profileArn 不能为空。")
+        multiline=True,
+    )
     cfg.gateway.profile_arn = profile_arn
     region = _prov.region_from_arn(profile_arn)
     if region:
@@ -400,10 +391,10 @@ class TrayApp:
         if not latest:
             return f"{line}\t检查中…"
         latest_ver = latest.lstrip("vV")
+        if latest_ver == __version__:
+            return f"{line}\t已是最新"
         if updates._is_newer(__version__, latest):
             return f"{line}\t可升级 {latest_ver}"
-        if updates._is_newer(latest, __version__):
-            return f"{line}\t高于发布版 {latest_ver}"
         return f"{line}\t已是最新"
 
     def _ensure_update_info_sync(self) -> None:
