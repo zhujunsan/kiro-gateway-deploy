@@ -250,16 +250,16 @@ const ROLLUP_FIELDS = [
   "bucket_start", "bucket_seconds", "username", "model", "app_version",
   "requests", "successes", "errors",
   "prompt_tokens_sum", "completion_tokens_sum", "total_tokens_sum",
-  "request_bytes_sum", "response_bytes_sum", "credits_used_sum",
+  "request_bytes_sum", "response_bytes_sum",
 ];
 
 const ROLLUP_INSERT_SQL = `
 INSERT INTO usage_rollup (bucket_start, bucket_seconds, username, model, app_version,
                           requests, successes, errors,
                           prompt_tokens_sum, completion_tokens_sum, total_tokens_sum,
-                          request_bytes_sum, response_bytes_sum, credits_used_sum,
-                          schema_version, received_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                          request_bytes_sum, response_bytes_sum,
+                          received_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(bucket_start, bucket_seconds, username, model, app_version)
 DO UPDATE SET
   requests = excluded.requests,
@@ -270,7 +270,6 @@ DO UPDATE SET
   total_tokens_sum = excluded.total_tokens_sum,
   request_bytes_sum = excluded.request_bytes_sum,
   response_bytes_sum = excluded.response_bytes_sum,
-  credits_used_sum = excluded.credits_used_sum,
   received_at = excluded.received_at`;
 
 function toInt(v, def = 0) {
@@ -279,7 +278,7 @@ function toInt(v, def = 0) {
 }
 
 // 把一行上报数据归一成 INSERT 的参数数组。无效行（缺 username/model 等）返回 null。
-function normalizeRollupRow(row, schemaVersion, receivedAt) {
+function normalizeRollupRow(row, receivedAt) {
   if (!row || typeof row !== "object") return null;
   const username = row.username;
   if (typeof username !== "string" || !USERNAME_RE.test(username)) return null;
@@ -289,10 +288,6 @@ function normalizeRollupRow(row, schemaVersion, receivedAt) {
   const bucketStart = toInt(row.bucket_start, -1);
   const bucketSeconds = toInt(row.bucket_seconds, -1);
   if (bucketStart < 0 || bucketSeconds <= 0) return null;
-
-  // credits_used_sum 可空（随缘），其余计数列缺失按 0。
-  const credits = row.credits_used_sum;
-  const creditsVal = credits == null || credits === "" ? null : Number(credits);
 
   return [
     bucketStart,
@@ -308,8 +303,6 @@ function normalizeRollupRow(row, schemaVersion, receivedAt) {
     toInt(row.total_tokens_sum),
     toInt(row.request_bytes_sum),
     toInt(row.response_bytes_sum),
-    Number.isFinite(creditsVal) ? creditsVal : null,
-    schemaVersion,
     receivedAt,
   ];
 }
@@ -328,7 +321,10 @@ async function handleTelemetry(request, env, json) {
     return json({ error: "invalid JSON" }, 400);
   }
 
+  // 协议版本握手位：读出 body 顶层 schema_version 备用（当前无分支按版本分流，
+  // 不再写入每行 rollup）。保留以便未来协议演进时按版本路由。
   const schemaVersion = toInt(body && body.schema_version, 1);
+  void schemaVersion;
   const rows = body && Array.isArray(body.rows) ? body.rows : null;
   if (!rows) {
     return json({ error: "rows must be an array" }, 400);
@@ -337,7 +333,7 @@ async function handleTelemetry(request, env, json) {
   const receivedAt = Math.floor(Date.now() / 1000);
   const statements = [];
   for (const row of rows) {
-    const params = normalizeRollupRow(row, schemaVersion, receivedAt);
+    const params = normalizeRollupRow(row, receivedAt);
     if (params) {
       statements.push(env.TELEMETRY_DB.prepare(ROLLUP_INSERT_SQL).bind(...params));
     }
@@ -413,8 +409,7 @@ const QUERIES = {
                    SUM(completion_tokens_sum) AS completion_tokens,
                    SUM(total_tokens_sum) AS total_tokens,
                    SUM(request_bytes_sum) AS request_bytes,
-                   SUM(response_bytes_sum) AS response_bytes,
-                   SUM(credits_used_sum) AS credits_used
+                   SUM(response_bytes_sum) AS response_bytes
             FROM usage_daily
             WHERE ${where}
             GROUP BY day, username
@@ -459,8 +454,7 @@ const QUERIES = {
                    SUM(requests) AS requests,
                    SUM(successes) AS successes,
                    SUM(errors) AS errors,
-                   SUM(total_tokens_sum) AS total_tokens,
-                   SUM(credits_used_sum) AS credits_used
+                   SUM(total_tokens_sum) AS total_tokens
             FROM usage_daily
             WHERE day >= date('now', ?)
             GROUP BY username
@@ -529,12 +523,12 @@ const DAILY_ROLLUP_SQL = `
 INSERT INTO usage_daily (day, username, model,
                          requests, successes, errors,
                          prompt_tokens_sum, completion_tokens_sum, total_tokens_sum,
-                         request_bytes_sum, response_bytes_sum, credits_used_sum)
+                         request_bytes_sum, response_bytes_sum)
 SELECT date(bucket_start, 'unixepoch') AS day,
        username, model,
        SUM(requests), SUM(successes), SUM(errors),
        SUM(prompt_tokens_sum), SUM(completion_tokens_sum), SUM(total_tokens_sum),
-       SUM(request_bytes_sum), SUM(response_bytes_sum), SUM(credits_used_sum)
+       SUM(request_bytes_sum), SUM(response_bytes_sum)
 FROM usage_rollup
 WHERE date(bucket_start, 'unixepoch') = ?
 GROUP BY day, username, model
@@ -547,8 +541,7 @@ DO UPDATE SET
   completion_tokens_sum = excluded.completion_tokens_sum,
   total_tokens_sum = excluded.total_tokens_sum,
   request_bytes_sum = excluded.request_bytes_sum,
-  response_bytes_sum = excluded.response_bytes_sum,
-  credits_used_sum = excluded.credits_used_sum`;
+  response_bytes_sum = excluded.response_bytes_sum`;
 
 async function rollupToDaily(env) {
   // 覆盖当天与前一天：cron 在 UTC 边界附近触发时，前一天可能还有迟到的桶进来。

@@ -82,5 +82,22 @@ if sys.platform == "darwin":
         info_plist={
             "LSUIElement": True,            # menu-bar only; no Dock icon
             "NSHighResolutionCapable": True,
+            # macOS 26 (Tahoe) Liquid Glass icon: rendered from the compiled
+            # AppIcon.icon -> Assets.car catalog installed below. Older macOS
+            # ignores this key and falls back to CFBundleIconFile (icon.icns),
+            # which PyInstaller sets automatically from BUNDLE(icon=...).
+            "CFBundleIconName": "AppIcon",
         },
     )
+
+    # Compile resources/AppIcon.icon -> Assets.car (Xcode 26 actool) and place
+    # it in Contents/Resources so macOS 26 renders the layered icon. Falls back
+    # to the checked-in resources/Assets.car when actool is unavailable.
+    import importlib.util as _ilu
+    _mi = APP / "packaging" / "macos_icon.py"
+    _spec = _ilu.spec_from_file_location("macos_icon", _mi)
+    _mod = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
+    _app_path = Path(DISTPATH) / f"{_name}.app"
+    if _app_path.exists():
+        _mod.install_into_app(_app_path)

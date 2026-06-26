@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.2.4 (2026-06-26)
+
+**New**
+- macOS 26（Tahoe）Liquid Glass 应用图标：新增 `AppIcon.icon` 图标合成器源（含 `Foreground.svg` 矢量字形与 `icon.json` 清单），打包时由 actool 编译为 `Assets.car` 资源目录并写入 `.app`，旧版 macOS 自动回退到 `icon.icns`。
+- Windows 托盘图标随任务栏深/浅色主题自动适配：新增 `theme_watcher.py`，通过 `RegNotifyChangeKeyValue` 监听注册表 `SystemUsesLightTheme`（带 5 秒轮询兜底），主题切换时实时重绘图标。
+
+**Changed**
+- 托盘图标渲染区分平台：macOS 继续使用系统自动着色的模板镂空图标，Windows/其它平台改用自带对比度的实色图标，并按任务栏主题反转配色，避免"黑底黑图"看不清。
+- 遥测移除 `credits_used` / `credits_used_sum` 字段：经实证上游网关从不返回 metering，该字段恒为 NULL 无意义，已从客户端采集/聚合/上报、Worker 落库/卷动/查询、D1 两张表及设计文档全链路移除。
+- 遥测 rollup 表不再落库 `schema_version`（保留上报 body 顶层的协议握手位，便于未来按版本路由）。
+- macOS 打包流程更新：`kiro_gateway_tray.spec` 在 BUNDLE 后调用 `macos_icon.install_into_app` 安装图标目录并写入 `CFBundleIconName`；`make_dist.py` 在打 DMG 前再执行一次作为兜底。
+
+**Fixed**
+- Windows 上启动内嵌网关进程时会弹出多余的空白控制台窗口：`gateway.py` 与 `proc_guard.py` 补充 `CREATE_NO_WINDOW` 标志。
+
 ## v0.2.3 (2026-06-26)
 
 **Changed**

@@ -43,6 +43,18 @@ def build_macos_dmg() -> Path:
     stage.mkdir(parents=True)
     shutil.copytree(DIST / "KiroGatewayTray.app", stage / "KiroGatewayTray.app", symlinks=True)
 
+    # Belt-and-suspenders: ensure the macOS 26 Liquid Glass icon catalog
+    # (Assets.car) and CFBundleIconName are present in the staged .app. The
+    # spec already does this post-BUNDLE, but re-running here keeps the DMG
+    # correct even if the .app was produced by an older spec or copied in.
+    try:
+        sys.path.insert(0, str(APP / "packaging"))
+        import macos_icon  # noqa: E402
+
+        macos_icon.install_into_app(stage / "KiroGatewayTray.app")
+    except Exception as exc:  # non-fatal: fall back to whatever the .app has
+        print(f"[warn] macOS icon catalog step skipped: {exc}")
+
     result = subprocess.run(
         [
             "create-dmg",

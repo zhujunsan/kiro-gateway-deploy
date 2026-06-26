@@ -56,10 +56,8 @@
    - `completion_tokens`：永远 tiktoken（cl100k_base × Claude 校正 1.15，见 `kiro/tokenizer.py`）。
    - `prompt_tokens / total_tokens`：上游回了 `contextUsagePercentage` 时按"百分比 × 模型上限"反算（`calculate_tokens_from_context_usage`，较准）；没回时退回纯 tiktoken；都没有则为 0。
    - **注意**：网关把精度来源（`prompt_source`/`total_source` = `API Kiro`/`tiktoken`）只写进 `logger.debug`，**不放进响应 `usage`**。因此客户端无法区分这条 token 是反算的还是估算的 —— 故**不采集 `token_source` 维度**（曾设想的 `tok_src_*` 列已砍掉，见决策记录）。
-3. **`credits_used` 是上游唯一真实计量，但随缘有**。`kiro/parsers.py:410-411` 仅当上游 SSE 出现 `{"usage":...}` 事件时才解析，`final_chunk` 里 `if metering_data:` 才带 `credits_used`。它是标量 credit 计量、非 token，覆盖不全。**作为可选交叉校验字段采集，不作硬指标。**
+3. **`credits_used` 上游随缘有，但本项目不采集**。`kiro/parsers.py:410-411` 仅当上游 SSE 出现 `{"usage":...}` 事件时才解析，`final_chunk` 里 `if metering_data:` 才带 `credits_used`。经本地日志实证：上游网关从不返回 metering，该字段恒为 NULL，没有意义，**已从全链路移除**（客户端采集/聚合/上报、Worker 落库/卷动/查询、D1 两张表均不再有 `credits_used` / `credits_used_sum`）。
 4. 非流式（`collect_stream_response`）内部跑同一套流式解析，结论一致。
-
-> 待实现时验证项：抓一条真实带 `{"usage":}` 事件的响应，确认 `data.get('usage')` 是纯数字还是对象，以定 `credits_used` 的列类型（`REAL` vs `JSON`）。当前按 `REAL`、可空设计。
 
 ---
 
@@ -126,7 +124,6 @@
 | `total_tokens_sum` | 总 token 之和 |
 | `request_bytes_sum` | 请求体字节之和 |
 | `response_bytes_sum` | 响应体字节之和 |
-| `credits_used_sum` | 上游真实计量之和（随缘，可空） |
 
 ### 容量测算（活跃 10h = 600 分钟，人均同时段约 2 个模型）
 
@@ -159,8 +156,6 @@ CREATE TABLE IF NOT EXISTS usage_rollup (
   total_tokens_sum    INTEGER NOT NULL DEFAULT 0,
   request_bytes_sum   INTEGER NOT NULL DEFAULT 0,
   response_bytes_sum  INTEGER NOT NULL DEFAULT 0,
-  credits_used_sum    REAL,               -- nullable，随缘
-  schema_version      INTEGER NOT NULL DEFAULT 1,
   received_at         INTEGER NOT NULL,   -- Worker 落库时间
   UNIQUE (bucket_start, bucket_seconds, username, model, app_version)
 );
@@ -182,7 +177,6 @@ CREATE TABLE IF NOT EXISTS usage_daily (
   total_tokens_sum    INTEGER NOT NULL DEFAULT 0,
   request_bytes_sum   INTEGER NOT NULL DEFAULT 0,
   response_bytes_sum  INTEGER NOT NULL DEFAULT 0,
-  credits_used_sum    REAL,
   PRIMARY KEY (day, username, model)
 );
 
@@ -205,7 +199,7 @@ POST /telemetry
   body: { schema_version, rows: [ {bucket_start, bucket_seconds,
           username, model, app_version, requests, successes, errors,
           prompt_tokens_sum, completion_tokens_sum, total_tokens_sum,
-          request_bytes_sum, response_bytes_sum, credits_used_sum} , ... ] }
+          request_bytes_sum, response_bytes_sum} , ... ] }
   → 200 { ok: true, accepted: N }
   → 401 { error: "unauthorized" }   // 密钥缺失或不匹配
 ```
@@ -258,9 +252,9 @@ POST /telemetry-secret
 INSERT INTO usage_rollup (bucket_start, bucket_seconds, username, model, app_version,
                           requests, successes, errors,
                           prompt_tokens_sum, completion_tokens_sum, total_tokens_sum,
-                          request_bytes_sum, response_bytes_sum, credits_used_sum,
-                          schema_version, received_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                          request_bytes_sum, response_bytes_sum,
+                          received_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(bucket_start, bucket_seconds, username, model, app_version)
 DO UPDATE SET
   requests = excluded.requests,
@@ -271,7 +265,6 @@ DO UPDATE SET
   total_tokens_sum = excluded.total_tokens_sum,
   request_bytes_sum = excluded.request_bytes_sum,
   response_bytes_sum = excluded.response_bytes_sum,
-  credits_used_sum = excluded.credits_used_sum,
   received_at = excluded.received_at;
 ```
 
@@ -358,7 +351,7 @@ DO UPDATE SET
 ## 十一、隐私与合规
 
 - 强制开启，无开关。
-- 上报内容白名单：时间桶、匿名哈希、模型、版本、计数、字节数之和、token 数之和、credits 之和。
+- 上报内容白名单：时间桶、匿名哈希、模型、版本、计数、字节数之和、token 数之和。
 - **绝不上报**：prompt 内容、响应正文、文件路径、IP、任何可直接定位个人的明文。
 - `username` 为不可逆哈希；如需落到真人，离线维护对照表，不写进代码或上报链路。
 
@@ -500,7 +493,7 @@ wrangler deploy
 
 ## 十四、待办验证清单（实现阶段）
 
-- [ ] 抓真实 `{"usage":}` 事件确认 `credits_used` 类型（`REAL` vs `JSON`）。
+- [x] `credits_used` / `credits_used_sum` 已从全链路移除（上游恒不返回 metering，字段恒 NULL）。
 - [ ] 确认 SSE usage chunk 跨 TCP 包分帧时尾部缓冲提取的可靠性。
 - [ ] 非流式（`stream=false`）响应能从 JSON body 正确提取 usage。
 - [ ] ASGI request body 回放正确：下游 app 仍能读到完整 body（含分帧 `more_body`）。

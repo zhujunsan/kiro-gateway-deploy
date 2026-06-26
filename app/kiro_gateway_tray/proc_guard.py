@@ -185,7 +185,8 @@ def _linux_set_pdeathsig() -> None:  # pragma: no cover - runs in child, Linux-o
 
 def _win_creationflags() -> int:  # pragma: no cover - Windows-only
     CREATE_NEW_PROCESS_GROUP = 0x00000200
-    return CREATE_NEW_PROCESS_GROUP
+    CREATE_NO_WINDOW = 0x08000000
+    return CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
 
 
 _WIN_JOB = None  # keep a process-wide handle alive; closing it kills the job

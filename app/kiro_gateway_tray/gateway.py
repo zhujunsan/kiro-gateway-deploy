@@ -112,12 +112,18 @@ class GatewayProcess:
         # keeps those bootstrap failures diagnosable.
         bootstrap_path = paths.log_dir() / "gateway-bootstrap.log"
         self._bootstrap_log = open(bootstrap_path, "w", encoding="utf-8")
+        popen_kwargs = {}
+        if sys.platform == "win32":
+            # CREATE_NO_WINDOW: re-exec'ing the frozen exe would otherwise
+            # allocate a blank console window on Windows.
+            popen_kwargs["creationflags"] = 0x08000000
         self._proc = subprocess.Popen(
             _child_command(),
             cwd=str(paths.data_dir()),
             env=env,
             stdout=self._bootstrap_log,
             stderr=subprocess.STDOUT,
+            **popen_kwargs,
         )
 
     def _close_bootstrap_log(self) -> None:

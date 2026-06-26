@@ -143,7 +143,6 @@ class _Bucket:
     total_tokens_sum: int = 0
     request_bytes_sum: int = 0
     response_bytes_sum: int = 0
-    credits_used_sum: float | None = None
 
     def to_row(self) -> dict[str, Any]:
         """Serialise to the worker payload row shape (design 八)."""
@@ -161,7 +160,6 @@ class _Bucket:
             "total_tokens_sum": self.total_tokens_sum,
             "request_bytes_sum": self.request_bytes_sum,
             "response_bytes_sum": self.response_bytes_sum,
-            "credits_used_sum": self.credits_used_sum,
         }
 
 
@@ -175,7 +173,6 @@ class RequestSample:
     total_tokens: int | None = None
     request_bytes: int = 0
     response_bytes: int = 0
-    credits_used: float | None = None
 
 
 class Aggregator:
@@ -220,8 +217,6 @@ class Aggregator:
                 b.total_tokens_sum += int(sample.total_tokens)
             b.request_bytes_sum += max(0, int(sample.request_bytes))
             b.response_bytes_sum += max(0, int(sample.response_bytes))
-            if sample.credits_used is not None:
-                b.credits_used_sum = (b.credits_used_sum or 0.0) + float(sample.credits_used)
 
     def collect_closed(self, now: float | None = None) -> list[dict[str, Any]]:
         """Remove & return rows for buckets whose window has fully elapsed.
@@ -647,25 +642,14 @@ def _usage_from_json(buf: bytes) -> dict[str, Any] | None:
     return merged or None
 
 
-def _coerce_credits(value: Any) -> float | None:
-    """credits_used is the upstream's only real metering, but it only appears
-    when the upstream emits a ``{"usage":}`` event and may be scalar or object
-    (design 四.3). We keep numeric scalars and drop anything else."""
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    return None
-
-
-def parse_usage(usage: dict[str, Any] | None) -> tuple[int | None, int | None, int | None, float | None]:
+def parse_usage(usage: dict[str, Any] | None) -> tuple[int | None, int | None, int | None]:
     """Normalise an OpenAI/Anthropic usage dict.
 
-    Returns ``(prompt, completion, total, credits)``. Maps Anthropic
+    Returns ``(prompt, completion, total)``. Maps Anthropic
     ``input_tokens``/``output_tokens`` onto the prompt/completion columns and
     synthesises ``total`` when only the parts are present."""
     if not usage:
-        return None, None, None, None
+        return None, None, None
     prompt = usage.get("prompt_tokens")
     if prompt is None:
         prompt = usage.get("input_tokens")
@@ -675,12 +659,10 @@ def parse_usage(usage: dict[str, Any] | None) -> tuple[int | None, int | None, i
     total = usage.get("total_tokens")
     if total is None and (prompt is not None or completion is not None):
         total = int(prompt or 0) + int(completion or 0)
-    credits = _coerce_credits(usage.get("credits_used"))
     return (
         int(prompt) if prompt is not None else None,
         int(completion) if completion is not None else None,
         int(total) if total is not None else None,
-        credits,
     )
 
 
@@ -844,11 +826,10 @@ class TelemetryMiddleware:
                 usage = _merge_usage_from_sse(bytes(state.get("sse_tail", b"")))
             elif state.get("is_json"):
                 usage = _usage_from_json(bytes(state.get("json_buf", b"")))
-            prompt, completion, total, credits = parse_usage(usage)
+            prompt, completion, total = parse_usage(usage)
             sample.prompt_tokens = prompt
             sample.completion_tokens = completion
             sample.total_tokens = total
-            sample.credits_used = credits
             status_ok = 200 <= int(state.get("status", 0) or 0) < 300
             has_usage = prompt is not None or completion is not None or total is not None
             # Success = the request completed AND we recovered a final usage

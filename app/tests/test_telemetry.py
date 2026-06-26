@@ -183,17 +183,6 @@ def test_aggregator_splits_by_dimension():
     assert len(rows) == 3
 
 
-def test_aggregator_credits_optional():
-    agg = Aggregator("user", "0.1.0", 600)
-    agg.record(RequestSample(model="m", success=True), now=1200)
-    rows = agg.drain_all()
-    assert rows[0]["credits_used_sum"] is None
-    agg.record(RequestSample(model="m", credits_used=1.5), now=1200)
-    agg.record(RequestSample(model="m", credits_used=2.0), now=1200)
-    rows = agg.drain_all()
-    assert rows[0]["credits_used_sum"] == 3.5
-
-
 def test_collect_closed_only_returns_expired():
     agg = Aggregator("user", "0.1.0", 600)
     # open bucket at 1200 (closes at 1800)
@@ -210,15 +199,14 @@ def test_collect_closed_only_returns_expired():
 # --- usage extraction -------------------------------------------------------
 
 def test_parse_usage_openai():
-    p, c, t, credits = parse_usage({
+    p, c, t = parse_usage({
         "prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120,
     })
     assert (p, c, t) == (100, 20, 120)
-    assert credits is None
 
 
 def test_parse_usage_anthropic_input_output():
-    p, c, t, credits = parse_usage({
+    p, c, t = parse_usage({
         "input_tokens": 30, "output_tokens": 7,
     })
     assert p == 30
@@ -226,15 +214,8 @@ def test_parse_usage_anthropic_input_output():
     assert t == 37  # synthesised
 
 
-def test_parse_usage_credits_scalar_only():
-    _, _, _, credits = parse_usage({"prompt_tokens": 1, "credits_used": 4})
-    assert credits == 4.0
-    _, _, _, credits = parse_usage({"prompt_tokens": 1, "credits_used": {"x": 1}})
-    assert credits is None
-
-
 def test_parse_usage_empty():
-    assert parse_usage(None) == (None, None, None, None)
+    assert parse_usage(None) == (None, None, None)
 
 
 def test_sse_usage_extraction():
@@ -625,7 +606,6 @@ def test_middleware_extracts_sse_usage(tmp_path):
     assert r["prompt_tokens_sum"] == 7
     assert r["completion_tokens_sum"] == 2
     assert r["total_tokens_sum"] == 9
-    assert r["credits_used_sum"] == 1.5
     assert r["successes"] == 1
 
 

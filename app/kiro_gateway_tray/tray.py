@@ -14,6 +14,7 @@ from .icon import make_icon
 from .log import logger
 from .notify import APP_NAME
 from .supervisor import Supervisor
+from .theme_watcher import ThemeWatcher
 
 
 class TrayUnavailable(RuntimeError):
@@ -204,6 +205,9 @@ class TrayApp:
         self._update_gate = _ThrottleGate()
         self._probe_gate = _ThrottleGate(min_interval=self._PROBE_MIN_INTERVAL)
         self._usage_refresh_stop = threading.Event()
+        # Windows-only: auto-adapt the tray icon to the taskbar light/dark
+        # theme. Constructed in run(); start() is a no-op off Windows.
+        self._theme_watcher: ThemeWatcher | None = None
 
     # --- redraw / notify helpers ---
 
@@ -228,6 +232,18 @@ class TrayApp:
             self._icon.icon = make_icon(self.sup.status()["gateway"] == "running")
         except Exception:
             logger.debug("_refresh_icon failed", exc_info=True)
+
+    def _on_theme_change(self, light_theme: bool) -> None:
+        """Windows taskbar theme changed: re-render the icon for the new theme.
+
+        Called from the ThemeWatcher daemon thread. pystray on Windows allows
+        setting ``icon.icon`` from any thread, so we refresh directly — we must
+        NOT route through ``macos_menu.run_on_main_thread`` here (that helper is
+        macOS-specific and there is no Windows main-thread requirement). The
+        ``light_theme`` argument is informational; ``_refresh_icon`` re-detects
+        via ``make_icon`` auto-detect, keeping a single rendering path.
+        """
+        self._refresh_icon()
 
     # --- menu actions ---
 
@@ -283,6 +299,8 @@ class TrayApp:
 
     def _on_quit(self, icon, _item):
         self._usage_refresh_stop.set()
+        if self._theme_watcher is not None:
+            self._theme_watcher.stop()
         self.sup.stop()
         self.sup.close()
         icon.stop()
@@ -570,6 +588,10 @@ class TrayApp:
         threading.Thread(target=_startup, daemon=True).start()
         self._kick_update_check()
         self._start_usage_refresh_loop()
+        # Windows-only taskbar theme auto-adaptation. start() is a no-op on
+        # macOS/Linux, so it's safe to call unconditionally.
+        self._theme_watcher = ThemeWatcher(self._on_theme_change)
+        self._theme_watcher.start()
         self._icon.run()
 
 
