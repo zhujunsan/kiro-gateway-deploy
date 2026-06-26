@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.2.5 (2026-06-26)
+
+**Fixed**
+- 网关工具调用改为符合 OpenAI 规范的增量流式下发：此前会把整个工具调用 `arguments`（如约 33KB 的 Write 计划）作为单个超大 SSE 块一次性发出，超大 `data:` 行容易被中间层（如 cloudflared）缓冲/截断，导致 Cursor 收到工具调用后卡死、不执行工具。现改为开场 delta 仅带 id/name 与空 arguments，随后按 1024 字符切片逐片下发 arguments，避免任何单行过大。
+
+**Changed**
+- 同步上游网关源码 SHA 至 `92f3ca9`（含增量流式工具调用修复），并将 `docker/docker-compose.yml` 镜像 tag 更新为 `ghcr.io/zhujunsan/kiro-gateway:main-92f3ca9`。
+
 ## v0.2.4 (2026-06-26)
 
 **New**
