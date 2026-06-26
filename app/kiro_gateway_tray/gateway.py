@@ -19,12 +19,15 @@ CRITICAL ORDER inside the child (see run_gateway_blocking):
 from __future__ import annotations
 
 import os
+import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from . import appconfig, paths
 from .appconfig import AppCfg
+from .log import logger
 
 
 def _candidate_vendor_roots() -> list[Path]:
@@ -135,17 +138,66 @@ class GatewayProcess:
             self._bootstrap_log = None
 
     def stop(self) -> None:
+        """Stop the child and block until it has actually exited.
+
+        terminate() only *requests* exit; if we returned without confirming the
+        process is gone (the old code returned right after kill() without a
+        second wait), a follow-up start() — i.e. a restart — could race the
+        dying child for the gateway port and fail to bind. So we wait after
+        terminate, and wait again after the kill fallback.
+        """
         if self._proc and self._proc.poll() is None:
             self._proc.terminate()
             try:
                 self._proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
+                logger.warning("gateway did not exit within 10s of SIGTERM; killing")
                 self._proc.kill()
+                try:
+                    self._proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    logger.error("gateway still alive after SIGKILL; port may stay busy")
         self._proc = None
         self._close_bootstrap_log()
 
     def is_alive(self) -> bool:
         return bool(self._proc and self._proc.poll() is None)
+
+
+def wait_port_free(
+    port: int,
+    host: str = "127.0.0.1",
+    *,
+    timeout: float = 10.0,
+    interval: float = 0.2,
+) -> bool:
+    """Poll until ``host:port`` can be bound, i.e. the previous listener has
+    released it. Returns True once free, False if still busy after ``timeout``.
+
+    Used between stop() and start() on restart: the OS may keep the listening
+    socket around briefly after the child dies, and a new uvicorn binding the
+    same port too soon would fail. We probe by attempting a bind (with
+    SO_REUSEADDR, matching how servers bind) rather than connecting, so we don't
+    depend on anything still answering.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        if _can_bind(host, port):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(interval)
+
+
+def _can_bind(host: str, port: int) -> bool:
+    """True if a TCP listener can currently bind ``host:port``."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind((host, port))
+            return True
+        except OSError:
+            return False
 
 
 def _setup_child_logging() -> None:

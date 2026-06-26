@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.2.6 (2026-06-26)
+
+**Fixed**
+- 托盘"重启"网关偶发端口被占用、启动失败：修复重启时序并增加兜底。`gateway.py` 的 `stop()` 在 `terminate()` 超时 `kill()` 后补充二次 `wait()`，确保返回前旧进程确实退出；新增 `wait_port_free()` 以「能否 bind 目标端口」轮询探测端口释放（用 `SO_REUSEADDR`，避免被无害的 TIME_WAIT 误卡）。`supervisor.py` 的 `restart()` 在 `stop()` 与 `start()` 之间等待端口释放（上限 10 秒），超时则记 warning 后照常启动，避免被外部进程卡死。
+
 ## v0.2.5 (2026-06-26)
 
 **Fixed**

@@ -1,4 +1,5 @@
 # app/tests/test_gateway.py
+import socket
 from pathlib import Path
 from kiro_gateway_tray import gateway, appconfig
 
@@ -35,3 +36,69 @@ def test_child_command_frozen_mode(monkeypatch):
     monkeypatch.setattr(gateway.sys, "executable", "/Apps/KiroGatewayTray", raising=False)
     cmd = gateway._child_command()
     assert cmd == ["/Apps/KiroGatewayTray", "--run-gateway"]
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def test_wait_port_free_returns_true_when_free():
+    # An unbound ephemeral port must be reported free immediately.
+    port = _free_port()
+    assert gateway.wait_port_free(port, timeout=1) is True
+
+
+def test_wait_port_free_times_out_while_bound():
+    # While a listener holds the port, wait_port_free must give up after timeout.
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        port = srv.getsockname()[1]
+        assert gateway.wait_port_free(port, timeout=0.5, interval=0.05) is False
+
+
+def test_wait_port_free_succeeds_after_release():
+    # Once the listener closes mid-poll, the next bind probe should succeed.
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+    srv.close()
+    assert gateway.wait_port_free(port, timeout=1, interval=0.05) is True
+
+
+def test_stop_waits_after_kill(monkeypatch):
+    # If terminate() doesn't make the child exit in time, stop() must kill AND
+    # wait again so it never returns while the port-holding child is still alive.
+    events = []
+
+    class _FakeProc:
+        def __init__(self):
+            self._alive = True
+
+        def poll(self):
+            return None if self._alive else 0
+
+        def terminate(self):
+            events.append("terminate")
+
+        def kill(self):
+            events.append("kill")
+            self._alive = False
+
+        def wait(self, timeout=None):
+            events.append(f"wait:{timeout}")
+            if self._alive and "kill" not in events:
+                raise gateway.subprocess.TimeoutExpired(cmd="gw", timeout=timeout)
+            return 0
+
+    gp = gateway.GatewayProcess()
+    gp._proc = _FakeProc()
+    gp.stop()
+
+    assert events == ["terminate", "wait:10", "kill", "wait:5"]
+    assert gp._proc is None

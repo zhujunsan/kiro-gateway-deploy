@@ -10,6 +10,7 @@ from typing import Callable
 import httpx
 
 from . import appconfig
+from . import gateway
 from .log import logger
 from .appconfig import AppCfg
 from .gateway import GatewayProcess
@@ -24,6 +25,9 @@ class Supervisor:
     _PROBE_INTERVAL_STEADY = 15     # seconds, once consistently running
     # automatically restart cloudflared if stuck in connecting/disconnected state for this long (seconds)
     _TUNNEL_RECONNECT_TIMEOUT = 60
+    # how long restart() waits for the old gateway's port to free before
+    # starting the new child (seconds)
+    _PORT_FREE_TIMEOUT = 10
 
     def __init__(self, gateway=None, tunnel=None) -> None:
         self.gateway = gateway or GatewayProcess()
@@ -199,6 +203,19 @@ class Supervisor:
 
     def restart(self) -> bool:
         self.stop()
+        # stop() already waits for the old gateway child to exit, but the OS can
+        # hold its listening socket open a beat longer. Starting the new child
+        # before the port frees would make uvicorn fail to bind. Poll until the
+        # port is bindable (bounded wait); proceed anyway on timeout so a stuck
+        # external listener doesn't wedge restart forever — start() surfaces the
+        # bind failure via the health probe.
+        cfg = self._get_cfg()
+        if not gateway.wait_port_free(cfg.gateway.port, timeout=self._PORT_FREE_TIMEOUT):
+            logger.warning(
+                "gateway port {} still busy after {}s; starting anyway",
+                cfg.gateway.port,
+                self._PORT_FREE_TIMEOUT,
+            )
         return self.start()
 
     def mark_starting(self) -> None:

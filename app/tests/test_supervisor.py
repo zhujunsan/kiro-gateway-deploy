@@ -247,3 +247,41 @@ def test_run_probe_cycle_auto_restarts_tunnel_on_timeout(monkeypatch, tmp_path):
     assert "start" in restarted
     assert s._tunnel_disconnected_since is None
 
+
+def test_restart_waits_for_port_before_start(monkeypatch, tmp_path):
+    # restart() must fully stop the old gateway and confirm the port is free
+    # BEFORE starting the new child, otherwise the new uvicorn races the dying
+    # one for the port. Assert ordering: stop -> wait_port_free -> start.
+    s = _make_sup(monkeypatch, tmp_path)
+    s.start()
+
+    order = []
+    monkeypatch.setattr(s.gateway, "stop", lambda: order.append("stop"))
+    monkeypatch.setattr(s.tunnel, "stop", lambda: order.append("tunnel_stop"))
+
+    def fake_wait(port, **kwargs):
+        order.append(f"wait:{port}")
+        return True
+
+    monkeypatch.setattr(supervisor.gateway, "wait_port_free", fake_wait)
+    monkeypatch.setattr(s, "start", lambda: order.append("start") or True)
+
+    s.restart()
+
+    assert order.index("stop") < order.index(f"wait:{s._get_cfg().gateway.port}")
+    assert order.index(f"wait:{s._get_cfg().gateway.port}") < order.index("start")
+
+
+def test_restart_starts_even_if_port_stays_busy(monkeypatch, tmp_path, capsys):
+    # A wedged external listener must not wedge restart forever: on port-free
+    # timeout we warn and start anyway (the health probe surfaces any failure).
+    s = _make_sup(monkeypatch, tmp_path)
+    s.start()
+
+    monkeypatch.setattr(supervisor.gateway, "wait_port_free", lambda port, **k: False)
+    started = {"n": 0}
+    monkeypatch.setattr(s, "start", lambda: started.__setitem__("n", started["n"] + 1) or True)
+
+    s.restart()
+    assert started["n"] == 1
+
