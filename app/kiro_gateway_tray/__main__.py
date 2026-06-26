@@ -73,12 +73,29 @@ def main() -> int:
         except tray.TrayUnavailable as e:
             print(f"[tray unavailable: {e}] 退化到 CLI 模式", file=sys.stderr)
             logger.info("tray unavailable ({}); falling back to CLI mode", e)
+        except Exception as e:
+            logger.exception("tray.run() failed")
+            if sys.platform == "win32":
+                import ctypes
+                ctypes.windll.user32.MessageBoxW(
+                    0, str(e), "Kiro Gateway Tray - 启动失败", 0x10
+                )
+            return 1
 
     try:
-        from . import cli
-    except ImportError:
-        from kiro_gateway_tray import cli
-    return cli.run()
+        try:
+            from . import cli
+        except ImportError:
+            from kiro_gateway_tray import cli
+        return cli.run()
+    except Exception as e:
+        logger.exception("cli.run() failed")
+        if sys.platform == "win32":
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(
+                0, str(e), "Kiro Gateway Tray - 启动失败", 0x10
+            )
+        return 1
 
 
 if __name__ == "__main__":

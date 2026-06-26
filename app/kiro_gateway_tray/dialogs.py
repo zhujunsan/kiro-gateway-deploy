@@ -67,6 +67,87 @@ def validate_profile_arn(value: str) -> str | None:
     return None
 
 
+def _win32_powershell_input(
+    title: str,
+    prompt: str,
+    default: str = "",
+    hidden: bool = False,
+    multiline: bool = False,
+) -> str:
+    """Windows fallback: WinForms 对话框（支持多行和密码掩码），无需 tkinter。"""
+    escaped_title = title.replace('"', '`"')
+    escaped_prompt = prompt.replace('"', '`"').replace("\n", "`n")
+    escaped_default = default.replace('"', '`"').replace("\n", "`n")
+
+    form_height = "300" if multiline else "180"
+    textbox_height = "80" if multiline else "20"
+    textbox_multiline = "$true" if multiline else "$false"
+    textbox_scrollbars = '"Vertical"' if multiline else '"None"'
+    textbox_password = "$true" if hidden else "$false"
+
+    ps_script = (
+        "Add-Type -AssemblyName System.Windows.Forms\n"
+        "Add-Type -AssemblyName System.Drawing\n"
+        "$form = New-Object System.Windows.Forms.Form\n"
+        f'$form.Text = "{escaped_title}"\n'
+        f"$form.Size = New-Object System.Drawing.Size(420,{form_height})\n"
+        "$form.StartPosition = 'CenterScreen'\n"
+        "$form.TopMost = $true\n"
+        "$form.FormBorderStyle = 'FixedDialog'\n"
+        "$form.MaximizeBox = $false\n"
+        "$form.MinimizeBox = $false\n"
+        "$label = New-Object System.Windows.Forms.Label\n"
+        "$label.Location = New-Object System.Drawing.Point(10,10)\n"
+        "$label.Size = New-Object System.Drawing.Size(380,50)\n"
+        f'$label.Text = "{escaped_prompt}"\n'
+        "$label.AutoSize = $false\n"
+        "$label.MaximumSize = New-Object System.Drawing.Size(380,0)\n"
+        "$label.AutoEllipsis = $false\n"
+        "$form.Controls.Add($label)\n"
+        "$tb = New-Object System.Windows.Forms.TextBox\n"
+        "$tb.Location = New-Object System.Drawing.Point(10,65)\n"
+        f"$tb.Size = New-Object System.Drawing.Size(380,{textbox_height})\n"
+        f"$tb.Multiline = {textbox_multiline}\n"
+        f"$tb.ScrollBars = {textbox_scrollbars}\n"
+        f"$tb.UseSystemPasswordChar = {textbox_password}\n"
+        f'$tb.Text = "{escaped_default}"\n'
+        "$form.Controls.Add($tb)\n"
+        "$okBtn = New-Object System.Windows.Forms.Button\n"
+        "$okBtn.Text = 'OK'\n"
+        f"$okBtn.Location = New-Object System.Drawing.Point(220,{int(form_height) - 70})\n"
+        "$okBtn.Size = New-Object System.Drawing.Size(75,30)\n"
+        "$okBtn.DialogResult = [System.Windows.Forms.DialogResult]::OK\n"
+        "$form.Controls.Add($okBtn)\n"
+        "$cancelBtn = New-Object System.Windows.Forms.Button\n"
+        "$cancelBtn.Text = 'Cancel'\n"
+        f"$cancelBtn.Location = New-Object System.Drawing.Point(310,{int(form_height) - 70})\n"
+        "$cancelBtn.Size = New-Object System.Drawing.Size(75,30)\n"
+        "$cancelBtn.DialogResult = [System.Windows.Forms.DialogResult]::Cancel\n"
+        "$form.Controls.Add($cancelBtn)\n"
+        "$form.AcceptButton = $okBtn\n"
+        "$form.CancelButton = $cancelBtn\n"
+        "$form.Add_Shown({$tb.Select()})\n"
+        "$result = $form.ShowDialog()\n"
+        'if ($result -eq [System.Windows.Forms.DialogResult]::OK) {\n'
+        "  Write-Output $tb.Text\n"
+        "  exit 0\n"
+        "} else {\n"
+        "  exit 1\n"
+        "}\n"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
+            capture_output=True, text=True, timeout=300,
+            creationflags=0x08000000,  # CREATE_NO_WINDOW
+        )
+    except Exception as e:
+        raise RuntimeError(f"无法弹出输入框: {e}")
+    if result.returncode != 0:
+        raise RuntimeError("用户取消了操作。")
+    return result.stdout.strip()
+
+
 def _osascript_input(title: str, prompt: str, default: str = "", hidden: bool = False) -> str:
     hidden_clause = "with hidden answer" if hidden else ""
     script = (
@@ -188,6 +269,8 @@ def prompt_input(
             raise RuntimeError("用户取消了操作。")
         return val
     except ImportError:
+        if sys.platform == "win32":
+            return _win32_powershell_input(title, prompt, default, hidden, multiline)
         raise RuntimeError("无法弹出输入框，请改用 CLI 模式（kiro-gateway-tray --cli）。")
 
 

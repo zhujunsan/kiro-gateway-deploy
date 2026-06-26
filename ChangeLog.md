@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.2.2 (2026-06-26)
+
+**Fixed**
+- Windows 上 PyInstaller 打包后首次运行无反应的问题（tkinter 未打包导致输入框无法弹出）
+- CLI 模式下 stdin 不可用时静默退出，现在会给出明确错误提示
+
+**Changed**
+- Windows 输入对话框从 VB InputBox 升级为 WinForms 版本，支持多行输入和密码掩码
+- 启动失败时在 Windows 上弹出 MessageBox 显示错误原因，不再静默退出
+
 ## v0.2.1 (2026-06-25)
 
 **Changed**

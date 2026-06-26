@@ -17,6 +17,22 @@ def _base_url(cfg) -> str:
 
 def _first_run_setup_cli(cfg) -> str:
     """CLI guided setup: prompt for provision_url (if empty) + shared secret."""
+    # Windows GUI 打包后无控制台，stdin 不可用时提前报错
+    if sys.stdin is None or not hasattr(sys.stdin, "fileno"):
+        raise RuntimeError(
+            "当前环境无控制台输入（stdin 不可用）。\n"
+            "请直接双击应用图标启动（将使用图形界面配置），\n"
+            "或在 cmd/PowerShell 终端中运行 --cli 模式。"
+        )
+    try:
+        sys.stdin.fileno()
+    except Exception:
+        raise RuntimeError(
+            "当前环境无控制台输入（stdin 不可用）。\n"
+            "请直接双击应用图标启动（将使用图形界面配置），\n"
+            "或在 cmd/PowerShell 终端中运行 --cli 模式。"
+        )
+
     print("\n=== Kiro Gateway Tray 首次配置 ===")
     if not cfg.cloudflare.provision_url:
         print("请输入 Worker 服务地址（provision URL）：", end="", flush=True)
