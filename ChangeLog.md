@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.2.7 (2026-06-26)
+
+**Fixed**
+- macOS Apple Silicon 上安装包打开时报「文件已损坏，无法打开」：DMG 内的 `.app` 此前完全未签名，配合 `com.apple.quarantine` 隔离标记会被 Gatekeeper 判定为「已损坏」。`make_dist.py` 新增 ad-hoc（identity `-`）代码签名 `_codesign_adhoc()`，在图标 catalog 安装之后、`create-dmg` 打包之前对 `.app` 签名（先单独签内层 cloudflared 子进程，再 `--deep` 整体签名并 `--verify --strict` 校验），把硬性「已损坏」拦截降级为可右键打开的「身份不明开发者」提示。
+- macOS DMG 内混入多余的图标编译中间目录 `_icon_build`：`macos_icon.install_into_app()` 此前把 `Assets.car` 等中间产物编译到 `app_path.parent`，会泄漏进 create-dmg 的 staging 目录与最终 DMG。改为用隔离的 `tempfile.mkdtemp()` 临时目录编译并在 `finally` 清理，确保 staging 目录只含 `KiroGatewayTray.app`。
+
+**Changed**
+- 更新 macOS 安装说明（`README.md`、`app/README.md`）：说明现采用临时（ad-hoc）签名而非付费签名/公证，不再出现「已损坏」，但首次打开仍会提示「身份不明的开发者」，并给出右键 App →「打开」或 `xattr -dr com.apple.quarantine` 两种打开方式（Homebrew 安装已自动处理隔离标记）。
+
 ## v0.2.6 (2026-06-26)
 
 **Fixed**

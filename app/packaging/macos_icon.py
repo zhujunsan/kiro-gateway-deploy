@@ -26,6 +26,7 @@ from __future__ import annotations
 import plistlib
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 APP = Path(__file__).resolve().parents[1]
@@ -96,14 +97,23 @@ def install_into_app(app_path: Path) -> bool:
     resources = app_path / "Contents" / "Resources"
     resources.mkdir(parents=True, exist_ok=True)
 
-    car = compile_icon(app_path.parent / "_icon_build")
-    if car is None and ASSETS_CAR.exists():
-        car = ASSETS_CAR
+    # Compile into an isolated temp dir so the intermediate build artifacts
+    # (Assets.car, partial.plist, ...) never land next to the .app. When
+    # install_into_app() is called against a create-dmg staging folder (or
+    # DISTPATH), writing under app_path.parent would leak that directory into
+    # the final DMG / dist output.
+    tmp_dir = Path(tempfile.mkdtemp(prefix="kiro_icon_build_"))
+    try:
+        car = compile_icon(tmp_dir)
+        if car is None and ASSETS_CAR.exists():
+            car = ASSETS_CAR
 
-    installed = False
-    if car is not None and car.exists():
-        shutil.copy2(car, resources / "Assets.car")
-        installed = True
+        installed = False
+        if car is not None and car.exists():
+            shutil.copy2(car, resources / "Assets.car")
+            installed = True
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
     # Defensive: make sure the Info.plist carries both icon keys even if the
     # spec's info_plist was changed. CFBundleIconName drives macOS 26's

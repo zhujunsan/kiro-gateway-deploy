@@ -30,6 +30,54 @@ def _write_sha(out: Path) -> str:
     return digest
 
 
+def _codesign_adhoc(app_path: Path) -> None:
+    """Ad-hoc (self) sign the staged .app in place.
+
+    On Apple Silicon macOS *requires* a valid code signature; a bundle with no
+    signature plus the com.apple.quarantine attribute is reported by Gatekeeper
+    as "damaged and can't be opened". We have no Apple Developer cert, so we
+    sign ad-hoc (identity "-"): the signature is valid but not from an
+    identified developer, which downgrades the hard "damaged" block to the
+    milder "unidentified developer" prompt (right-click > Open).
+
+    Must run *after* the icon catalog is installed and right before create-dmg,
+    because rewriting Contents/Resources would invalidate an earlier signature.
+    """
+    if not shutil.which("codesign"):
+        print("[warn] codesign not found; skipping ad-hoc signing")
+        return
+
+    # Sign nested executables/dylibs first so the bundle seal is consistent.
+    # --deep usually covers these, but the bundled cloudflared is a loose
+    # Mach-O child process, so sign it explicitly to be robust.
+    inner: list[Path] = []
+    for sub in ("Contents/Frameworks", "Contents/Resources", "Contents/MacOS"):
+        d = app_path / sub
+        if d.exists():
+            inner += [p for p in d.rglob("cloudflared") if p.is_file()]
+    for binary in inner:
+        subprocess.run(
+            ["codesign", "--force", "--sign", "-", "--timestamp=none", str(binary)],
+            check=False,
+        )
+
+    result = subprocess.run(
+        ["codesign", "--force", "--deep", "--sign", "-", "--timestamp=none", str(app_path)],
+        check=False,
+    )
+    if result.returncode != 0:
+        raise subprocess.CalledProcessError(result.returncode, "codesign")
+
+    verify = subprocess.run(
+        ["codesign", "--verify", "--deep", "--strict", "--verbose=2", str(app_path)],
+        check=False,
+    )
+    if verify.returncode != 0:
+        print(f"[warn] codesign verify reported issues (rc={verify.returncode})")
+    else:
+        print(f"[ok] ad-hoc signed {app_path.name}")
+
+
 def build_macos_dmg() -> Path:
     arch = "arm64" if platform.machine() == "arm64" else "amd64"
     out = OUT / f"KiroGatewayTray-{VER}-macos-{arch}.dmg"
@@ -54,6 +102,11 @@ def build_macos_dmg() -> Path:
         macos_icon.install_into_app(stage / "KiroGatewayTray.app")
     except Exception as exc:  # non-fatal: fall back to whatever the .app has
         print(f"[warn] macOS icon catalog step skipped: {exc}")
+
+    # Ad-hoc sign AFTER the icon catalog is installed (rewriting Resources would
+    # invalidate the seal) and BEFORE create-dmg packages the bundle. Eliminates
+    # the Apple Silicon "damaged and can't be opened" Gatekeeper error.
+    _codesign_adhoc(stage / "KiroGatewayTray.app")
 
     result = subprocess.run(
         [

@@ -49,7 +49,9 @@ Cursor 支持自定义 OpenAI 兼容的 API 地址，但有几个坑：
    >
    > 新版 Homebrew 默认拒绝加载第三方 tap，若安装时报 `Refusing to load cask ... from untrusted tap`，先执行上面的 `brew trust zhujunsan/kiro-gateway-deploy`（或 `brew trust --cask zhujunsan/kiro-gateway-deploy/kiro-gateway-tray`）再重试。
    >
-   > App 暂未签名/公证，首次打开前需去掉隔离标记（或在「系统设置 → 隐私与安全性」点「仍要打开」）：
+   > App 采用**临时（ad-hoc）签名**，不是付费 Apple 开发者签名/公证。临时签名消除了 Apple Silicon 上「已损坏，无法打开」的报错，但首次打开仍会提示「来自身份不明的开发者」。两种打开方式任选其一：
+   > - **右键打开**：在 Applications 里右键点 `KiroGatewayTray.app` → 「打开」→ 弹窗里再点「打开」（仅首次需要）。
+   > - **去掉隔离标记**（Homebrew 安装已自动执行，DMG 手动安装时可用）：
    >
    > ```bash
    > xattr -dr com.apple.quarantine "/Applications/KiroGatewayTray.app"
