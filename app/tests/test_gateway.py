@@ -52,8 +52,9 @@ def test_wait_port_free_returns_true_when_free():
 
 def test_wait_port_free_times_out_while_bound():
     # While a listener holds the port, wait_port_free must give up after timeout.
+    # No SO_REUSEADDR here: a real held port mustn't be re-bindable, and on
+    # Windows SO_REUSEADDR would let the probe hijack-bind and wrongly pass.
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind(("127.0.0.1", 0))
         srv.listen(1)
         port = srv.getsockname()[1]

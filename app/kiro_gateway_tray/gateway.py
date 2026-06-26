@@ -176,8 +176,8 @@ def wait_port_free(
 
     Used between stop() and start() on restart: the OS may keep the listening
     socket around briefly after the child dies, and a new uvicorn binding the
-    same port too soon would fail. We probe by attempting a bind (with
-    SO_REUSEADDR, matching how servers bind) rather than connecting, so we don't
+    same port too soon would fail. We probe by attempting a bind (matching how
+    asyncio/uvicorn bind, see _can_bind) rather than connecting, so we don't
     depend on anything still answering.
     """
     deadline = time.monotonic() + timeout
@@ -190,9 +190,17 @@ def wait_port_free(
 
 
 def _can_bind(host: str, port: int) -> bool:
-    """True if a TCP listener can currently bind ``host:port``."""
+    """True if a TCP listener can currently bind ``host:port``.
+
+    We mirror asyncio/uvicorn's bind options: SO_REUSEADDR is set on
+    non-Windows only. On Windows SO_REUSEADDR has hijack semantics (it lets a
+    bind succeed even while another socket is actively listening on the same
+    address), which would make this probe wrongly report a busy port as free;
+    asyncio likewise omits it there. Matching that keeps the probe truthful.
+    """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if sys.platform != "win32":
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             sock.bind((host, port))
             return True
