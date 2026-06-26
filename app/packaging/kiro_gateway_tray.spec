@@ -59,7 +59,7 @@ a = Analysis(
     hiddenimports=hiddenimports,
     hookspath=[],
     runtime_hooks=[],
-    excludes=["tkinter", "pytest", "hypothesis"],
+    excludes=["pytest", "hypothesis"],
     noarchive=False,
 )
 pyz = PYZ(a.pure)

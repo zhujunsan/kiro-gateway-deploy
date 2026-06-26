@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.2.3 (2026-06-26)
+
+**Changed**
+- Linux 首次配置改用系统原生对话框（zenity，缺失时回退 kdialog），不再依赖 tkinter
+- 彻底移除 tkinter 依赖，开发环境与打包发行版的对话框行为现在保持一致
+- 优化 Windows 输入对话框布局，OK/取消按钮紧贴输入框，去除底部多余留白
+
+**Fixed**
+- Linux 桌面环境下首次配置因 tkinter 被排除而无法弹出输入框的问题
+
 ## v0.2.2 (2026-06-26)
 
 **Fixed**
