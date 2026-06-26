@@ -18,9 +18,15 @@ from pathlib import Path
 # Draw on a high-res canvas and let Cocoa scale to menu-bar size; combined with
 # the Retina fix this stays crisp.
 _TRAY_RENDER = 256
-# Transparent padding ratio: native menu-bar icons all have breathing room.
-# Content occupies 75% -> padding 12.5%.
+# Transparent padding ratio for the macOS menu-bar template icon: native
+# menu-bar icons all have breathing room. Content occupies 75% -> padding 12.5%.
 _TRAY_PAD = 0.125
+# Windows/other (solid) icons are blitted straight onto the taskbar with NO
+# system-added margin, so they must fill the slot like every other app's icon.
+# A large transparent margin here makes our icon look a size smaller than the
+# neighbors after Windows scales the bitmap down to ~16px. Keep only a hair of
+# padding so the rounded corners are not clipped -> content occupies ~90%.
+_TRAY_PAD_SOLID = 0.05
 
 _SILHOUETTE = None
 _SILHOUETTE_LOADED = False
@@ -188,7 +194,7 @@ def _make_icon_solid(running: bool, light_theme: bool = False):
     size = _TRAY_RENDER
     canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
 
-    pad = int(size * _TRAY_PAD)
+    pad = int(size * _TRAY_PAD_SOLID)
     box = size - 2 * pad
     radius = int(box * 0.22)
 
