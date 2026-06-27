@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.2.11 (2026-06-27)
+
+**Fixed**
+- Windows 安装器在升级安装前会强制自动关闭正在运行的 `KiroGatewayTray.exe` 与子进程 `cloudflared.exe`，避免旧版本进程锁住安装目录文件导致选择“自动关闭应用”后仍无法继续安装。
+
 ## v0.2.10 (2026-06-27)
 
 **Fixed**

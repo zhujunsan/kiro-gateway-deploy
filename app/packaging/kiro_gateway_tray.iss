@@ -28,6 +28,8 @@ SolidCompression=yes
 WizardStyle=modern
 PrivilegesRequired=admin
 ArchitecturesInstallIn64BitMode=x64compatible
+CloseApplications=force
+RestartApplications=yes
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -44,3 +46,25 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Run]
 Filename: "{app}\KiroGatewayTray.exe"; Description: "{cm:LaunchProgram,Kiro Gateway Tray}"; Flags: nowait postinstall skipifsilent
+
+[Code]
+procedure KillProcessByImageName(ImageName: String);
+var
+  ResultCode: Integer;
+begin
+  Exec(
+    ExpandConstant('{sys}\taskkill.exe'),
+    '/IM "' + ImageName + '" /T /F',
+    '',
+    SW_HIDE,
+    ewWaitUntilTerminated,
+    ResultCode
+  );
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  KillProcessByImageName('KiroGatewayTray.exe');
+  KillProcessByImageName('cloudflared.exe');
+  Result := '';
+end;
