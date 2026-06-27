@@ -21,6 +21,14 @@ def _make_app():
     return TrayApp()
 
 
+@pytest.fixture(autouse=True)
+def _disable_async_update_check(monkeypatch):
+    """These tests assert cache rendering, not the GitHub update worker."""
+    from kiro_gateway_tray.tray import TrayApp
+
+    monkeypatch.setattr(TrayApp, "_kick_update_check", lambda self: None)
+
+
 def test_ensure_update_info_sync_from_cache(tmp_path, monkeypatch):
     monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
     updates._write_cache(latest="v9.9.9")
