@@ -25,6 +25,25 @@ def test_apply_env_sets_process_env(tmp_path, monkeypatch):
     assert os.environ["SERVER_HOST"] == "127.0.0.1"
 
 
+def test_gateway_env_sets_tiktoken_cache_under_data_dir(tmp_path, monkeypatch):
+    monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
+    cfg = appconfig.AppCfg()
+
+    env = gateway._gateway_env(cfg)
+
+    assert env["TIKTOKEN_CACHE_DIR"] == str(tmp_path / "data" / "tiktoken_cache")
+
+
+def test_gateway_env_respects_tiktoken_cache_override(tmp_path, monkeypatch):
+    monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
+    cfg = appconfig.AppCfg()
+    cfg.gateway_extra["TIKTOKEN_CACHE_DIR"] = r"C:\custom\tiktoken"
+
+    env = gateway._gateway_env(cfg)
+
+    assert env["TIKTOKEN_CACHE_DIR"] == r"C:\custom\tiktoken"
+
+
 def test_child_command_source_mode(monkeypatch):
     monkeypatch.setattr(gateway.sys, "frozen", False, raising=False)
     cmd = gateway._child_command()

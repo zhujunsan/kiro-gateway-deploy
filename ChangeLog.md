@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.2.9 (2026-06-27)
+
+**Fixed**
+- Windows 上复制隧道 URL 改为直接写入系统 Unicode 剪贴板，不再依赖 `clip.exe`，避免中文或特殊字符在命令行管道编码下复制异常。
+- Windows 安装到 `Program Files` 后，内嵌网关的 `tiktoken` 缓存改用用户数据目录 `tiktoken_cache`，避免普通用户无权限写入 `_internal/vendor/.tiktoken_cache` 导致 tokenizer 初始化反复报 `[WinError 5] 拒绝访问`。
+
 ## v0.2.8 (2026-06-26)
 
 **Fixed**

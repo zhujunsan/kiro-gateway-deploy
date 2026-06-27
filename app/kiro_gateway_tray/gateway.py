@@ -58,6 +58,10 @@ def _gateway_env(cfg: AppCfg) -> dict[str, str]:
     # request, so it must never be the log dir itself. Respect a user override
     # if one was set explicitly under [gateway_extra].
     env.setdefault("DEBUG_DIR", str(paths.log_dir() / "debug_logs"))
+    # tiktoken writes model encoding caches during initialization. In frozen
+    # Windows installs the vendored gateway lives under Program Files, so keep
+    # that cache in the per-user data directory unless explicitly overridden.
+    env.setdefault("TIKTOKEN_CACHE_DIR", str(paths.data_dir() / "tiktoken_cache"))
     return env
 
 
