@@ -28,7 +28,7 @@ SolidCompression=yes
 WizardStyle=modern
 PrivilegesRequired=admin
 ArchitecturesInstallIn64BitMode=x64compatible
-CloseApplications=force
+CloseApplications=yes
 RestartApplications=yes
 
 [Languages]
