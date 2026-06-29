@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.2.14 (2026-06-29)
+
+**Fixed**
+- 修复 Cursor 经网关调用工具时偶发 `Invalid tool use format (REQUEST_BODY_INVALID)` 报错：Cursor 发来的复合工具 ID（`call_<24>\nfc_<50hex>`）去掉换行后会拼成约 82 字符，超过 Kiro/Bedrock 对 `toolUseId` 的 64 字符上限。网关的 `sanitize_tool_use_id` 现在在去空白的基础上，额外把非 `[a-zA-Z0-9_-]` 字符替换为下划线，并在超过 64 字符时保留前缀加内容哈希后缀做确定性截断；该转换是输入的纯函数，工具调用与工具结果两侧独立处理仍能保持配对一致。
+
+**Changed**
+- 内嵌网关与 docker 镜像升级至上游 fork `f3c8147`（含上述工具 ID 修复）。
+
 ## v0.2.13 (2026-06-29)
 
 **Changed**
