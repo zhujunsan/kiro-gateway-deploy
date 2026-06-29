@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.2.13 (2026-06-29)
+
+**Changed**
+- Windows 安装器关闭正在运行的应用前，先弹窗询问用户是否关闭：选择“是”才自动结束 `KiroGatewayTray.exe` 与 `cloudflared.exe` 并继续安装，选择“否”则取消安装。同时关闭 Inno Restart Manager 的静默自动关闭（`CloseApplications=no`/`RestartApplications=no`），不再出现无确认直接关进程的情况。
+- Windows 安装器改为可在向导中选择“为所有用户（管理员）”或“仅为我安装”（`PrivilegesRequiredOverridesAllowed=dialog`），启动时不再立即弹 UAC，仅在用户选择管理员安装时才提权；桌面图标按安装范围分别写入公共或当前用户桌面。
+- Windows 安装器新增简体中文向导（随系统语言自动切换），关闭进程提示等文案提供中英双语。
+
+**New**
+- Windows 安装器补全分发元数据：固定 `AppId`（保证后续升级识别与干净卸载）、`AppVerName`/`UninstallDisplayName`、`VersionInfo*` 文件属性、`AppCopyright`，并限定 64 位且要求 Windows 10 及以上（`ArchitecturesAllowed`/`MinVersion=10.0`）。
+
 ## v0.2.12 (2026-06-27)
 
 **Fixed**
