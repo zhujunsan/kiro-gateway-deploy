@@ -174,6 +174,31 @@ class Supervisor:
             print(f"[kiro-gateway-tray] update-port 失败: {e}", file=sys.stderr)
             logger.exception("update-port failed")
 
+    def _reprovision_if_deleted(self) -> bool:
+        """Check if the cloud tunnel was deleted; if so, re-provision silently.
+
+        Returns True if a re-provision was performed (tunnel restarted with new
+        token), False otherwise (caller should do a plain restart).
+        """
+        cfg = self._get_cfg()
+        secret = self._cached_secret or cfg.cloudflare.shared_secret
+        if not secret:
+            return False
+        from . import provision
+        exists = provision.tunnel_exists(cfg, secret)
+        if exists is not False:
+            return False
+        logger.warning("cloud tunnel deleted; re-provisioning with stored activation code")
+        try:
+            self.register(cfg, secret)
+            cfg = self._load()
+            self.tunnel.stop()
+            self.tunnel.start(cfg)
+            return True
+        except Exception:
+            logger.exception("re-provision after tunnel deletion failed")
+            return False
+
     def start(self) -> bool:
         cfg = self._load()
         self._ensure_provisioned(cfg)
@@ -300,13 +325,15 @@ class Supervisor:
 
             if should_restart_tunnel:
                 logger.warning(
-                    "Cloudflare tunnel has been disconnected for more than {}s; restarting...",
+                    "Cloudflare tunnel has been disconnected for more than {}s; checking status...",
                     self._TUNNEL_RECONNECT_TIMEOUT
                 )
                 try:
-                    self.tunnel.stop()
-                    cfg = self._get_cfg()
-                    self.tunnel.start(cfg)
+                    reprovisioned = self._reprovision_if_deleted()
+                    if not reprovisioned:
+                        self.tunnel.stop()
+                        cfg = self._get_cfg()
+                        self.tunnel.start(cfg)
                 except Exception:
                     logger.exception("Failed to restart cloudflared tunnel")
                 tunnel_connected = False

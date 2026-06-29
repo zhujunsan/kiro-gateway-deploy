@@ -13,6 +13,11 @@
 //   body: { shared_secret, username, port }
 //   → 200 { ok: true, changed, port }   (port = value actually in effect)
 //
+// POST /tunnel-status
+//   body: { shared_secret, username }
+//   → 200 { exists: boolean }            ← 只读查询，绝不修改 tunnel/DNS
+//   → 401 { error: "unauthorized" }
+//
 // POST /telemetry-secret
 //   body: { shared_secret, username }    ← 用激活码鉴权（同 /provision），不用 TELEMETRY_SECRET
 //   → 200 { telemetry_secret }           ← 只回当前密钥，绝不重建隧道
@@ -31,7 +36,8 @@
 //   注意：/q/* 不自校验密钥 —— 由 Cloudflare Access 在边缘挡（见设计文档第十二/十三节）。
 //   Worker 侧只做：白名单查询 + 仅 SELECT + 结果缓存（TTL 60 分钟）。
 //
-// scheduled(): cron 触发，把 usage_rollup 卷成 usage_daily 日聚合（幂等可重入）。
+// scheduled(): cron 触发，把 usage_rollup 卷成 usage_daily 日聚合（幂等可重入）；
+//   同时执行闲置隧道清理（仅当 IDLE_CLEANUP_DAYS 配置时）。
 //
 // Required Worker Secrets (set via wrangler secret put):
 //   SHARED_SECRET   — the secret distributed to users out-of-band
@@ -41,6 +47,8 @@
 //   DOMAIN_SUFFIX   — e.g. "example.com"
 //   HOSTNAME_PREFIX — e.g. "kg"  → final hostname = kg-<username>.<DOMAIN_SUFFIX>
 //   TELEMETRY_SECRET — 客户端上报 /telemetry 用的预共享密钥（独立于 SHARED_SECRET）
+// Optional:
+//   IDLE_CLEANUP_DAYS — 闲置隧道清理阈值（天）；未配置则不清理
 // Required bindings (wrangler.toml):
 //   TELEMETRY_DB    — D1 database (kiro-telemetry)
 
@@ -557,6 +565,81 @@ async function rollupToDaily(env) {
   await env.TELEMETRY_DB.batch(statements);
 }
 
+// --- 闲置隧道定期清理 ---
+//
+// 仅在 IDLE_CLEANUP_DAYS 已配置且为正整数时执行；未配置则完全跳过（安全默认）。
+// 只清理 name 以 HOSTNAME_PREFIX- 开头的隧道（本项目签发的），跳过正在活跃的。
+// 单个隧道删除失败不影响其余；console.log 记录操作用于审计。
+
+async function cleanupIdleTunnels(env) {
+  const maxDays = parseInt(env.IDLE_CLEANUP_DAYS, 10);
+  if (!Number.isFinite(maxDays) || maxDays <= 0) return;
+
+  const prefix = (env.HOSTNAME_PREFIX || "kg") + "-";
+  const nowMs = Date.now();
+  const thresholdMs = maxDays * 86400000;
+  let page = 1;
+  let hasMore = true;
+
+  while (hasMore) {
+    const tunnels = await cfFetch(
+      env,
+      `/accounts/${env.CF_ACCOUNT_ID}/cfd_tunnel?is_deleted=false&per_page=100&page=${page}`
+    );
+    if (!Array.isArray(tunnels) || tunnels.length === 0) break;
+
+    for (const t of tunnels) {
+      if (!t.name || !t.name.startsWith(prefix)) continue;
+      if (t.status === "healthy") continue;
+      if (t.conns_active_at && !t.conns_inactive_at) continue;
+
+      const refTime = t.conns_inactive_at || t.created_at;
+      if (!refTime) continue;
+      const idleMs = nowMs - new Date(refTime).getTime();
+      if (idleMs < thresholdMs) continue;
+
+      const hostname = `${t.name}.${env.DOMAIN_SUFFIX}`;
+      try {
+        await deleteDnsRecord(env, hostname);
+        await deleteTunnel(env, t.id);
+        console.log(`[cleanup] deleted idle tunnel "${t.name}" (idle ${Math.floor(idleMs / 86400000)}d)`);
+      } catch (err) {
+        console.log(`[cleanup] failed to delete "${t.name}": ${err.message}`);
+      }
+    }
+
+    hasMore = tunnels.length === 100;
+    page++;
+  }
+}
+
+// --- 隧道存在性只读查询 ---
+//
+// POST /tunnel-status: 供客户端确认隧道是否仍存在于云端。
+// 严格只读——绝不创建/删除/修改任何 tunnel 或 DNS。
+// 鉴权：body 中的 shared_secret，恒定时间比较。
+
+async function handleTunnelStatus(request, env, json) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: "invalid JSON" }, 400);
+  }
+
+  const { shared_secret, username } = body || {};
+  if (!shared_secret || !env.SHARED_SECRET || !timingSafeEqual(shared_secret, env.SHARED_SECRET)) {
+    return json({ error: "unauthorized" }, 401);
+  }
+  if (!username || !USERNAME_RE.test(username)) {
+    return json({ error: "username must be lowercase alphanumeric/hyphen, 1-32 chars" }, 400);
+  }
+
+  const { tunnelName } = tunnelMeta(env, username);
+  const tunnel = await findTunnelByName(env, tunnelName);
+  return json({ exists: !!tunnel });
+}
+
 // --- request handler ---
 
 export default {
@@ -585,6 +668,18 @@ export default {
       }
       try {
         return await handleTelemetrySecret(request, env, json);
+      } catch (err) {
+        return json({ error: err.message }, 500);
+      }
+    }
+
+    // 隧道存在性查询：只读，供客户端判断云端 tunnel 是否已被删除。
+    if (url.pathname === "/tunnel-status") {
+      if (request.method !== "POST") {
+        return new Response("not found", { status: 404 });
+      }
+      try {
+        return await handleTunnelStatus(request, env, json);
       } catch (err) {
         return json({ error: err.message }, 500);
       }
@@ -654,8 +749,9 @@ export default {
     return new Response("not found", { status: 404 });
   },
 
-  // cron 触发：把 usage_rollup 卷成 usage_daily（幂等可重入）。
+  // cron 触发：卷 rollup → daily + 清理闲置隧道。
   async scheduled(event, env, ctx) {
     ctx.waitUntil(rollupToDaily(env));
+    ctx.waitUntil(cleanupIdleTunnels(env));
   },
 };

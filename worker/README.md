@@ -20,6 +20,12 @@
 | HOSTNAME_PREFIX | kg |
 | TELEMETRY_SECRET | 客户端上报 `/telemetry` 用的预共享密钥，独立于 SHARED_SECRET。可用 `openssl rand -hex 32` 生成 |
 
+### 可选 Secrets/Vars
+
+| Secret | 说明 |
+|---|---|
+| IDLE_CLEANUP_DAYS | 闲置隧道清理阈值（天）。设为正整数后 cron 会自动清理超过该天数未连接的隧道及对应 DNS 记录。未配置则不清理，安全默认 |
+
 ## 更新 SHARED_SECRET（换批用户时）
 
 ```bash
@@ -65,5 +71,29 @@ wrangler deploy
 ## 注意事项
 
 - run_token 只在 201 响应里返回一次，Worker 本身不存储任何状态（Cloudflare API 是唯一数据源）
-- 吊销某用户：在 Zero Trust 控制台删 tunnel，DNS 记录也要手动删
+- 吊销某用户：在 Zero Trust 控制台删 tunnel + DNS 记录即可；也可配置 `IDLE_CLEANUP_DAYS` 让 cron 自动回收长期不活跃的隧道
 - CF_API_TOKEN 永远不要提交到 git，只通过 `wrangler secret put` 存入
+
+## 闲置隧道自动清理
+
+设置 `IDLE_CLEANUP_DAYS`（正整数，单位天）后，每小时 cron 会：
+
+1. 列出账号下所有未删除隧道，过滤出 `HOSTNAME_PREFIX-` 前缀的（本项目签发的）
+2. 跳过 `status=healthy` 或正在有活跃连接的隧道
+3. 闲置时长 = `now - conns_inactive_at`（若无连接记录则用 `created_at`）
+4. 超过阈值的：删除对应 DNS CNAME + 删除 tunnel 本身
+
+审计日志通过 `console.log` 输出到 Worker Logs（Cloudflare Dashboard → Workers → Logs），每条记录被清理的隧道名和闲置天数。
+
+客户端侧：隧道被清理后，下次启动时会自动检测到隧道不存在并静默重建（使用本地持久化的激活码），用户无感。
+
+## 隧道状态查询 `/tunnel-status`
+
+供客户端判断云端隧道是否仍存在（只读，绝不修改 tunnel/DNS）：
+
+```
+POST /tunnel-status
+body: { shared_secret, username }
+→ 200 { exists: true/false }
+→ 401 { error: "unauthorized" }
+```

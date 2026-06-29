@@ -223,6 +223,9 @@ def test_run_probe_cycle_auto_restarts_tunnel_on_timeout(monkeypatch, tmp_path):
     monkeypatch.setattr(s._client, "get", lambda *a, **k: _Resp())
     monkeypatch.setattr(s, "_probe_tunnel_ready", lambda: False)
 
+    # Mock _reprovision_if_deleted to return False (tunnel exists, just restart)
+    monkeypatch.setattr(s, "_reprovision_if_deleted", lambda: False)
+
     # First probe: sets the disconnected timestamp
     s._run_probe_cycle()
     assert s._tunnel_disconnected_since is not None
@@ -284,4 +287,71 @@ def test_restart_starts_even_if_port_stays_busy(monkeypatch, tmp_path, capsys):
 
     s.restart()
     assert started["n"] == 1
+
+
+def test_reprovision_if_deleted_exists_true(monkeypatch, tmp_path):
+    # tunnel_exists returns True → _reprovision_if_deleted returns False (no rebuild)
+    monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
+    cfg = appconfig.load()
+    cfg.cloudflare.hostname = "kg-test.example.com"
+    cfg.cloudflare.run_token = "eyJ_test"
+    cfg.cloudflare.shared_secret = "s3cret"
+    cfg.cloudflare.provision_url = "https://w.example.com"
+    appconfig.save(cfg)
+
+    s = supervisor.Supervisor(gateway=_FakeGateway(), tunnel=_FakeTunnel())
+    import kiro_gateway_tray.provision as pmod
+    monkeypatch.setattr(pmod, "tunnel_exists", lambda cfg, secret: True)
+
+    assert s._reprovision_if_deleted() is False
+
+
+def test_reprovision_if_deleted_exists_none(monkeypatch, tmp_path):
+    # tunnel_exists returns None (network error) → conservative, no rebuild
+    monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
+    cfg = appconfig.load()
+    cfg.cloudflare.hostname = "kg-test.example.com"
+    cfg.cloudflare.run_token = "eyJ_test"
+    cfg.cloudflare.shared_secret = "s3cret"
+    cfg.cloudflare.provision_url = "https://w.example.com"
+    appconfig.save(cfg)
+
+    s = supervisor.Supervisor(gateway=_FakeGateway(), tunnel=_FakeTunnel())
+    import kiro_gateway_tray.provision as pmod
+    monkeypatch.setattr(pmod, "tunnel_exists", lambda cfg, secret: None)
+
+    assert s._reprovision_if_deleted() is False
+
+
+def test_reprovision_if_deleted_exists_false(monkeypatch, tmp_path):
+    # tunnel_exists returns False → re-provision silently
+    monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
+    cfg = appconfig.load()
+    cfg.cloudflare.hostname = "kg-test.example.com"
+    cfg.cloudflare.run_token = "eyJ_old"
+    cfg.cloudflare.shared_secret = "s3cret"
+    cfg.cloudflare.provision_url = "https://w.example.com"
+    appconfig.save(cfg)
+
+    s = supervisor.Supervisor(gateway=_FakeGateway(), tunnel=_FakeTunnel())
+    import kiro_gateway_tray.provision as pmod
+    monkeypatch.setattr(pmod, "tunnel_exists", lambda cfg, secret: False)
+    monkeypatch.setattr(pmod, "run", lambda cfg, secret: ("kg-test.example.com", "eyJ_new", ""))
+
+    result = s._reprovision_if_deleted()
+    assert result is True
+    reloaded = appconfig.load()
+    assert reloaded.cloudflare.run_token == "eyJ_new"
+
+
+def test_reprovision_if_deleted_no_secret(monkeypatch, tmp_path):
+    # No secret available → safe fallback, no rebuild attempt
+    monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
+    cfg = appconfig.load()
+    cfg.cloudflare.hostname = "kg-test.example.com"
+    cfg.cloudflare.run_token = "eyJ_test"
+    appconfig.save(cfg)
+
+    s = supervisor.Supervisor(gateway=_FakeGateway(), tunnel=_FakeTunnel())
+    assert s._reprovision_if_deleted() is False
 

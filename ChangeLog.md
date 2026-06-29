@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.3.0 (2026-06-29)
+
+**New**
+- Worker 新增闲置隧道定期清理：配置 `IDLE_CLEANUP_DAYS` 后，cron 自动回收超期未连接的 tunnel 及对应 DNS 记录，无需手动在 Cloudflare 控制台逐个删除。
+- Worker 新增只读 `POST /tunnel-status` 端点：供客户端查询云端隧道是否仍存在（不修改任何资源）。
+- 客户端新增隧道丢失自愈：当云端 tunnel 被删除（如定期清理或管理员手动回收）后，下次启动时自动检测到隧道已失效，用本地持久化的激活码静默重新 provision 并拿到新 token 重连，用户无感。
+
+**Changed**
+- 隧道断连超时重启逻辑优化：重启 cloudflared 前先调 `/tunnel-status` 判断隧道是否仍存在于云端，仅在明确被删时走重建路径，网络未知时保守只重启（避免误换 token 踢断正常隧道）。
+
 ## v0.2.14 (2026-06-29)
 
 **Fixed**

@@ -213,6 +213,37 @@ def refresh_telemetry_secret(provision_url: str, shared_secret: str, username: s
         return ""
 
 
+def tunnel_exists(cfg: AppCfg, shared_secret: str) -> bool | None:
+    """Check whether the tunnel still exists on the cloud side.
+
+    Returns True (exists), False (definitively deleted), or None (unable to
+    determine — network error, auth failure, etc.). The caller should only
+    re-provision on an explicit False; None means "unknown, stay conservative".
+    """
+    if not cfg.cloudflare.provision_url or not shared_secret:
+        return None
+    try:
+        username = _get_username(cfg)
+    except Exception:
+        return None
+    url = cfg.cloudflare.provision_url.rstrip("/") + "/tunnel-status"
+    try:
+        resp = httpx.post(
+            url,
+            json={"shared_secret": shared_secret, "username": username},
+            timeout=_HTTP_TIMEOUT,
+            trust_env=False,
+        )
+    except httpx.HTTPError:
+        return None
+    if resp.status_code != 200:
+        return None
+    try:
+        return bool(resp.json().get("exists"))
+    except Exception:
+        return None
+
+
 def update_port(cfg: AppCfg, shared_secret: str) -> int:
     """Tell the Worker to update the tunnel ingress port.
 
