@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.3.1 (2026-07-01)
+
+**New**
+- 网关新增内置测速端点 `/speedtest`（`ping` / `download` / `upload`），用于测量通过 Cloudflare 边缘 + cloudflared 绕一圈相对本地直连的延迟与吞吐损耗；含一个浏览器可直接打开的测速页面。端点复用网关密码（`proxy_api_key`）做 Bearer 鉴权（也支持 `?key=` 便于浏览器使用），下载/上传均有字节上限，随机不可压缩数据 + `no-store, no-transform` 避免 CF 压缩/缓存虚高；可用 `SPEEDTEST_ENABLED=false` 关闭。该能力作为侧信道中间件注入，不改动 vendor 网关本体。
+- 菜单栏在版本行下方新增「隧道网络测速」入口，点击用默认浏览器打开隧道域名的测速页；仅在已配置隧道时显示（本地打本地无意义）。
+- 新增命令行测速脚本 `app/scripts/speedtest_probe.py`：自动读取配置对比本地 vs 隧道的延迟与吞吐，输出"绕一圈"开销。
+
 ## v0.3.0 (2026-06-29)
 
 **New**

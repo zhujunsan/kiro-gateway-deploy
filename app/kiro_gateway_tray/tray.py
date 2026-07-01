@@ -43,6 +43,17 @@ def _base_url(cfg) -> str:
     return appconfig.base_url(cfg)
 
 
+def _speedtest_url(cfg) -> str:
+    """URL of the gateway's built-in speed-test page (tunnel host).
+
+    Only ever called when a tunnel is provisioned (the menu item is hidden
+    otherwise), so this always targets the public host to measure the full
+    edge→cloudflared→local round-trip. Note there is no ``/v1`` suffix — the
+    speed-test routes live at the gateway root under ``/speedtest``.
+    """
+    return f"https://{cfg.cloudflare.hostname}/speedtest"
+
+
 def _first_run_setup(cfg) -> str:
     """Guided setup. Cloudflare credentials + Kiro profileArn.
 
@@ -315,6 +326,15 @@ class TrayApp:
             f"https://github.com/{GITHUB_REPO}/releases/tag/v{__version__}"
         )
 
+    def _on_open_speedtest(self, _icon, _item):
+        cfg = appconfig.load(use_cache=True)
+        webbrowser.open(_speedtest_url(cfg))
+
+    def _speedtest_visible(self, _item) -> bool:
+        # 仅在配了隧道时展示：本地打本地测不出"绕一圈"的开销，没意义。
+        cfg = appconfig.load(use_cache=True)
+        return bool(cfg.cloudflare.hostname)
+
     def _on_toggle_autostart(self, icon, _item):
         want = not autostart.is_enabled()
         try:
@@ -544,6 +564,7 @@ class TrayApp:
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(self._autostart_line, self._on_toggle_autostart),
             pystray.MenuItem(self._version_line, self._on_open_release),
+            pystray.MenuItem("📶 隧道网络测速", self._on_open_speedtest, visible=self._speedtest_visible),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(self._start_line, self._on_start_or_restart),
             pystray.MenuItem("⏹️ 停止", self._on_stop),

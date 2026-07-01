@@ -270,6 +270,12 @@ def run_gateway_blocking() -> int:
     from . import telemetry
     app = telemetry.wrap_app(main.app)
 
+    # Also wrap the speed-test side-channel (adds /speedtest routes). Same
+    # rationale: it lives here, not in vendor/, so vendor_sync can't clobber it.
+    # No-op when SPEEDTEST_ENABLED=false.
+    from . import speedtest
+    app = speedtest.wrap_app(app)
+
     config = uvicorn.Config(
         app=app,
         host=os.environ.get("SERVER_HOST", "127.0.0.1"),
