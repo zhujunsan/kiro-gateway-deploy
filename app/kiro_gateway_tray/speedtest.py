@@ -259,6 +259,8 @@ _HTML = """<!doctype html>
            border-radius: 9px; background: #4c7dff; color: #fff; font-size: 15px;
            font-weight: 600; cursor: pointer; }
   button:disabled { opacity: .5; cursor: default; }
+  .row button { flex: 1; min-width: 120px; }
+  button.secondary { background: #2b3143; }
   .results { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
   .metric { background: #0f131b; border: 1px solid #232838; border-radius: 10px;
             padding: 14px; text-align: center; }
@@ -285,23 +287,26 @@ _HTML = """<!doctype html>
       <div>
         <label>下载大小</label>
         <select id="dl">
+          <option value="1048576">1 MB</option>
+          <option value="2097152" selected>2 MB</option>
           <option value="5242880">5 MB</option>
-          <option value="10485760" selected>10 MB</option>
-          <option value="26214400">25 MB</option>
-          <option value="52428800">50 MB</option>
+          <option value="10485760">10 MB</option>
         </select>
       </div>
       <div>
         <label>上传大小</label>
         <select id="ul">
-          <option value="2097152">2 MB</option>
-          <option value="5242880" selected>5 MB</option>
+          <option value="1048576">1 MB</option>
+          <option value="2097152" selected>2 MB</option>
+          <option value="5242880">5 MB</option>
           <option value="10485760">10 MB</option>
-          <option value="20971520">20 MB</option>
         </select>
       </div>
     </div>
-    <button id="go">开始测速</button>
+    <div class="row">
+      <button id="go">开始测速</button>
+      <button id="stop" class="secondary" disabled>停止</button>
+    </div>
   </div>
 
   <div class="card">
@@ -320,14 +325,43 @@ const log = (msg, cls) => {
   const line = cls ? `<span class="${cls}">${msg}</span>` : msg;
   el.innerHTML = (el.innerHTML === "就绪。" ? "" : el.innerHTML + "\\n") + line;
 };
+// Replace the last log line in place (for live-updating progress).
+const logReplace = (msg, cls) => {
+  const el = $("log");
+  const line = cls ? `<span class="${cls}">${msg}</span>` : msg;
+  const parts = el.innerHTML === "就绪。" ? [] : el.innerHTML.split("\\n");
+  parts[parts.length ? parts.length - 1 : 0] = line;
+  el.innerHTML = parts.join("\\n");
+};
 const key = () => $("key").value.trim();
-const authInit = () => ({ headers: key() ? { Authorization: "Bearer " + key() } : {} });
+const authInit = (signal) => ({
+  signal,
+  headers: key() ? { Authorization: "Bearer " + key() } : {},
+});
 
-async function ping(n = 7) {
+// Prefill the key from ?key= so opening from the menu needs no paste. We strip
+// it from the visible address bar afterwards so the password isn't left there.
+(function prefillKey() {
+  try {
+    const params = new URLSearchParams(location.search);
+    const k = params.get("key");
+    if (k) {
+      $("key").value = k;
+      history.replaceState(null, "", location.pathname);
+    }
+  } catch (e) {}
+})();
+
+let controller = null;   // AbortController for the in-flight run
+let stopped = false;
+
+async function ping(signal, n = 7) {
   const samples = [];
   for (let i = 0; i < n; i++) {
+    if (stopped) throw new DOMException("stopped", "AbortError");
+    logReplace(`测延迟… (${i + 1}/${n})`);
     const t0 = performance.now();
-    const r = await fetch("./speedtest/ping?t=" + Date.now(), authInit());
+    const r = await fetch("./speedtest/ping?t=" + Date.now(), authInit(signal));
     if (!r.ok) throw new Error("ping HTTP " + r.status);
     await r.json();
     samples.push(performance.now() - t0);
@@ -336,27 +370,41 @@ async function ping(n = 7) {
   return samples[Math.floor(samples.length / 2)];
 }
 
-async function download(bytes) {
+async function download(signal, bytes) {
   const t0 = performance.now();
-  const r = await fetch("./speedtest/download?bytes=" + bytes + "&t=" + Date.now(), authInit());
+  const r = await fetch("./speedtest/download?bytes=" + bytes + "&t=" + Date.now(), authInit(signal));
   if (!r.ok) throw new Error("download HTTP " + r.status);
   const reader = r.body.getReader();
   let received = 0;
+  let lastTick = t0;
+  let lastBytes = 0;
+  const total = bytes;
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
     received += value.length;
+    // Live speed, refreshed ~once per second.
+    const now = performance.now();
+    if (now - lastTick >= 1000) {
+      const inst = ((received - lastBytes) * 8 / 1e6) / ((now - lastTick) / 1000);
+      const pct = total ? Math.min(100, (received / total) * 100) : 0;
+      $("m-dl").textContent = inst.toFixed(1);
+      logReplace(`下载中… ${pct.toFixed(0)}%  当前 ${inst.toFixed(1)} Mbps`);
+      lastTick = now;
+      lastBytes = received;
+    }
   }
   const secs = (performance.now() - t0) / 1000;
   return { mbps: (received * 8 / 1e6) / secs, bytes: received, secs };
 }
 
-async function upload(bytes) {
+async function upload(signal, bytes) {
   const payload = new Uint8Array(bytes);
   crypto.getRandomValues(payload.subarray(0, Math.min(bytes, 65536)));
   const t0 = performance.now();
   const r = await fetch("./speedtest/upload?t=" + Date.now(), {
     method: "POST",
+    signal,
     headers: { ...authInit().headers, "Content-Type": "application/octet-stream" },
     body: payload,
   });
@@ -366,34 +414,56 @@ async function upload(bytes) {
   return { clientMbps: (bytes * 8 / 1e6) / secs, server: j };
 }
 
+function setRunning(running) {
+  $("go").disabled = running;
+  $("stop").disabled = !running;
+  ["key", "dl", "ul"].forEach((id) => ($(id).disabled = running));
+}
+
+$("stop").addEventListener("click", () => {
+  stopped = true;
+  if (controller) controller.abort();
+});
+
 $("go").addEventListener("click", async () => {
-  const btn = $("go");
-  btn.disabled = true;
+  stopped = false;
+  controller = new AbortController();
+  const signal = controller.signal;
+  setRunning(true);
   $("log").innerHTML = "";
   $("m-ping").textContent = $("m-dl").textContent = $("m-ul").textContent = "…";
   try {
     log("测延迟…");
-    const p = await ping();
+    const p = await ping(signal);
     $("m-ping").textContent = p.toFixed(1);
-    log(`延迟中位数 ${p.toFixed(1)} ms`, "ok");
+    logReplace(`延迟中位数 ${p.toFixed(1)} ms`, "ok");
 
     log("测下载…");
-    const d = await download(parseInt($("dl").value, 10));
+    const d = await download(signal, parseInt($("dl").value, 10));
     $("m-dl").textContent = d.mbps.toFixed(1);
-    log(`下载 ${d.mbps.toFixed(1)} Mbps（${(d.bytes/1048576).toFixed(1)} MB / ${d.secs.toFixed(2)} s）`, "ok");
+    logReplace(`下载 ${d.mbps.toFixed(1)} Mbps（${(d.bytes/1048576).toFixed(1)} MB / ${d.secs.toFixed(2)} s）`, "ok");
 
     log("测上传…");
-    const u = await upload(parseInt($("ul").value, 10));
+    const u = await upload(signal, parseInt($("ul").value, 10));
     $("m-ul").textContent = u.clientMbps.toFixed(1);
-    log(`上传 ${u.clientMbps.toFixed(1)} Mbps（服务端计 ${u.server.server_mbps} Mbps）`, "ok");
+    logReplace(`上传 ${u.clientMbps.toFixed(1)} Mbps（服务端计 ${u.server.server_mbps} Mbps）`, "ok");
 
     log("完成。", "ok");
   } catch (e) {
-    log("失败：" + e.message + "（密码填了吗？）", "err");
+    if (e.name === "AbortError" || stopped) {
+      log("已停止。", "err");
+    } else {
+      log("失败：" + e.message + "（密码填了吗？）", "err");
+    }
   } finally {
-    btn.disabled = false;
+    controller = null;
+    setRunning(false);
   }
 });
+
+// Abort any in-flight run when leaving/refreshing, so a big download doesn't
+// hold the connection and make the page unreloadable.
+window.addEventListener("pagehide", () => { stopped = true; if (controller) controller.abort(); });
 </script>
 </body>
 </html>

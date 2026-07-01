@@ -50,8 +50,15 @@ def _speedtest_url(cfg) -> str:
     otherwise), so this always targets the public host to measure the full
     edge→cloudflared→local round-trip. Note there is no ``/v1`` suffix — the
     speed-test routes live at the gateway root under ``/speedtest``.
+
+    The proxy API key is appended as a ``?key=`` param so the page (opened from
+    the menu) authenticates without the user having to paste the password. The
+    page prefills its input from this param.
     """
-    return f"https://{cfg.cloudflare.hostname}/speedtest"
+    from urllib.parse import quote
+    base = f"https://{cfg.cloudflare.hostname}/speedtest"
+    key = cfg.gateway.proxy_api_key or ""
+    return f"{base}?key={quote(key, safe='')}" if key else base
 
 
 def _first_run_setup(cfg) -> str:
