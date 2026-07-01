@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.3.3 (2026-07-01)
+
+**Fixed**
+- 修复遥测 `flush_interval`（定时刷新间隔）配置项完全不生效的问题：此前该值既未从 app 配置注入到网关子进程的环境变量，`from_env` 又误读了 `TELEMETRY_BUCKET_SECONDS`，导致在 `config.toml` 里调整 `flush_interval` 静默无效（默认值恰好相同才未暴露）。现改为独立注入并读取 `TELEMETRY_FLUSH_INTERVAL`，配置可端到端生效。
+- 收紧测速下载下界：`/speedtest/download?bytes=0` 会被夹到 1 字节而非返回空流。
+
+**Changed**
+- 内部重构（不影响使用行为）：遥测中间件的响应采集状态由字符串键裸 `dict` 改为 `dataclass`，字段拼写错误从静默失效变为静态可查；抽取本地探针专用的 `trust_env=False` HTTP 客户端工厂，消除 `usage`/`supervisor` 中重复的构造与注释；`updates` 模块新增公开的 `version_status()`，托盘菜单不再依赖其私有函数；补齐两处此前静默吞掉的异常日志（菜单重绘、异步缓存回调）。
+
 ## v0.3.2 (2026-07-01)
 
 **Changed**

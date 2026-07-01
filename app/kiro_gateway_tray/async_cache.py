@@ -10,6 +10,8 @@ import threading
 import time
 from typing import Callable, Generic, TypeVar
 
+from .log import logger
+
 T = TypeVar("T")
 
 
@@ -79,6 +81,6 @@ class AsyncRefreshCache(Generic[T]):
                 try:
                     self._on_update()
                 except Exception:
-                    pass
+                    logger.debug("async_cache on_update callback failed", exc_info=True)
 
         threading.Thread(target=_work, daemon=True).start()

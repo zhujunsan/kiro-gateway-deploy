@@ -25,6 +25,7 @@ from pathlib import Path
 import httpx
 
 from . import GITHUB_REPO, __version__, paths
+from .log import logger
 
 _TTL_SECONDS = 4 * 60 * 60
 _CACHE_NAME = "update_check.json"
@@ -38,6 +39,20 @@ class UpdateInfo:
     latest: str | None
     update_available: bool
     release_url: str
+
+
+@dataclass
+class VersionStatus:
+    """What the tray's version line needs to render, without reaching into this
+    module's private cache helpers.
+
+    ``latest is None`` means no check has landed yet (render "检查中…"). When a
+    latest is known, ``upgradable`` says whether it is newer than ``current``;
+    both "same" and "we're ahead of the published release" collapse to
+    not-upgradable so the UI never shows a confusing "高于发布版"."""
+    current: str
+    latest: str | None
+    upgradable: bool
 
 
 def _cache_file() -> Path:
@@ -124,6 +139,7 @@ def check(current: str | None = None, force: bool = False) -> UpdateInfo:
     release_url = _RELEASE_PAGE.format(repo=GITHUB_REPO)
     try:
         if force or _should_check():
+            logger.info("update check: querying GitHub releases")
             latest = _fetch_latest()
             if latest is not None:
                 _write_cache(latest)
@@ -142,3 +158,14 @@ def check(current: str | None = None, force: bool = False) -> UpdateInfo:
     available = bool(latest) and _is_newer(current, latest)
     return UpdateInfo(current=current, latest=latest,
                       update_available=available, release_url=release_url)
+
+
+def version_status(current: str | None = None) -> VersionStatus:
+    """Read-only view of the cached latest version for the tray's version line.
+
+    No network: reflects whatever the background ``check()`` last wrote. Keeps
+    the tray out of this module's private cache/compare helpers."""
+    current = current or __version__
+    latest = (_read_cache() or {}).get("latest")
+    upgradable = bool(latest) and _is_newer(current, latest)
+    return VersionStatus(current=current, latest=latest, upgradable=upgradable)

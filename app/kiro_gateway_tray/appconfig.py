@@ -210,6 +210,7 @@ def _inject_telemetry_env(cfg: AppCfg, env: dict[str, str]) -> None:
     env["TELEMETRY_URL"] = endpoint_url
     env["TELEMETRY_SECRET"] = tel.secret
     env["TELEMETRY_BUCKET_SECONDS"] = str(tel.bucket_seconds)
+    env["TELEMETRY_FLUSH_INTERVAL"] = str(tel.flush_interval)
     env["TELEMETRY_MAX_RETENTION_DAYS"] = str(tel.max_retention_days)
     env["APP_VERSION"] = __version__
     # Inputs for on-401 secret refresh (design §8): the refresh endpoint is

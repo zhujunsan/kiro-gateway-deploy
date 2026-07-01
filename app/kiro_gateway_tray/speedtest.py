@@ -155,7 +155,7 @@ class SpeedTestMiddleware:
             await _send_json(send, 401, {"error": "unauthorized"})
             return
         q = _query(scope)
-        n = _clamp_int((q.get("bytes") or [None])[0], _DEFAULT_DOWNLOAD, 0, _MAX_DOWNLOAD)
+        n = _clamp_int((q.get("bytes") or [None])[0], _DEFAULT_DOWNLOAD, 1, _MAX_DOWNLOAD)
         headers = [
             (b"content-type", b"application/octet-stream"),
             (b"content-length", str(n).encode("ascii")),

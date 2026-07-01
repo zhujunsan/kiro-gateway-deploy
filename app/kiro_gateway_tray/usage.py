@@ -7,15 +7,14 @@ import atexit
 import httpx
 
 from . import appconfig
+from .httpclient import local_client
 
 # Reused connection pool for localhost gateway calls (usage + models). Avoids
 # building a fresh client/connection on every menu refresh. Released at process
-# exit so the pool doesn't outlive us during interpreter shutdown.
-# trust_env=False: these calls always target 127.0.0.1, but httpx (unlike
-# requests) does NOT bypass localhost for HTTP(S)_PROXY env vars. A system/corp
-# proxy without 127.0.0.1 in NO_PROXY would otherwise hijack every probe and
-# make a healthy gateway look unreachable.
-_client = httpx.Client(timeout=30.0, trust_env=False)
+# exit so the pool doesn't outlive us during interpreter shutdown. See
+# httpclient.local_client for the trust_env=False rationale (avoid a corp proxy
+# hijacking 127.0.0.1 probes).
+_client = local_client(timeout=30.0)
 atexit.register(_client.close)
 
 

@@ -94,3 +94,28 @@ def test_upgrade_forces_recheck(tmp_path, monkeypatch):
     cached["app_version"] = "0.0.1"
     updates._cache_file().write_text(json.dumps(cached), encoding="utf-8")
     assert updates._should_check() is True
+
+
+def test_version_status_no_cache_has_no_latest(tmp_path, monkeypatch):
+    monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
+    st = updates.version_status(current="0.1.0")
+    assert st.latest is None
+    assert st.upgradable is False
+
+
+def test_version_status_upgradable(tmp_path, monkeypatch):
+    monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
+    updates._write_cache(latest="v9.9.9")
+    st = updates.version_status(current="0.1.0")
+    assert st.latest == "v9.9.9"
+    assert st.upgradable is True
+
+
+def test_version_status_not_upgradable_when_ahead_of_release(tmp_path, monkeypatch):
+    # Cache left over from before an upgrade points at an older release than
+    # the running app. Must not read as upgradable (no "高于发布版" confusion).
+    monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
+    updates._write_cache(latest="v0.1.17")
+    st = updates.version_status(current="0.1.23")
+    assert st.latest == "v0.1.17"
+    assert st.upgradable is False

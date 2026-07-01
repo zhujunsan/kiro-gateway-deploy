@@ -238,7 +238,7 @@ class TrayApp:
             try:
                 ic.update_menu()
             except Exception:
-                pass
+                logger.debug("update_menu failed during redraw", exc_info=True)
 
         macos_menu.run_on_main_thread(_do)
 
@@ -446,15 +446,11 @@ class TrayApp:
         self._kick_update_check()
         from . import updates
         line = f"ℹ️ 当前版本 v{__version__}"
-        cached = updates._read_cache() or {}
-        latest = cached.get("latest")
-        if not latest:
+        status = updates.version_status(__version__)
+        if not status.latest:
             return f"{line}\t检查中…"
-        latest_ver = latest.lstrip("vV")
-        if latest_ver == __version__:
-            return f"{line}\t已是最新"
-        if updates._is_newer(__version__, latest):
-            return f"{line}\t可升级 {latest_ver}"
+        if status.upgradable:
+            return f"{line}\t可升级 {status.latest.lstrip('vV')}"
         return f"{line}\t已是最新"
 
     def _ensure_update_info_sync(self) -> None:
@@ -491,9 +487,6 @@ class TrayApp:
         def _work():
             try:
                 from . import updates
-                stale = updates._should_check()
-                if stale:
-                    logger.info("update check: querying GitHub releases")
                 info = updates.check()
                 logger.info(
                     "update check: current={} latest={} available={}",

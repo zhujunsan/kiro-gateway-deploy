@@ -173,6 +173,17 @@ def test_download_bad_bytes_uses_default():
     assert len(_body(sent)) == speedtest._DEFAULT_DOWNLOAD
 
 
+def test_download_zero_bytes_clamped_to_minimum():
+    # ?bytes=0 is meaningless for a throughput test; the lower bound clamps it
+    # to 1 rather than streaming an empty body.
+    mw = SpeedTestMiddleware(None, "k")
+    sent, _ = _run(_drive(
+        mw, path="/speedtest/download", query=b"bytes=0&key=k",
+    ))
+    assert _status(sent) == 200
+    assert len(_body(sent)) == 1
+
+
 # --- upload ------------------------------------------------------------------
 
 def test_upload_counts_bytes():

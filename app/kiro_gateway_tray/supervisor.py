@@ -7,11 +7,10 @@ import threading
 import time
 from typing import Callable
 
-import httpx
-
 from . import appconfig
 from . import gateway
 from .log import logger
+from .httpclient import local_client
 from .appconfig import AppCfg
 from .gateway import GatewayProcess
 from .cloudflared import CloudflaredProcess
@@ -62,11 +61,12 @@ class Supervisor:
         self._probe_lock = threading.Lock()
         # Guards config (re)loads so concurrent callers don't double-read disk.
         self._cfg_lock = threading.Lock()
-        # Reused connection pool for localhost health/usage probes.
-        # trust_env=False: probes always hit 127.0.0.1, but httpx does not bypass
-        # localhost for HTTP(S)_PROXY; a system proxy would otherwise route these
-        # to a proxy and make a healthy gateway/tunnel look down.
-        self._client = httpx.Client(timeout=3, trust_env=False)
+        # Reused connection pool for localhost health/usage probes. See
+        # httpclient.local_client for the trust_env=False rationale: probes
+        # always hit 127.0.0.1, but httpx does not bypass localhost for
+        # HTTP(S)_PROXY; a system proxy would otherwise route these to a proxy
+        # and make a healthy gateway/tunnel look down.
+        self._client = local_client(timeout=3)
 
     def _load(self) -> AppCfg:
         with self._cfg_lock:

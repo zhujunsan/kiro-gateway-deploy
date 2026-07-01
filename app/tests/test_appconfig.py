@@ -166,6 +166,25 @@ def test_telemetry_explicit_endpoint_wins_over_derivation(tmp_path, monkeypatch)
     assert env["TELEMETRY_URL"] == "https://custom.example.com/telemetry"
 
 
+def test_telemetry_flush_interval_injected_end_to_end(tmp_path, monkeypatch):
+    # flush_interval must actually reach the child: it is injected as its own
+    # env var (not aliased to TELEMETRY_BUCKET_SECONDS) and round-trips through
+    # telemetry.from_env back onto the config field.
+    monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
+    cfg = appconfig.load()
+    cfg.cloudflare.provision_url = "https://w.example.com"
+    cfg.telemetry.bucket_seconds = 300
+    cfg.telemetry.flush_interval = 120
+    env = appconfig.to_gateway_env(cfg)
+    assert env["TELEMETRY_BUCKET_SECONDS"] == "300"
+    assert env["TELEMETRY_FLUSH_INTERVAL"] == "120"
+
+    from kiro_gateway_tray import telemetry
+    resolved = telemetry.from_env(env)
+    assert resolved.bucket_seconds == 300
+    assert resolved.flush_interval == 120
+
+
 def test_telemetry_not_injected_when_both_empty(tmp_path, monkeypatch):
     # No endpoint_url and no provision_url ⇒ telemetry stays dormant.
     monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))

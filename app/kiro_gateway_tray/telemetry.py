@@ -30,7 +30,7 @@ import json
 import os
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -117,7 +117,7 @@ def from_env(env: dict[str, str] | None = None) -> TelemetryConfig:
         username=(e.get("TELEMETRY_USERNAME") or "unknown").strip() or "unknown",
         app_version=(e.get("APP_VERSION") or "unknown").strip() or "unknown",
         bucket_seconds=_int("TELEMETRY_BUCKET_SECONDS", DEFAULT_BUCKET_SECONDS),
-        flush_interval=_int("TELEMETRY_BUCKET_SECONDS", DEFAULT_FLUSH_INTERVAL),
+        flush_interval=_int("TELEMETRY_FLUSH_INTERVAL", DEFAULT_FLUSH_INTERVAL),
         max_retention_days=_int("TELEMETRY_MAX_RETENTION_DAYS", DEFAULT_MAX_RETENTION_DAYS),
         provision_url=(e.get("TELEMETRY_PROVISION_URL") or "").strip(),
         shared_secret=(e.get("TELEMETRY_SHARED_SECRET") or "").strip(),
@@ -173,6 +173,24 @@ class RequestSample:
     total_tokens: int | None = None
     request_bytes: int = 0
     response_bytes: int = 0
+
+
+@dataclass
+class _ResponseState:
+    """Mutable accumulator for the response side of one collected request.
+
+    Replaces a string-keyed dict so a typo'd field is a static error, not a
+    silent miss. Holds only what we need to recover the final usage after the
+    bytes are already forwarded: status, content-type flags, byte count and the
+    small retained SSE tail / capped JSON buffer."""
+    status: int = 0
+    content_type: str = ""
+    response_bytes: int = 0
+    is_sse: bool = False
+    is_json: bool = False
+    completed: bool = False
+    sse_tail: bytearray = field(default_factory=bytearray)
+    json_buf: bytearray = field(default_factory=bytearray)
 
 
 class Aggregator:
@@ -753,16 +771,7 @@ class TelemetryMiddleware:
 
         # --- response side: forward every chunk verbatim; retain only what we
         # need to recover the final usage afterwards. ---
-        state: dict[str, Any] = {
-            "status": 0,
-            "content_type": "",
-            "response_bytes": 0,
-            "sse_tail": bytearray(),
-            "json_buf": bytearray(),
-            "is_sse": False,
-            "is_json": False,
-            "completed": False,
-        }
+        state = _ResponseState()
 
         async def wrapped_send(message: dict) -> None:
             try:
@@ -786,10 +795,10 @@ class TelemetryMiddleware:
             self._finalise(sample, state, ok=True)
 
     @staticmethod
-    def _inspect_response(message: dict, state: dict[str, Any]) -> None:
+    def _inspect_response(message: dict, state: _ResponseState) -> None:
         mtype = message.get("type")
         if mtype == "http.response.start":
-            state["status"] = int(message.get("status", 0) or 0)
+            state.status = int(message.get("status", 0) or 0)
             ctype = ""
             for k, v in message.get("headers", []) or []:
                 try:
@@ -798,43 +807,43 @@ class TelemetryMiddleware:
                         break
                 except Exception:
                     continue
-            state["content_type"] = ctype
-            state["is_sse"] = "text/event-stream" in ctype
-            state["is_json"] = "application/json" in ctype
+            state.content_type = ctype
+            state.is_sse = "text/event-stream" in ctype
+            state.is_json = "application/json" in ctype
         elif mtype == "http.response.body":
             chunk = message.get("body", b"") or b""
-            state["response_bytes"] += len(chunk)
-            if state["is_sse"]:
-                tail: bytearray = state["sse_tail"]
+            state.response_bytes += len(chunk)
+            if state.is_sse:
+                tail = state.sse_tail
                 tail.extend(chunk)
                 if len(tail) > _SSE_TAIL_CAP:
                     del tail[:-_SSE_TAIL_CAP]
-            elif state["is_json"]:
-                buf: bytearray = state["json_buf"]
+            elif state.is_json:
+                buf = state.json_buf
                 if len(buf) < _JSON_BODY_CAP:
                     buf.extend(chunk)
             if not message.get("more_body", False):
-                state["completed"] = True
+                state.completed = True
 
-    def _finalise(self, sample: RequestSample, state: dict[str, Any], *, ok: bool) -> None:
+    def _finalise(self, sample: RequestSample, state: _ResponseState, *, ok: bool) -> None:
         """Extract usage from the retained buffers and record the sample. Never
         raises (telemetry must not affect the request)."""
         try:
-            sample.response_bytes = int(state.get("response_bytes", 0))
+            sample.response_bytes = int(state.response_bytes)
             usage: dict[str, Any] | None = None
-            if state.get("is_sse"):
-                usage = _merge_usage_from_sse(bytes(state.get("sse_tail", b"")))
-            elif state.get("is_json"):
-                usage = _usage_from_json(bytes(state.get("json_buf", b"")))
+            if state.is_sse:
+                usage = _merge_usage_from_sse(bytes(state.sse_tail))
+            elif state.is_json:
+                usage = _usage_from_json(bytes(state.json_buf))
             prompt, completion, total = parse_usage(usage)
             sample.prompt_tokens = prompt
             sample.completion_tokens = completion
             sample.total_tokens = total
-            status_ok = 200 <= int(state.get("status", 0) or 0) < 300
+            status_ok = 200 <= int(state.status or 0) < 300
             has_usage = prompt is not None or completion is not None or total is not None
             # Success = the request completed AND we recovered a final usage
             # (design 六: successes == "got final usage").
-            sample.success = bool(ok and status_ok and state.get("completed") and has_usage)
+            sample.success = bool(ok and status_ok and state.completed and has_usage)
             self.reporter.aggregator.record(sample)
         except Exception:
             logger.debug("telemetry: finalise failed", exc_info=True)
