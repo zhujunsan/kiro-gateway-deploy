@@ -112,6 +112,10 @@ def build_macos_dmg() -> Path:
         [
             "create-dmg",
             "--volname", "KiroGatewayTray",
+            # UDBZ (bzip2) compresses noticeably better than the default UDZO
+            # (zlib), shrinking the shipped .dmg. Only affects download size;
+            # the installed .app is identical after copy.
+            "--format", "UDBZ",
             "--window-pos", "200", "120",
             "--window-size", "560", "400",
             "--icon-size", "120",

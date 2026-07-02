@@ -11,17 +11,24 @@ VENDOR = APP / "kiro_gateway_tray" / "vendor"
 RES = APP / "resources"
 
 # --- platform → cloudflared subdir + exe name ---
+# _strip removes debug/symbol tables from bundled binaries to shrink the app.
+# Windows is excluded: PyInstaller's strip needs binutils' `strip`, which isn't
+# present on the runner and can corrupt PE files. macOS strip is safe here
+# because ad-hoc signing happens later in make_dist.py (after packaging).
 if sys.platform.startswith("win"):
     _cf_sub, _cf_exe, _name = "windows-amd64", "cloudflared.exe", "KiroGatewayTray"
     _console = False
+    _strip = False
 elif sys.platform == "darwin":
     import platform as _pf
     _arch = "arm64" if _pf.machine() == "arm64" else "amd64"
     _cf_sub, _cf_exe, _name = f"darwin-{_arch}", "cloudflared", "KiroGatewayTray"
     _console = False
+    _strip = True
 else:
     _cf_sub, _cf_exe, _name = "linux-amd64", "cloudflared", "kiro-gateway-tray"
     _console = True
+    _strip = True
 
 datas = [
     (str(VENDOR), "vendor"),
@@ -59,7 +66,15 @@ a = Analysis(
     hiddenimports=hiddenimports,
     hookspath=[],
     runtime_hooks=[],
-    excludes=["pytest", "hypothesis"],
+    # Build-time / dev-only modules that the frozen app never imports. Trimming
+    # them shrinks the bundle without touching runtime behavior. tkinter is a
+    # big one (Tk/Tcl); the app's tray UI is pystray, not tkinter.
+    excludes=[
+        "pytest", "hypothesis",
+        "tkinter", "test", "unittest",
+        "distutils", "setuptools", "pip", "pkg_resources",
+        "pydoc", "doctest", "lib2to3",
+    ],
     noarchive=False,
 )
 pyz = PYZ(a.pure)
@@ -69,9 +84,10 @@ exe = EXE(
     exclude_binaries=True,
     name=_name,
     console=_console,
+    strip=_strip,
     icon=_bundle_icon,
 )
-coll = COLLECT(exe, a.binaries, a.datas, name=_name)
+coll = COLLECT(exe, a.binaries, a.datas, strip=_strip, name=_name)
 
 if sys.platform == "darwin":
     app = BUNDLE(

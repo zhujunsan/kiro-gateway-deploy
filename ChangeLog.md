@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.3.5 (2026-07-02)
+
+**Changed**
+- 打包体积优化（不影响任何运行时行为）：macOS/Linux 的 PyInstaller 构建开启 `strip`，剥离二进制的调试符号；Windows 不启用（PE 格式不适用且 runner 无 `strip`）。扩充 `excludes`，剔除冻结应用运行时用不到的 `tkinter`、`test`、`unittest`、`distutils`、`setuptools`、`pip` 等模块。macOS 的 `.dmg` 改用 `UDBZ`（bzip2）压缩，缩小下载体积；安装后的 `.app` 内容不变。
+
 ## v0.3.4 (2026-07-02)
 
 **Fixed**
