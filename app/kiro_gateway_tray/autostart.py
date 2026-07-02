@@ -7,7 +7,9 @@ tray UI only sees ``is_supported`` / ``is_enabled`` / ``set_enabled``.
   - macOS:   a LaunchAgent plist in ``~/Library/LaunchAgents``. This works for
              unsigned apps. macOS 13+ shows its own "added a login item" system
              notification and lists us under 系统设置 → 通用 → 登录项, so we do
-             NOT pop a custom dialog — the OS already tells the user.
+             NOT pop a custom dialog — the OS already tells the user. We also
+             ``launchctl bootstrap``/``bootout`` the job so launchd and the
+             登录项 list sync in the current session instead of only at reboot.
   - Windows: an ``HKCU\\...\\CurrentVersion\\Run`` registry value (per-user, no
              admin rights needed).
   - Linux:   an XDG autostart ``.desktop`` file in ``~/.config/autostart``.
@@ -21,6 +23,7 @@ The launch target is derived from how we're running:
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -93,13 +96,37 @@ def _macos_is_enabled() -> bool:
     return _macos_plist_path().exists()
 
 
+def _launchctl(*args: str) -> None:
+    """Run ``launchctl`` best-effort. launchd state is separate from the plist
+    file: on macOS 13+ merely creating/deleting the file does NOT load/unload
+    the job in the current session, nor promptly refresh 系统设置 → 登录项. We
+    still swallow errors so a launchctl hiccup never blocks the file operation
+    (which is what actually decides behavior on the next reboot)."""
+    try:
+        subprocess.run(
+            ["launchctl", *args],
+            check=False,
+            capture_output=True,
+            timeout=5,
+        )
+    except Exception:
+        logger.debug("launchctl %s failed", " ".join(args), exc_info=True)
+
+
 def _macos_set_enabled(enabled: bool) -> None:
     p = _macos_plist_path()
+    domain = f"gui/{os.getuid()}"
     if enabled:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(_macos_plist_contents(), encoding="utf-8")
-    elif p.exists():
-        p.unlink()
+        # Register with launchd now so the login item appears without a reboot.
+        _launchctl("bootstrap", domain, str(p))
+    else:
+        # Unload the (possibly already-loaded) job BEFORE removing the file, so
+        # launchd and the 登录项 list drop it instead of leaving a stale entry.
+        _launchctl("bootout", f"{domain}/{BUNDLE_ID}")
+        if p.exists():
+            p.unlink()
 
 
 # --- Windows: HKCU Run registry value ----------------------------------------

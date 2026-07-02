@@ -40,6 +40,9 @@ def test_quote_handles_spaces():
 def test_macos_roundtrip(monkeypatch, tmp_path):
     monkeypatch.setattr(sys, "platform", "darwin")
     monkeypatch.setattr(autostart.Path, "home", lambda: tmp_path)
+    calls = []
+    monkeypatch.setattr(autostart, "_launchctl", lambda *a: calls.append(a))
+    monkeypatch.setattr(autostart.os, "getuid", lambda: 501, raising=False)
     assert autostart.is_enabled() is False
     autostart.set_enabled(True)
     plist = tmp_path / "Library" / "LaunchAgents" / f"{autostart.BUNDLE_ID}.plist"
@@ -49,14 +52,20 @@ def test_macos_roundtrip(monkeypatch, tmp_path):
     assert "<key>RunAtLoad</key>" in body
     assert "<key>AssociatedBundleIdentifiers</key>" not in body
     assert autostart.is_enabled() is True
+    assert calls == [("bootstrap", "gui/501", str(plist))]
+    calls.clear()
     autostart.set_enabled(False)
     assert plist.exists() is False
     assert autostart.is_enabled() is False
+    # bootout must run before the file is removed so launchd/登录项 drop the job.
+    assert calls == [("bootout", f"gui/501/{autostart.BUNDLE_ID}")]
 
 
 def test_macos_set_enabled_false_is_idempotent(monkeypatch, tmp_path):
     monkeypatch.setattr(sys, "platform", "darwin")
     monkeypatch.setattr(autostart.Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(autostart, "_launchctl", lambda *a: None)
+    monkeypatch.setattr(autostart.os, "getuid", lambda: 501, raising=False)
     autostart.set_enabled(False)  # nothing there yet
     assert autostart.is_enabled() is False
 

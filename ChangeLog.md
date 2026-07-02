@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.3.4 (2026-07-02)
+
+**Fixed**
+- 修复 macOS 取消开机自启后系统「登录项」仍残留、且当前会话里 LaunchAgent 未卸载的问题：此前仅写入/删除 `~/Library/LaunchAgents` 下的 plist 文件，而 macOS 13+ 的 launchd 加载状态与「登录项」列表独立于该文件，仅删文件不会即时卸载或刷新。现在开启时额外 `launchctl bootstrap` 注册、取消时先 `launchctl bootout` 卸载再删文件，使 launchd 与登录项在当前会话即同步，无需重启。`launchctl` 调用为 best-effort，出错不影响文件操作本身。
+
 ## v0.3.3 (2026-07-01)
 
 **Fixed**
