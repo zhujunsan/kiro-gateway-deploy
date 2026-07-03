@@ -187,7 +187,7 @@ def test_post_with_retry_retries_on_5xx(monkeypatch):
 
     calls = {"n": 0}
 
-    def fake_post(url, json, timeout):
+    def fake_post(url, json, timeout, **kwargs):
         calls["n"] += 1
         return _Resp(500 if calls["n"] < 3 else 200)
 
@@ -207,7 +207,7 @@ def test_post_with_retry_no_retry_on_401(monkeypatch):
 
     calls = {"n": 0}
 
-    def fake_post(url, json, timeout):
+    def fake_post(url, json, timeout, **kwargs):
         calls["n"] += 1
         return _Resp()
 

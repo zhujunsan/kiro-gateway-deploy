@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.3.7 (2026-07-03)
+
+**Fixed**
+- 修复 Linux（及任何设置了系统代理环境变量的环境）下首次启动即闪退的问题：首次注册隧道的请求此前会继承系统 `ALL_PROXY`/`HTTP(S)_PROXY`，当其为 `socks://` 且未安装 `httpx[socks]` 时，httpx 在构造客户端阶段直接抛 `ValueError: Unknown scheme for proxy URL`，导致启动线程崩溃、托盘应用闪退。现在首次注册请求与其他控制面调用一致，统一使用 `trust_env=False`，不再经用户代理，从根本上规避该崩溃。
+
 ## v0.3.6 (2026-07-03)
 
 **Fixed**

@@ -25,7 +25,12 @@ def _post_with_retry(url: str, payload: dict) -> httpx.Response:
     last_err: Exception | None = None
     for attempt in range(1, _HTTP_RETRIES + 1):
         try:
-            resp = httpx.post(url, json=payload, timeout=_HTTP_TIMEOUT)
+            # trust_env=False: don't inherit system HTTP(S)_PROXY / ALL_PROXY.
+            # A socks:// proxy (common on Linux) makes httpx raise ValueError at
+            # client construction unless httpx[socks] is installed, crashing the
+            # whole first-run registration. These are our own control-plane calls
+            # and must not be routed through a user proxy anyway.
+            resp = httpx.post(url, json=payload, timeout=_HTTP_TIMEOUT, trust_env=False)
         except httpx.HTTPError as e:
             last_err = e
         else:
