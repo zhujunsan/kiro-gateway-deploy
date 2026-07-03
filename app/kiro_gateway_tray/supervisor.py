@@ -314,7 +314,7 @@ class Supervisor:
 
             should_restart_tunnel = False
             with self._state_lock:
-                if not tunnel_alive or tunnel_connected:
+                if tunnel_connected:
                     self._tunnel_disconnected_since = None
                 else:
                     if self._tunnel_disconnected_since is None:

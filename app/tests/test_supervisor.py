@@ -355,3 +355,37 @@ def test_reprovision_if_deleted_no_secret(monkeypatch, tmp_path):
     s = supervisor.Supervisor(gateway=_FakeGateway(), tunnel=_FakeTunnel())
     assert s._reprovision_if_deleted() is False
 
+
+def test_run_probe_cycle_auto_restarts_tunnel_when_dead_on_timeout(monkeypatch, tmp_path):
+    # Tests that when tunnel is dead (is_alive is False), it still restarts on timeout
+    s = _make_sup(monkeypatch, tmp_path)
+    s.start()
+
+    # Gateway is alive and healthy, tunnel is NOT alive
+    s.gateway.started = True
+    s.tunnel.started = False
+
+    class _Resp:
+        status_code = 200
+
+    monkeypatch.setattr(s._client, "get", lambda *a, **k: _Resp())
+    monkeypatch.setattr(s, "_reprovision_if_deleted", lambda: False)
+
+    # First probe: sets the disconnected timestamp
+    s._run_probe_cycle()
+    assert s._tunnel_disconnected_since is not None
+    initial_ts = s._tunnel_disconnected_since
+
+    restarted = []
+    monkeypatch.setattr(s.tunnel, "stop", lambda: restarted.append("stop"))
+    monkeypatch.setattr(s.tunnel, "start", lambda cfg: restarted.append("start"))
+
+    # Mock time advancement beyond _TUNNEL_RECONNECT_TIMEOUT
+    fake_time = initial_ts + s._TUNNEL_RECONNECT_TIMEOUT + 5
+    monkeypatch.setattr(time, "time", lambda: fake_time)
+
+    s._run_probe_cycle()
+    assert "stop" in restarted
+    assert "start" in restarted
+    assert s._tunnel_disconnected_since is None
+
