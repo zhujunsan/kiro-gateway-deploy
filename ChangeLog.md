@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.3.8 (2026-07-06)
+
+**Fixed**
+- 彻底修复 SOCKS 代理环境下的启动闪退，并让 SOCKS 代理真正可用（v0.3.7 只是用 `trust_env=False` 绕过、牺牲了代理能力，且网关本体完全没修）。根因有两层：一是打包/运行环境缺少 `socksio`，二是 httpx 仅接受 `http/https/socks5/socks5h` 代理 scheme，而 Clash/v2ray 等常导出的通用 `socks://` 会让 httpx 在构造客户端阶段直接抛 `ValueError: Unknown scheme for proxy URL`。现在依赖改用 `httpx[socks]`（PyInstaller 一并打包 `socksio`），并新增统一的代理解析：读取 `HTTP(S)_PROXY`/`ALL_PROXY` 并把 `socks://` 归一化为 `socks5h://`（DNS 走代理解析，适配翻墙网络），网关转发、令牌刷新、MCP、隧道注册、遥测、更新检查等出网请求均据此显式设置代理，翻墙用户的 SOCKS 代理可正常使用。
+- 本地回环探测（健康检查、用量、测速）仍显式忽略代理（`trust_env=False`），避免用户代理劫持 `127.0.0.1` 请求导致健康的网关/隧道被误判为不可用。
+
+**Changed**
+- 同步升级 vendored 网关本体至上游 `f978a2b`，并将 docker 部署镜像 tag 更新为 `main-f978a2b`。
+
 ## v0.3.7 (2026-07-03)
 
 **Fixed**

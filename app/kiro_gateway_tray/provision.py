@@ -11,6 +11,7 @@ import httpx
 
 from . import appconfig
 from .appconfig import AppCfg
+from .httpclient import resolve_proxy
 
 _USERNAME_LEN = 12  # chars used from the per-user profile ID
 _HTTP_RETRIES = 3   # attempts for transient network errors
@@ -25,12 +26,13 @@ def _post_with_retry(url: str, payload: dict) -> httpx.Response:
     last_err: Exception | None = None
     for attempt in range(1, _HTTP_RETRIES + 1):
         try:
-            # trust_env=False: don't inherit system HTTP(S)_PROXY / ALL_PROXY.
-            # A socks:// proxy (common on Linux) makes httpx raise ValueError at
-            # client construction unless httpx[socks] is installed, crashing the
-            # whole first-run registration. These are our own control-plane calls
-            # and must not be routed through a user proxy anyway.
-            resp = httpx.post(url, json=payload, timeout=_HTTP_TIMEOUT, trust_env=False)
+            # Honour the environment's proxy (HTTP(S)_PROXY / ALL_PROXY). Users
+            # behind a SOCKS proxy need these control-plane calls to reach the
+            # Worker through it. resolve_proxy() normalizes socks:// -> socks5h://
+            # so an otherwise-unsupported scheme doesn't crash construction.
+            resp = httpx.post(
+                url, json=payload, timeout=_HTTP_TIMEOUT, proxy=resolve_proxy()
+            )
         except httpx.HTTPError as e:
             last_err = e
         else:
@@ -206,7 +208,7 @@ def refresh_telemetry_secret(provision_url: str, shared_secret: str, username: s
             url,
             json={"shared_secret": shared_secret, "username": username},
             timeout=_HTTP_TIMEOUT,
-            trust_env=False,
+            proxy=resolve_proxy(),
         )
     except httpx.HTTPError:
         return ""
@@ -237,7 +239,7 @@ def tunnel_exists(cfg: AppCfg, shared_secret: str) -> bool | None:
             url,
             json={"shared_secret": shared_secret, "username": username},
             timeout=_HTTP_TIMEOUT,
-            trust_env=False,
+            proxy=resolve_proxy(),
         )
     except httpx.HTTPError:
         return None

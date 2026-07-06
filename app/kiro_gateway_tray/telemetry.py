@@ -36,6 +36,7 @@ from typing import Any, Iterable
 
 import httpx
 
+from .httpclient import resolve_proxy
 from .log import logger
 
 # --- constants ---------------------------------------------------------------
@@ -373,10 +374,12 @@ class Uploader:
             headers["Authorization"] = f"Bearer {self.secret}"
         body = {"schema_version": SCHEMA_VERSION, "rows": rows}
         try:
-            # trust_env=False: never let a corp HTTP(S)_PROXY hijack the report.
+            # Honour the environment's proxy so users behind a SOCKS/HTTP proxy
+            # can still upload telemetry through it. resolve_proxy() normalizes
+            # socks:// -> socks5h:// so it doesn't crash client construction.
             resp = httpx.post(
                 self.endpoint_url, json=body, headers=headers,
-                timeout=self.timeout, trust_env=False,
+                timeout=self.timeout, proxy=resolve_proxy(),
             )
         except Exception:
             logger.debug("telemetry: upload request failed", exc_info=True)

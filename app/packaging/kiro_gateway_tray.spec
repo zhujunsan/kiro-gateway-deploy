@@ -57,6 +57,10 @@ hiddenimports += collect_submodules("tiktoken_ext")
 hiddenimports += collect_submodules("loguru")
 hiddenimports += collect_submodules("starlette")
 hiddenimports += ["sqlite3", "_sqlite3"]
+# httpx imports socksio lazily only when it sees a socks:// proxy, so PyInstaller
+# can't detect it statically. Without this the frozen app crashes on a socks://
+# HTTP(S)_PROXY / ALL_PROXY with "Unknown scheme for proxy URL".
+hiddenimports += collect_submodules("socksio")
 
 a = Analysis(
     [str(APP / "kiro_gateway_tray" / "__main__.py")],

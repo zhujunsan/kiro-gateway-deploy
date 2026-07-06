@@ -25,6 +25,7 @@ from pathlib import Path
 import httpx
 
 from . import GITHUB_REPO, __version__, paths
+from .httpclient import resolve_proxy
 from .log import logger
 
 _TTL_SECONDS = 4 * 60 * 60
@@ -106,7 +107,10 @@ def _should_check() -> bool:
 
 def _fetch_latest() -> str | None:
     url = _RELEASE_API.format(repo=GITHUB_REPO)
-    resp = httpx.get(url, timeout=8, headers={"Accept": "application/vnd.github+json"})
+    resp = httpx.get(
+        url, timeout=8, headers={"Accept": "application/vnd.github+json"},
+        proxy=resolve_proxy(),
+    )
     if resp.status_code != 200:
         return None
     return resp.json().get("tag_name")

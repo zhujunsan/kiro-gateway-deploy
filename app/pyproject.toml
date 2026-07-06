@@ -13,7 +13,9 @@ dependencies = [
     "Pillow",
     "platformdirs",
     "tomli-w",
-    "httpx",
+    # [socks] pulls in socksio so a socks:// proxy works instead of crashing
+    # httpx at client construction with "Unknown scheme for proxy URL".
+    "httpx[socks]",
     # Gateway (vendored) runtime
     "fastapi",
     "uvicorn[standard]",
