@@ -184,6 +184,64 @@ def test_download_zero_bytes_clamped_to_minimum():
     assert len(_body(sent)) == 1
 
 
+# --- download stat -----------------------------------------------------------
+
+def test_download_stat_returns_server_timing_by_nonce():
+    mw = SpeedTestMiddleware(None, "k")
+    sent, _ = _run(_drive(
+        mw, path="/speedtest/download", query=b"bytes=2000&nonce=abc&key=k",
+    ))
+    assert _status(sent) == 200
+    assert len(_body(sent)) == 2000
+
+    sent, _ = _run(_drive(
+        mw, path="/speedtest/download/stat", query=b"nonce=abc&key=k",
+    ))
+    assert _status(sent) == 200
+    j = json.loads(_body(sent))
+    assert j["sent_bytes"] == 2000
+    assert j["server_seconds"] >= 0
+    assert "server_mbps" in j
+
+
+def test_download_stat_unknown_nonce_404():
+    mw = SpeedTestMiddleware(None, "k")
+    sent, _ = _run(_drive(
+        mw, path="/speedtest/download/stat", query=b"nonce=missing&key=k",
+    ))
+    assert _status(sent) == 404
+
+
+def test_download_stat_requires_auth():
+    mw = SpeedTestMiddleware(None, "k")
+    sent, _ = _run(_drive(
+        mw, path="/speedtest/download/stat", query=b"nonce=abc",
+    ))
+    assert _status(sent) == 401
+
+
+def test_download_without_nonce_stores_nothing():
+    mw = SpeedTestMiddleware(None, "k")
+    _run(_drive(mw, path="/speedtest/download", query=b"bytes=1000&key=k"))
+    assert len(mw._dl_stats) == 0
+
+
+def test_download_stat_evicts_beyond_cap():
+    mw = SpeedTestMiddleware(None, "k")
+    for i in range(speedtest._STAT_MAX + 5):
+        _run(_drive(
+            mw, path="/speedtest/download",
+            query=f"bytes=1&nonce=n{i}&key=k".encode(),
+        ))
+    assert len(mw._dl_stats) == speedtest._STAT_MAX
+    # Oldest nonces were evicted; the most recent one survives.
+    sent, _ = _run(_drive(
+        mw, path="/speedtest/download/stat",
+        query=f"nonce=n{speedtest._STAT_MAX + 4}&key=k".encode(),
+    ))
+    assert _status(sent) == 200
+
+
 # --- upload ------------------------------------------------------------------
 
 def test_upload_counts_bytes():

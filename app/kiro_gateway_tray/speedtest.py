@@ -32,6 +32,7 @@ import hmac
 import json
 import os
 import time
+from collections import OrderedDict
 from urllib.parse import parse_qs
 
 from .log import logger
@@ -43,6 +44,8 @@ _CHUNK = 256 * 1024              # streamed download chunk size (bytes)
 _DEFAULT_DOWNLOAD = 10 * 1024 * 1024      # 10 MiB when ?bytes= is omitted
 _MAX_DOWNLOAD = 100 * 1024 * 1024         # hard cap: never stream more than this
 _MAX_UPLOAD = 200 * 1024 * 1024           # hard cap on accepted upload body
+_STAT_TTL = 60.0                 # keep a download's server-side stat this long
+_STAT_MAX = 256                  # cap remembered stats so memory can't grow
 
 
 def _enabled(env: dict[str, str] | None = None) -> bool:
@@ -98,6 +101,12 @@ class SpeedTestMiddleware:
     def __init__(self, app, api_key: str) -> None:
         self.app = app
         self.api_key = api_key or ""
+        # Download is streamed, so the browser's fetch() can't read a trailing
+        # server-side timing (HTTP trailers aren't exposed). We instead time the
+        # push here, stash it under the client-supplied nonce, and let the page
+        # fetch it back from /speedtest/download/stat. Bounded + TTL'd so it
+        # can't grow without limit.
+        self._dl_stats: "OrderedDict[str, tuple[float, dict]]" = OrderedDict()
 
     async def __call__(self, scope: dict, receive, send) -> None:
         if scope.get("type") != "http":
@@ -114,6 +123,8 @@ class SpeedTestMiddleware:
                 await self._page(send)
             elif path == _PREFIX + "/ping":
                 await self._ping(scope, send)
+            elif path == _PREFIX + "/download/stat" and method == "GET":
+                await self._download_stat(scope, send)
             elif path == _PREFIX + "/download" and method == "GET":
                 await self._download(scope, send)
             elif path == _PREFIX + "/upload" and method == "POST":
@@ -150,12 +161,39 @@ class SpeedTestMiddleware:
             return
         await _send_json(send, 200, {"pong": True, "server_time": time.time()})
 
+    def _remember_stat(self, nonce: str, stat: dict) -> None:
+        """Store a download's server-side timing under its nonce, bounded+TTL'd."""
+        if not nonce:
+            return
+        now = time.time()
+        # Drop expired entries and enforce the size cap (oldest first).
+        for key in list(self._dl_stats):
+            ts, _ = self._dl_stats[key]
+            if now - ts > _STAT_TTL:
+                self._dl_stats.pop(key, None)
+        self._dl_stats[nonce] = (now, stat)
+        while len(self._dl_stats) > _STAT_MAX:
+            self._dl_stats.popitem(last=False)
+
+    async def _download_stat(self, scope: dict, send) -> None:
+        """Return the server-measured timing for a completed download by nonce."""
+        if not self._authorized(scope):
+            await _send_json(send, 401, {"error": "unauthorized"})
+            return
+        nonce = (_query(scope).get("nonce") or [""])[0]
+        entry = self._dl_stats.get(nonce)
+        if not entry:
+            await _send_json(send, 404, {"error": "no stat for nonce"})
+            return
+        await _send_json(send, 200, entry[1])
+
     async def _download(self, scope: dict, send) -> None:
         if not self._authorized(scope):
             await _send_json(send, 401, {"error": "unauthorized"})
             return
         q = _query(scope)
         n = _clamp_int((q.get("bytes") or [None])[0], _DEFAULT_DOWNLOAD, 1, _MAX_DOWNLOAD)
+        nonce = (q.get("nonce") or [""])[0]
         headers = [
             (b"content-type", b"application/octet-stream"),
             (b"content-length", str(n).encode("ascii")),
@@ -165,6 +203,7 @@ class SpeedTestMiddleware:
             (b"x-speedtest-bytes", str(n).encode("ascii")),
         ]
         await send({"type": "http.response.start", "status": 200, "headers": headers})
+        start = time.perf_counter()
         remaining = n
         while remaining > 0:
             size = min(_CHUNK, remaining)
@@ -176,6 +215,13 @@ class SpeedTestMiddleware:
                 "body": os.urandom(size),
                 "more_body": remaining > 0,
             })
+        elapsed = time.perf_counter() - start
+        mbps = (n * 8 / 1_000_000 / elapsed) if elapsed > 0 else 0.0
+        self._remember_stat(nonce, {
+            "sent_bytes": n,
+            "server_seconds": round(elapsed, 6),
+            "server_mbps": round(mbps, 3),
+        })
 
     async def _upload(self, scope: dict, receive, send) -> None:
         if not self._authorized(scope):
@@ -261,12 +307,15 @@ _HTML = """<!doctype html>
   button:disabled { opacity: .5; cursor: default; }
   .row button { flex: 1; min-width: 120px; }
   button.secondary { background: #2b3143; }
-  .results { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
-  .metric { background: #0f131b; border: 1px solid #232838; border-radius: 10px;
-            padding: 14px; text-align: center; }
-  .metric .v { font-size: 22px; font-weight: 700; }
-  .metric .u { font-size: 11px; color: #98a0b3; margin-top: 2px; }
-  .metric .l { font-size: 12px; color: #c3c9d6; margin-bottom: 6px; }
+  table.results { width: 100%; border-collapse: collapse; }
+  table.results th, table.results td { padding: 12px 10px; text-align: right;
+            border-bottom: 1px solid #232838; }
+  table.results th { color: #98a0b3; font-size: 12px; font-weight: 600; }
+  table.results td:first-child, table.results th:first-child { text-align: left; }
+  table.results tbody th { color: #c3c9d6; font-size: 13px; }
+  table.results td { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  table.results .unit { font-size: 11px; color: #98a0b3; font-weight: 400; margin-left: 3px; }
+  table.results tr:last-child td, table.results tr:last-child th { border-bottom: 0; }
   pre { background: #0f131b; border: 1px solid #232838; border-radius: 8px;
         padding: 12px; font-size: 12px; overflow: auto; white-space: pre-wrap;
         color: #98a0b3; margin: 12px 0 0; }
@@ -310,16 +359,40 @@ _HTML = """<!doctype html>
   </div>
 
   <div class="card">
-    <div class="results">
-      <div class="metric"><div class="l">延迟 (中位数)</div><div class="v" id="m-ping">–</div><div class="u">ms · RTT</div></div>
-      <div class="metric"><div class="l">下载</div><div class="v" id="m-dl">–</div><div class="u">Mbps</div></div>
-      <div class="metric"><div class="l">上传</div><div class="v" id="m-ul">–</div><div class="u">Mbps</div></div>
-    </div>
+    <table class="results">
+      <thead>
+        <tr><th>指标</th><th>客户端侧</th><th>服务端侧</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <th>延迟 (中位数)</th>
+          <td id="m-ping">–<span class="unit">ms</span></td>
+          <td>–</td>
+        </tr>
+        <tr>
+          <th>下载</th>
+          <td id="m-dl-c">–<span class="unit">Mbps</span></td>
+          <td id="m-dl-s">–<span class="unit">Mbps</span></td>
+        </tr>
+        <tr>
+          <th>上传</th>
+          <td id="m-ul-c">–<span class="unit">Mbps</span></td>
+          <td id="m-ul-s">–<span class="unit">Mbps</span></td>
+        </tr>
+      </tbody>
+    </table>
+    <p class="sub" style="margin:12px 0 0">客户端侧＝浏览器端到端实测（含链路往返，日常以此为准）；服务端侧＝网关只计自身收/发数据的耗时。经隧道时服务端侧会因边缘缓冲偏高，仅供对照。</p>
     <pre id="log">就绪。</pre>
   </div>
 </div>
 <script>
 const $ = (id) => document.getElementById(id);
+// Set a metric cell's number while keeping its <span class="unit"> suffix.
+const setVal = (id, text, unit) => {
+  const el = $(id);
+  const u = unit != null ? unit : (el.querySelector(".unit")?.textContent || "");
+  el.innerHTML = text + (u ? `<span class="unit">${u}</span>` : "");
+};
 const log = (msg, cls) => {
   const el = $("log");
   const line = cls ? `<span class="${cls}">${msg}</span>` : msg;
@@ -370,9 +443,13 @@ async function ping(signal, n = 7) {
   return samples[Math.floor(samples.length / 2)];
 }
 
+const nonce = () => (crypto.randomUUID ? crypto.randomUUID()
+                     : String(Date.now()) + Math.random().toString(16).slice(2));
+
 async function download(signal, bytes) {
+  const id = nonce();
   const t0 = performance.now();
-  const r = await fetch("./speedtest/download?bytes=" + bytes + "&t=" + Date.now(), authInit(signal));
+  const r = await fetch("./speedtest/download?bytes=" + bytes + "&nonce=" + id + "&t=" + Date.now(), authInit(signal));
   if (!r.ok) throw new Error("download HTTP " + r.status);
   const reader = r.body.getReader();
   let received = 0;
@@ -388,14 +465,21 @@ async function download(signal, bytes) {
     if (now - lastTick >= 1000) {
       const inst = ((received - lastBytes) * 8 / 1e6) / ((now - lastTick) / 1000);
       const pct = total ? Math.min(100, (received / total) * 100) : 0;
-      $("m-dl").textContent = inst.toFixed(1);
+      setVal("m-dl-c", inst.toFixed(1));
       logReplace(`下载中… ${pct.toFixed(0)}%  当前 ${inst.toFixed(1)} Mbps`);
       lastTick = now;
       lastBytes = received;
     }
   }
   const secs = (performance.now() - t0) / 1000;
-  return { mbps: (received * 8 / 1e6) / secs, bytes: received, secs };
+  // Fetch the server-side timing for this download (best-effort; the number
+  // isn't critical, so we swallow any error).
+  let server = null;
+  try {
+    const s = await fetch("./speedtest/download/stat?nonce=" + id, authInit(signal));
+    if (s.ok) server = await s.json();
+  } catch (e) {}
+  return { mbps: (received * 8 / 1e6) / secs, bytes: received, secs, server };
 }
 
 async function upload(signal, bytes) {
@@ -409,9 +493,9 @@ async function upload(signal, bytes) {
     body: payload,
   });
   if (!r.ok) throw new Error("upload HTTP " + r.status);
-  const j = await r.json();
+  const server = await r.json();
   const secs = (performance.now() - t0) / 1000;
-  return { clientMbps: (bytes * 8 / 1e6) / secs, server: j };
+  return { clientMbps: (bytes * 8 / 1e6) / secs, server };
 }
 
 function setRunning(running) {
@@ -431,22 +515,26 @@ $("go").addEventListener("click", async () => {
   const signal = controller.signal;
   setRunning(true);
   $("log").innerHTML = "";
-  $("m-ping").textContent = $("m-dl").textContent = $("m-ul").textContent = "…";
+  ["m-ping", "m-dl-c", "m-dl-s", "m-ul-c", "m-ul-s"].forEach((id) => setVal(id, "…"));
   try {
     log("测延迟…");
     const p = await ping(signal);
-    $("m-ping").textContent = p.toFixed(1);
+    setVal("m-ping", p.toFixed(1));
     logReplace(`延迟中位数 ${p.toFixed(1)} ms`, "ok");
 
     log("测下载…");
     const d = await download(signal, parseInt($("dl").value, 10));
-    $("m-dl").textContent = d.mbps.toFixed(1);
-    logReplace(`下载 ${d.mbps.toFixed(1)} Mbps（${(d.bytes/1048576).toFixed(1)} MB / ${d.secs.toFixed(2)} s）`, "ok");
+    setVal("m-dl-c", d.mbps.toFixed(1));
+    setVal("m-dl-s", d.server ? d.server.server_mbps.toFixed(1) : "—");
+    const dlSrv = d.server ? `，服务端侧 ${d.server.server_mbps.toFixed(1)} Mbps` : "";
+    logReplace(`下载 客户端侧 ${d.mbps.toFixed(1)} Mbps（${(d.bytes/1048576).toFixed(1)} MB / ${d.secs.toFixed(2)} s）${dlSrv}`, "ok");
 
     log("测上传…");
     const u = await upload(signal, parseInt($("ul").value, 10));
-    $("m-ul").textContent = u.clientMbps.toFixed(1);
-    logReplace(`上传 ${u.clientMbps.toFixed(1)} Mbps（服务端计 ${u.server.server_mbps} Mbps）`, "ok");
+    setVal("m-ul-c", u.clientMbps.toFixed(1));
+    setVal("m-ul-s", u.server ? u.server.server_mbps.toFixed(1) : "—");
+    const ulSrv = u.server ? `，服务端侧 ${u.server.server_mbps.toFixed(1)} Mbps` : "";
+    logReplace(`上传 客户端侧 ${u.clientMbps.toFixed(1)} Mbps${ulSrv}`, "ok");
 
     log("完成。", "ok");
   } catch (e) {
