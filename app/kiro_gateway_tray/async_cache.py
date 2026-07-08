@@ -35,12 +35,14 @@ class AsyncRefreshCache(Generic[T]):
         self._lock = threading.Lock()
         self._value: T | None = None
         self._inflight = False
-        # Whether any attempt has completed yet. Kept separate from _value so the
-        # cooldown also throttles fetches that legitimately yield None/empty, and
-        # so the very first refresh is never mistaken for "within cooldown" (the
-        # monotonic clock does not start at 0 on macOS/Linux).
-        self._fetched = False
+        # Whether a fetch has ever succeeded. Cooldown only applies after the
+        # first success so that startup retries are not throttled.
+        self._succeeded = False
         self._last_fetch = 0.0
+        self._backoff = 0.0  # current backoff delay (reset on success)
+
+    _BACKOFF_BASE = 1.0
+    _BACKOFF_MAX = 64.0
 
     def get(self) -> T | None:
         """Return the last cached value (None until the first refresh lands)."""
@@ -58,12 +60,12 @@ class AsyncRefreshCache(Generic[T]):
         with self._lock:
             if self._inflight:
                 return
-            if (
-                not force
-                and self._fetched
-                and (now - self._last_fetch) < self._cooldown
-            ):
-                return
+            if not force:
+                if self._succeeded and (now - self._last_fetch) < self._cooldown:
+                    return
+                # A retry is already scheduled via backoff; don't pile on.
+                if self._backoff > 0.0:
+                    return
             self._inflight = True
 
         def _work():
@@ -74,13 +76,29 @@ class AsyncRefreshCache(Generic[T]):
             with self._lock:
                 if value is not None:
                     self._value = value
+                    self._succeeded = True
+                    self._last_fetch = time.monotonic()
+                    self._backoff = 0.0
                 self._inflight = False
-                self._fetched = True
-                self._last_fetch = time.monotonic()
-            if value is not None and self._on_update is not None:
-                try:
-                    self._on_update()
-                except Exception:
-                    logger.debug("async_cache on_update callback failed", exc_info=True)
+
+            if value is not None:
+                if self._on_update is not None:
+                    try:
+                        self._on_update()
+                    except Exception:
+                        logger.debug("async_cache on_update callback failed", exc_info=True)
+            else:
+                # Failed — schedule retry with exponential backoff
+                with self._lock:
+                    delay = self._BACKOFF_BASE if self._backoff == 0.0 else min(self._backoff * 2, self._BACKOFF_MAX)
+                    self._backoff = delay
+                self._schedule_retry(delay)
 
         threading.Thread(target=_work, daemon=True).start()
+
+    def _schedule_retry(self, delay: float) -> None:
+        def _retry():
+            time.sleep(delay)
+            self.refresh(force=True)
+
+        threading.Thread(target=_retry, daemon=True).start()

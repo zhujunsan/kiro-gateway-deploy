@@ -215,7 +215,7 @@ class TrayApp:
 
         self._usage_cache = _UsageCache(on_update=self._request_redraw)
         self._models_cache = AsyncRefreshCache(
-            usage.fetch_models, cooldown=60, on_update=self._request_redraw,
+            usage.fetch_models, cooldown=14400, on_update=self._request_redraw,
         )
         self.sup.on_status_change = self._request_redraw
 
@@ -600,6 +600,7 @@ class TrayApp:
                 self._notify(f"{APP_NAME} 错误", str(e)[:200])
             self._refresh_icon()
             self._icon.update_menu()
+            self._models_cache.refresh(force=True)
 
         self.sup.mark_starting()
         menu = self._build_menu()
