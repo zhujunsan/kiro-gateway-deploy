@@ -43,6 +43,8 @@ npm-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 
+local-telemetry/
+
 # 日志与调试产物
 *.log
 debug_logs/

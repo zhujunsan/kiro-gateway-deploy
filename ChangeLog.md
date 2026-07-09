@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.3.12 (2026-07-09)
+
+**Changed**
+- 升级内嵌 cloudflared 二进制至 2026.7.0（darwin 资产的官方 release 正文 checksum 有误，已按实际 GitHub asset 重新计算并 pin）。
+- 升级 Python 依赖：fastapi 0.139.0、uvicorn 0.51.0、pillow 12.3.0，以及 anyio / click / pytest / regex / setuptools / typing-extensions / charset-normalizer / pyobjc-* 等小版本。
+- CI Actions 升级：`actions/checkout` v7、`actions/upload-artifact` v7、`actions/download-artifact` v8。
+- `.gitignore` 增加 `local-telemetry/`，避免本地遥测观测笔记被误提交。
+
 ## v0.3.11 (2026-07-08)
 
 **Changed**

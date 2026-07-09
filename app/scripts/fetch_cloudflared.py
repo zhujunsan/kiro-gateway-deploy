@@ -21,7 +21,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DEST_BASE = ROOT / "resources" / "cloudflared"
 
-CLOUDFLARED_VERSION = "2026.6.1"
+CLOUDFLARED_VERSION = "2026.7.0"
 BASE_URL = (
     "https://github.com/cloudflare/cloudflared/releases/download/"
     f"{CLOUDFLARED_VERSION}"
@@ -29,11 +29,13 @@ BASE_URL = (
 
 # sha256 of each pinned release asset (the downloaded file, before extraction).
 CLOUDFLARED_SHA256 = {
-    "cloudflared-darwin-amd64.tgz": "d7a66b525fe76820da6e5406611b61e48b40de682368ac00454d9158f085be4b",
-    "cloudflared-darwin-arm64.tgz": "f6d4c439c6c782b83264951d327989ce5e23373acc5942b872411601fedb020d",
-    "cloudflared-linux-amd64": "5861a10a438fe8ddcfebb3b830f83966cbf193edafce0fe2eeb198fbae1f7a22",
-    "cloudflared-linux-arm64": "59816ce9b16db71f5bc2a86d59b3632a96c8c3ee934bde2bc8641ee83a6070eb",
-    "cloudflared-windows-amd64.exe": "5253e66f1f493c4e13539749f1aa86fd0c61e3072900fec29a44ba046a6d97e2",
+    # Note: 2026.7.0 release-body checksums for the two darwin .tgz assets are
+    # wrong; values below are sha256 of the actual GitHub release assets.
+    "cloudflared-darwin-amd64.tgz": "dd1fb6a914a21dc52c64bad96987bbbc72d6c65553a2cfee1dd5bc886742ddfb",
+    "cloudflared-darwin-arm64.tgz": "276f4ae3119c88d1708b0f884a35a1c87d9ae459b0dab6313f2daddbddab2bec",
+    "cloudflared-linux-amd64": "434a04eb237e07d3d4146fc44acdbb411260a94fcb01764f454abe38a09503f3",
+    "cloudflared-linux-arm64": "a4c14d1dfb4ea1092da4b64ede05fab7092ba8a424c7df1e7747f5232a4127ff",
+    "cloudflared-windows-amd64.exe": "b11ee950a12b15604e6b0a0f30a226516adc7aec75de2e3c642b28e50ddef9ea",
 }
 
 DOWNLOAD_TIMEOUT = 60  # seconds per attempt

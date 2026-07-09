@@ -39,7 +39,7 @@ jobs:
       run:
         working-directory: app
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-python@v6
         with:
@@ -116,7 +116,7 @@ jobs:
 
       - name: Upload artifact
         if: env.IS_RELEASE == 'true'
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: kiro-gateway-tray-${{ matrix.os }}-${{ matrix.arch }}
           path: app/release/*
@@ -133,7 +133,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-python@v6
         with:
@@ -151,7 +151,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
 
@@ -171,7 +171,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.repository.default_branch }}
 
