@@ -31,6 +31,13 @@
 //   → 401 { error: "unauthorized" }
 //   Idempotent overwrite (last-write-wins) via ON CONFLICT DO UPDATE.
 //
+// POST /telemetry/errors
+//   headers: { Authorization: "Bearer <TELEMETRY_SECRET>" }
+//   body: { schema_version, record: { record_type: "manifest"|"artifact_chunk", ... } }
+//   → 200 { ok: true, accepted: 1, incident_id, part_id, record_type }
+//   → 401 / 400 / 413
+//   Writes exactly one structured console.error to Workers Logs (no D1).
+//
 // GET|POST /q/*
 //   只读查询端点，仅开放参数化的固定查询，默认查 usage_daily。
 //   注意：/q/* 不自校验密钥 —— 由 Cloudflare Access 在边缘挡（见设计文档第十二/十三节）。
@@ -356,6 +363,126 @@ async function handleTelemetry(request, env, json) {
   return json({ ok: true, accepted: statements.length });
 }
 
+// --- error incidents (Workers Logs) -----------------------------------------
+//
+// POST /telemetry/errors
+//   body: { schema_version, record: { record_type: "manifest"|"artifact_chunk", ... } }
+// One record per request. Worker emits exactly one console.error so the
+// invocation stays under the 256 KB Workers Logs budget.
+
+const MAX_INCIDENT_RECORD_BYTES = 192 * 1024;
+const INCIDENT_KIND = "kiro_gateway_incident";
+
+function normalizeIncidentRecord(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  if (raw.kind !== INCIDENT_KIND) return null;
+  const recordType = raw.record_type;
+  if (recordType !== "manifest" && recordType !== "artifact_chunk") return null;
+  const incidentId = typeof raw.incident_id === "string" ? raw.incident_id : "";
+  if (!incidentId || incidentId.length > 128) return null;
+  const partId = typeof raw.part_id === "string" ? raw.part_id : "";
+  if (!partId || partId.length > 64) return null;
+
+  if (recordType === "manifest") {
+    const username = typeof raw.username === "string" ? raw.username : "unknown";
+    if (!USERNAME_RE.test(username) && username !== "unknown") return null;
+    return {
+      kind: INCIDENT_KIND,
+      record_type: "manifest",
+      part_id: partId,
+      incident_id: incidentId,
+      ts: toInt(raw.ts, 0),
+      username,
+      app_version: typeof raw.app_version === "string" ? raw.app_version : "unknown",
+      upstream_sha: typeof raw.upstream_sha === "string" ? raw.upstream_sha : "unknown",
+      path: typeof raw.path === "string" ? raw.path.slice(0, 128) : "",
+      model: typeof raw.model === "string" ? raw.model.slice(0, 128) : "unknown",
+      stream: raw.stream == null ? null : !!raw.stream,
+      status_code: toInt(raw.status_code, 0),
+      gateway_status: toInt(raw.gateway_status, toInt(raw.status_code, 0)),
+      upstream_status: raw.upstream_status == null ? null : toInt(raw.upstream_status, 0),
+      source: typeof raw.source === "string" ? raw.source.slice(0, 64) : "unknown",
+      code: typeof raw.code === "string" ? raw.code.slice(0, 128) : "unknown",
+      phase: typeof raw.phase === "string" ? raw.phase.slice(0, 64) : "unknown",
+      client_disconnected: !!raw.client_disconnected,
+      error_message: typeof raw.error_message === "string" ? raw.error_message.slice(0, 2000) : "",
+      duration_ms: toInt(raw.duration_ms, 0),
+      artifact_names: Array.isArray(raw.artifact_names) ? raw.artifact_names.slice(0, 32) : [],
+      artifact_bytes: raw.artifact_bytes && typeof raw.artifact_bytes === "object" ? raw.artifact_bytes : {},
+      artifact_sha256: raw.artifact_sha256 && typeof raw.artifact_sha256 === "object" ? raw.artifact_sha256 : {},
+      artifact_parts: raw.artifact_parts && typeof raw.artifact_parts === "object" ? raw.artifact_parts : {},
+      total_parts: toInt(raw.total_parts, 0),
+    };
+  }
+
+  // artifact_chunk
+  const artifact = typeof raw.artifact === "string" ? raw.artifact.slice(0, 128) : "";
+  if (!artifact) return null;
+  const encoding = raw.encoding === "base64" ? "base64" : "utf-8";
+  const data = typeof raw.data === "string" ? raw.data : "";
+  if (!data) return null;
+  return {
+    kind: INCIDENT_KIND,
+    record_type: "artifact_chunk",
+    part_id: partId,
+    incident_id: incidentId,
+    artifact,
+    part_index: toInt(raw.part_index, 0),
+    part_total: toInt(raw.part_total, 1),
+    sha256: typeof raw.sha256 === "string" ? raw.sha256.slice(0, 64) : "",
+    artifact_bytes: toInt(raw.artifact_bytes, 0),
+    encoding,
+    data,
+  };
+}
+
+async function handleTelemetryErrors(request, env, json) {
+  const token = extractBearer(request);
+  if (!env.TELEMETRY_SECRET || token == null || !timingSafeEqual(token, env.TELEMETRY_SECRET)) {
+    return json({ error: "unauthorized" }, 401);
+  }
+
+  // Reject oversized bodies before parsing when Content-Length is present.
+  const cl = request.headers.get("content-length");
+  if (cl && toInt(cl, 0) > MAX_INCIDENT_RECORD_BYTES) {
+    return json({ error: "payload too large" }, 413);
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: "invalid JSON" }, 400);
+  }
+
+  const schemaVersion = toInt(body && body.schema_version, 1);
+  void schemaVersion;
+  const record = normalizeIncidentRecord(body && body.record);
+  if (!record) {
+    return json({ error: "invalid record" }, 400);
+  }
+
+  const receivedAt = Math.floor(Date.now() / 1000);
+  const logLine = {
+    ...record,
+    received_at: receivedAt,
+  };
+  const serialized = JSON.stringify(logLine);
+  if (serialized.length > MAX_INCIDENT_RECORD_BYTES) {
+    return json({ error: "payload too large" }, 413);
+  }
+
+  // Exactly one log emission per invocation.
+  console.error(serialized);
+  return json({
+    ok: true,
+    accepted: 1,
+    incident_id: record.incident_id,
+    part_id: record.part_id,
+    record_type: record.record_type,
+  });
+}
+
 // 刷新端点：客户端在 /telemetry 收到 401（本地密钥过期）后，用激活码 shared_secret
 // 换取最新 TELEMETRY_SECRET（设计文档第八节"密钥分发与轮换"）。
 // 用 shared_secret 鉴权（恒定时间比较），只读 env 返回密钥，绝不创建/删除/修改任何
@@ -656,6 +783,18 @@ export default {
       }
       try {
         return await handleTelemetry(request, env, json);
+      } catch (err) {
+        return json({ error: err.message }, 500);
+      }
+    }
+
+    // 错误事件上报：自校验 TELEMETRY_SECRET，写 Workers Logs（不落 D1）。
+    if (url.pathname === "/telemetry/errors") {
+      if (request.method !== "POST") {
+        return new Response("not found", { status: 404 });
+      }
+      try {
+        return await handleTelemetryErrors(request, env, json);
       } catch (err) {
         return json({ error: err.message }, 500);
       }

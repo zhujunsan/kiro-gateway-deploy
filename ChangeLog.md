@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.3.13 (2026-07-13)
+
+**New**
+- 网关对话请求失败时自动把完整 debug 抓包（请求体、Kiro payload、响应流、`app_logs`、错误信息）分片上报到 Cloudflare Workers Logs，按 `incident_id` / `source` / `code` 可检索，无需再向用户索要日志目录。
+- Worker 新增 `POST /telemetry/errors`（复用 `TELEMETRY_SECRET`），每次 invocation 只写一条结构化日志；开启 Workers Logs（100% 采样，关闭 invocation logs）。
+- 错误分类：`kiro_upstream` / `network` / `client_request` / `gateway` / `cancelled`（客户端断开单独标记）。
+
+**Changed**
+- 同步上游网关至 `main-7f25d0f`：请求级 DebugSession（并发隔离）与错误快照回调。
+
 ## v0.3.12 (2026-07-09)
 
 **Changed**

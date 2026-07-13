@@ -270,6 +270,12 @@ def run_gateway_blocking() -> int:
     from . import telemetry
     app = telemetry.wrap_app(main.app)
 
+    # Register the error-incident uploader against vendor debug_logger's
+    # snapshot callback. Must run AFTER vendor import so kiro.debug_logger is
+    # importable. No-op when INCIDENT_URL is unset.
+    from . import incident_report
+    incident_report.install()
+
     # Also wrap the speed-test side-channel (adds /speedtest routes). Same
     # rationale: it lives here, not in vendor/, so vendor_sync can't clobber it.
     # No-op when SPEEDTEST_ENABLED=false.

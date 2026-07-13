@@ -196,6 +196,9 @@ def _inject_telemetry_env(cfg: AppCfg, env: dict[str, str]) -> None:
     endpoint_url still wins (escape hatch for testing/overrides). Telemetry stays
     dormant only when neither is set (gateway.py won't wrap the app).
 
+    Also injects ``INCIDENT_URL`` (same host + ``/telemetry/errors``) and
+    ``GATEWAY_UPSTREAM_SHA`` for the error-incident uploader.
+
     The anonymous username comes from provision._get_username(), which can raise
     when the Kiro token file is missing — that must never block gateway startup,
     so we degrade to "unknown" on any failure."""
@@ -213,6 +216,16 @@ def _inject_telemetry_env(cfg: AppCfg, env: dict[str, str]) -> None:
     env["TELEMETRY_FLUSH_INTERVAL"] = str(tel.flush_interval)
     env["TELEMETRY_MAX_RETENTION_DAYS"] = str(tel.max_retention_days)
     env["APP_VERSION"] = __version__
+    # Error-incident uploader (Workers Logs). Same auth secret as usage telemetry.
+    incident_url = endpoint_url.rstrip("/")
+    if incident_url.endswith("/telemetry"):
+        incident_url = incident_url[: -len("/telemetry")] + "/telemetry/errors"
+    else:
+        incident_url = incident_url + "/telemetry/errors"
+    env["INCIDENT_URL"] = incident_url
+    import importlib
+    _pkg = importlib.import_module(__package__ or "kiro_gateway_tray")
+    env["GATEWAY_UPSTREAM_SHA"] = getattr(_pkg, "UPSTREAM_SHA", "unknown")
     # Inputs for on-401 secret refresh (design §8): the refresh endpoint is
     # same-origin as /provision and authed with the activation code, both of
     # which are persisted in [cloudflare]. Absent either, the child simply

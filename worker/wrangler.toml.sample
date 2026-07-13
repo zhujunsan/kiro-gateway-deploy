@@ -21,7 +21,17 @@ database_id = "<wrangler d1 create 输出的 id>"
 [triggers]
 crons = ["7 * * * *"]
 
-# 可选：闲置隧道清理阈值（天）。设为正整数后 cron 自动清理超过该天数未连接的隧道。
+# Workers Logs：错误事件 (/telemetry/errors) 依赖此配置落盘。
+# head_sampling_rate=1 确保不分片丢失；关闭 invocation_logs 避免每个分片
+# 额外消耗一条 invocation log 与 256KB 预算。
+[observability]
+enabled = true
+head_sampling_rate = 1
+
+[observability.logs]
+invocation_logs = false
+
+# 可选：闲置隧道清理频率（天）。设为正整数后 cron 自动清理超过该天数未连接的隧道。
 # 未配置则不清理。可通过 wrangler secret put IDLE_CLEANUP_DAYS 设置，也可放在 [vars] 里。
 # [vars]
 # IDLE_CLEANUP_DAYS = "30"
