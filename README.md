@@ -84,11 +84,12 @@ Cursor 支持自定义 OpenAI 兼容的 API 地址，但有几个坑：
 | `kiro-o-4.8` | `claude-opus-4.8` |
 | `kiro-o-4.7` | `claude-opus-4.7` |
 | `kiro-o-4.6` | `claude-opus-4.6` |
-| `kiro-o-4.5` | `claude-opus-4.5` |
 | `kiro-s-4.6` | `claude-sonnet-4.6` |
-| `kiro-s-4.5` | `claude-sonnet-4.5` |
-| `kiro-s-4` | `claude-sonnet-4` |
 | `kiro-h-4.5` | `claude-haiku-4.5` |
+| `kiro-deepseek-3.2` | `deepseek-3.2` |
+| `kiro-glm-5` | `glm-5` |
+| `kiro-minimax-m2.5` | `minimax-m2.5` |
+| `kiro-qwen3-coder-next` | `qwen3-coder-next` |
 
 要修改别名，编辑 fork（[`zhujunsan/kiro-gateway`](https://github.com/zhujunsan/kiro-gateway)）`kiro/config.py` 里的 `MODEL_ALIASES`，推送后 CI 产出新镜像 tag。
 
