@@ -311,6 +311,42 @@ def test_middleware_ignores_health(tmp_path):
     assert store.snapshot().recent == []
 
 
+def test_collect_paths_includes_responses():
+    assert "/v1/chat/completions" in ra.COLLECT_PATHS
+    assert "/v1/messages" in ra.COLLECT_PATHS
+    assert "/v1/responses" in ra.COLLECT_PATHS
+
+
+def test_middleware_tracks_responses_path(tmp_path):
+    store = RequestActivityStore(tmp_path / "request_activity.json")
+    mw = RequestActivityMiddleware(None, store)
+    body = json.dumps({
+        "model": "kiro-s-4.6",
+        "messages": [{"role": "user", "content": "ping"}],
+    }).encode()
+    responses = [
+        {
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [(b"content-type", b"application/json")],
+        },
+        {
+            "type": "http.response.body",
+            "body": json.dumps({"output": [{"content": [{"text": "pong"}]}]}).encode(),
+            "more_body": False,
+        },
+    ]
+    _run(_drive_http(
+        mw, method="POST", path="/v1/responses", body=body, response_messages=responses,
+    ))
+    snap = store.snapshot()
+    assert snap.active == []
+    assert len(snap.recent) == 1
+    assert snap.recent[0].path == "/v1/responses"
+    assert snap.recent[0].model == "kiro-s-4.6"
+    assert snap.recent[0].ok is True
+
+
 def test_stale_active_filtered_on_load(tmp_path):
     path = tmp_path / "request_activity.json"
     path.write_text(json.dumps({

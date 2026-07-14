@@ -6,7 +6,8 @@ Lives beside (not inside) usage telemetry: same ASGI wrap pattern as
 text. The gateway child writes ``{data_dir}/request_activity.json``; the tray
 parent reads it on a short refresh loop.
 
-Tracks only ``POST /v1/chat/completions`` and ``POST /v1/messages``.
+Tracks only ``POST /v1/chat/completions``, ``POST /v1/messages``, and
+``POST /v1/responses``.
 """
 from __future__ import annotations
 
@@ -21,7 +22,11 @@ from typing import Any
 
 from .log import logger
 
-COLLECT_PATHS = frozenset({"/v1/chat/completions", "/v1/messages"})
+COLLECT_PATHS = frozenset({
+    "/v1/chat/completions",
+    "/v1/messages",
+    "/v1/responses",
+})
 
 RECENT_LIMIT = 10
 PREVIEW_CHARS = 72  # multi-line recent items can show a bit more than one tight row

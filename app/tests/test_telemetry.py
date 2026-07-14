@@ -224,6 +224,14 @@ def test_collect_closed_only_returns_expired():
     assert agg.collect_closed(now=1800) == []
 
 
+# --- collect paths ----------------------------------------------------------
+
+def test_collect_paths_includes_responses():
+    assert "/v1/chat/completions" in telemetry.COLLECT_PATHS
+    assert "/v1/messages" in telemetry.COLLECT_PATHS
+    assert "/v1/responses" in telemetry.COLLECT_PATHS
+
+
 # --- usage extraction -------------------------------------------------------
 
 def test_parse_usage_openai():
@@ -240,6 +248,25 @@ def test_parse_usage_anthropic_input_output():
     assert p == 30
     assert c == 7
     assert t == 37  # synthesised
+
+
+def test_parse_usage_responses_input_output():
+    """OpenAI Responses API uses input_tokens/output_tokens (same as Anthropic)."""
+    p, c, t = parse_usage({
+        "input_tokens": 42, "output_tokens": 9, "total_tokens": 51,
+    })
+    assert (p, c, t) == (42, 9, 51)
+
+
+def test_parse_usage_prefers_chat_fields_when_both_present():
+    p, c, t = parse_usage({
+        "prompt_tokens": 10,
+        "completion_tokens": 2,
+        "input_tokens": 999,
+        "output_tokens": 888,
+        "total_tokens": 12,
+    })
+    assert (p, c, t) == (10, 2, 12)
 
 
 def test_parse_usage_empty():
@@ -685,6 +712,35 @@ def test_middleware_model_fallback_unknown(tmp_path):
     # no usage -> counted as a request but not a success
     assert rows[0]["requests"] == 1
     assert rows[0]["successes"] == 0
+
+
+def test_middleware_collects_responses_path_with_input_output_usage(tmp_path):
+    """POST /v1/responses is collected; Responses usage fields map correctly."""
+    rep, _, _ = _reporter(tmp_path)
+    mw = TelemetryMiddleware(None, rep)
+    body = json.dumps({"model": "kiro-s-4.6", "input": "hi", "stream": False}).encode()
+    resp_json = json.dumps({
+        "id": "resp_x",
+        "usage": {"input_tokens": 15, "output_tokens": 4, "total_tokens": 19},
+    }).encode()
+    _run(_drive_http(
+        mw, method="POST", path="/v1/responses", body=body,
+        response_messages=[
+            {"type": "http.response.start", "status": 200,
+             "headers": [(b"content-type", b"application/json")]},
+            {"type": "http.response.body", "body": resp_json, "more_body": False},
+        ],
+        capture={},
+    ))
+    rows = rep.aggregator.drain_all()
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["model"] == "kiro-s-4.6"
+    assert r["requests"] == 1
+    assert r["successes"] == 1
+    assert r["prompt_tokens_sum"] == 15
+    assert r["completion_tokens_sum"] == 4
+    assert r["total_tokens_sum"] == 19
 
 
 # --- middleware: lifespan passthrough + flush -------------------------------

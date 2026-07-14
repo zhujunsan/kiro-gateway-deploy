@@ -22,8 +22,8 @@ Hard rules (see design 五):
   * Forward every response chunk verbatim with zero buffering (streaming-safe):
     we only keep a small rolling tail for SSE and a capped buffer for JSON to
     recover the final ``usage`` after the bytes have already been forwarded.
-  * Only ``POST /v1/chat/completions`` and ``POST /v1/messages`` are collected;
-    everything else passes straight through.
+  * Only ``POST /v1/chat/completions``, ``POST /v1/messages``, and
+    ``POST /v1/responses`` are collected; everything else passes straight through.
 """
 from __future__ import annotations
 
@@ -50,7 +50,11 @@ DEFAULT_MAX_RETENTION_DAYS = 30        # local spool retention (design 十)
 
 # Only conversation endpoints are collected, to avoid model=null noise rows
 # from /health, /usage, /v1/models, OPTIONS, etc. (design 五.1).
-COLLECT_PATHS = frozenset({"/v1/chat/completions", "/v1/messages"})
+COLLECT_PATHS = frozenset({
+    "/v1/chat/completions",
+    "/v1/messages",
+    "/v1/responses",
+})
 
 _SSE_TAIL_CAP = 65536        # bytes of trailing SSE kept to recover final usage
 _JSON_BODY_CAP = 2_000_000   # cap on buffered non-stream JSON body
@@ -1014,11 +1018,12 @@ def _usage_from_json(buf: bytes) -> dict[str, Any] | None:
 
 
 def parse_usage(usage: dict[str, Any] | None) -> tuple[int | None, int | None, int | None]:
-    """Normalise an OpenAI/Anthropic usage dict.
+    """Normalise a Chat Completions / Anthropic / Responses usage dict.
 
-    Returns ``(prompt, completion, total)``. Maps Anthropic
-    ``input_tokens``/``output_tokens`` onto the prompt/completion columns and
-    synthesises ``total`` when only the parts are present."""
+    Returns ``(prompt, completion, total)``. Accepts either OpenAI Chat
+    ``prompt_tokens``/``completion_tokens`` or Anthropic/Responses
+    ``input_tokens``/``output_tokens`` (mapped onto the prompt/completion
+    columns) and synthesises ``total`` when only the parts are present."""
     if not usage:
         return None, None, None
     prompt = usage.get("prompt_tokens")
