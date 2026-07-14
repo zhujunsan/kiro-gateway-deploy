@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.3.17 (2026-07-14)
+
+**Changed**
+- 同步上游网关至 `main-ff6ee87`：下线上游已不可用的 `minimax-m2.1` 及其 `kiro-minimax-m2.1` 别名（并加入 `HIDDEN_FROM_LIST`）。
+
 ## v0.3.16 (2026-07-14)
 
 **Changed**
