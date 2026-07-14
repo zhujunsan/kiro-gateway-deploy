@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.3.22 (2026-07-14)
+
+**Fixed**
+- 修复 Windows / Linux CI 测试失败：菜单打开期间 live-patch 断言未覆盖跨平台路径。
+
 ## v0.3.21 (2026-07-14)
 
 **New**

@@ -347,7 +347,17 @@ def test_supervisor_status_change_live_patches_while_menu_open(monkeypatch):
     app._menu_session_open = True
     patched = {"n": 0}
     redraws = {"n": 0}
-    monkeypatch.setattr(app, "_live_patch_status_titles", lambda nsmenu=None: patched.__setitem__("n", patched["n"] + 1))
+    # darwin uses AppKit title patch; Win/Linux use cross-platform in-place patch.
+    monkeypatch.setattr(
+        app,
+        "_live_patch_status_titles",
+        lambda nsmenu=None: patched.__setitem__("n", patched["n"] + 1),
+    )
+    monkeypatch.setattr(
+        app,
+        "_live_patch_open_menu_crossplatform",
+        lambda snap: patched.__setitem__("n", patched["n"] + 1),
+    )
     monkeypatch.setattr(app, "_request_redraw", lambda: redraws.__setitem__("n", redraws["n"] + 1))
     monkeypatch.setattr(macos_menu, "run_on_main_thread", lambda fn: fn())
 
@@ -373,6 +383,11 @@ def test_activity_update_while_menu_open_defers_and_patches(monkeypatch):
         app,
         "_live_patch_open_menu",
         lambda snap, nsmenu=None, force_rebuild=False: patches.__setitem__("n", patches["n"] + 1),
+    )
+    monkeypatch.setattr(
+        app,
+        "_live_patch_open_menu_crossplatform",
+        lambda snap: patches.__setitem__("n", patches["n"] + 1),
     )
 
     snap = ActivitySnapshot(active=[
