@@ -156,7 +156,7 @@ def _flatten_content(content: Any, *, skip_noise: bool = False) -> str:
             elif isinstance(block, dict):
                 if block.get("type") == "text" or "text" in block:
                     piece = str(block.get("text") or "")
-                elif block.get("type") == "input_text":
+                elif block.get("type") in ("input_text", "output_text"):
                     piece = str(block.get("text") or "")
             if not piece:
                 continue
@@ -183,8 +183,49 @@ def extract_model(body: bytes) -> str:
     return "unknown"
 
 
+def _last_user_text_from_messages(messages: list[Any]) -> str:
+    for msg in reversed(messages):
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") != "user":
+            continue
+        text = _flatten_content(msg.get("content"), skip_noise=True).strip()
+        if text:
+            return text
+    return ""
+
+
+def _question_from_responses_input(inp: Any) -> str:
+    """OpenAI Responses API ``input``: plain string or list of message items."""
+    if isinstance(inp, str):
+        return _extract_real_user_text(inp).strip()
+    if not isinstance(inp, list):
+        return ""
+    # Prefer last user-role message (same idea as chat ``messages``).
+    text = _last_user_text_from_messages(inp)
+    if text:
+        return text
+    # Fallback: scan reversed items for any user/input_text content.
+    for item in reversed(inp):
+        if isinstance(item, str):
+            piece = _extract_real_user_text(item).strip()
+            if piece:
+                return piece
+            continue
+        if not isinstance(item, dict):
+            continue
+        role = item.get("role")
+        if role and role != "user":
+            continue
+        content = item.get("content", item.get("text"))
+        piece = _flatten_content(content, skip_noise=True).strip()
+        if piece:
+            return piece
+    return ""
+
+
 def extract_question_preview(body: bytes, limit: int = PREVIEW_CHARS) -> str:
-    """Last user message from OpenAI/Anthropic-style ``messages``."""
+    """Last user text from ``messages`` or Responses ``input``."""
     if not body:
         return ""
     try:
@@ -194,16 +235,13 @@ def extract_question_preview(body: bytes, limit: int = PREVIEW_CHARS) -> str:
     if not isinstance(data, dict):
         return ""
     messages = data.get("messages")
-    if not isinstance(messages, list):
-        return ""
-    for msg in reversed(messages):
-        if not isinstance(msg, dict):
-            continue
-        if msg.get("role") != "user":
-            continue
-        text = _flatten_content(msg.get("content"), skip_noise=True).strip()
-        if not text:
-            continue
+    if isinstance(messages, list):
+        text = _last_user_text_from_messages(messages)
+        if text:
+            return truncate_preview(text, limit)
+    # OpenAI Responses API uses ``input`` instead of ``messages``.
+    text = _question_from_responses_input(data.get("input"))
+    if text:
         return truncate_preview(text, limit)
     return ""
 
@@ -234,6 +272,27 @@ def extract_answer_preview_from_json(buf: bytes, limit: int = PREVIEW_CHARS) -> 
     text = _flatten_content(content)
     if text:
         return truncate_preview(text, limit)
+    # OpenAI Responses API: output[] message items with output_text parts
+    output = data.get("output")
+    if isinstance(output, list):
+        parts: list[str] = []
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            # Skip non-message items (reasoning, function_call, …)
+            itype = item.get("type")
+            if itype and itype not in ("message", "output_text"):
+                continue
+            if itype == "output_text":
+                t = item.get("text")
+                if isinstance(t, str) and t:
+                    parts.append(t)
+                continue
+            piece = _flatten_content(item.get("content"))
+            if piece:
+                parts.append(piece)
+        if parts:
+            return truncate_preview("".join(parts), limit)
     return ""
 
 
@@ -319,6 +378,15 @@ def _sse_delta_text(obj: dict[str, Any]) -> str:
             t = block.get("text")
             if isinstance(t, str):
                 return t
+    # OpenAI Responses API streaming: top-level string delta
+    # e.g. {"type":"response.output_text.delta","delta":"你好"}
+    delta = obj.get("delta")
+    if isinstance(delta, str):
+        return delta
+    if isinstance(delta, dict):
+        t = delta.get("text") or delta.get("content")
+        if isinstance(t, str):
+            return t
     return ""
 
 

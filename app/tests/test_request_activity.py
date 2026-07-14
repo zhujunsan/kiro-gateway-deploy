@@ -92,6 +92,27 @@ def test_extract_question_openai_and_anthropic_blocks():
     assert extract_question_preview(anth_body).startswith("用一句话")
 
 
+def test_extract_question_responses_input():
+    as_str = json.dumps({
+        "model": "gpt-test",
+        "input": "Responses 用字符串当提问",
+    }).encode()
+    assert "字符串" in extract_question_preview(as_str)
+
+    as_list = json.dumps({
+        "model": "gpt-test",
+        "input": [
+            {"role": "user", "content": "第一轮"},
+            {"role": "assistant", "content": "答"},
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "请总结网关预览逻辑"}],
+            },
+        ],
+    }).encode()
+    assert "预览逻辑" in extract_question_preview(as_list)
+
+
 def test_extract_answer_json_openai_and_anthropic():
     openai = json.dumps({
         "choices": [{"message": {"role": "assistant", "content": "这是一段回复内容"}}],
@@ -102,6 +123,17 @@ def test_extract_answer_json_openai_and_anthropic():
         "content": [{"type": "text", "text": "Anthropic 风格回复"}],
     }).encode()
     assert "Anthropic" in extract_answer_preview_from_json(anth)
+
+
+def test_extract_answer_json_responses_output():
+    body = json.dumps({
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "Responses 非流式回复"}],
+        }],
+    }).encode()
+    assert "非流式" in extract_answer_preview_from_json(body)
 
 
 def test_feed_sse_openai_and_anthropic():
@@ -120,6 +152,16 @@ def test_feed_sse_openai_and_anthropic():
     ).encode()
     feed_sse_text(acc2, anth_chunk)
     assert "".join(acc2) == "流式"
+
+
+def test_feed_sse_responses_output_text_delta():
+    acc: list[str] = []
+    chunk = (
+        'data: {"type":"response.output_text.delta","delta":"你好"}\n\n'
+        'data: {"type":"response.output_text.delta","delta":"Responses"}\n\n'
+    ).encode()
+    feed_sse_text(acc, chunk)
+    assert "".join(acc) == "你好Responses"
 
 
 def test_format_duration_and_menu_lines():
@@ -322,7 +364,7 @@ def test_middleware_tracks_responses_path(tmp_path):
     mw = RequestActivityMiddleware(None, store)
     body = json.dumps({
         "model": "kiro-s-4.6",
-        "messages": [{"role": "user", "content": "ping"}],
+        "input": "ping",
     }).encode()
     responses = [
         {
@@ -332,7 +374,13 @@ def test_middleware_tracks_responses_path(tmp_path):
         },
         {
             "type": "http.response.body",
-            "body": json.dumps({"output": [{"content": [{"text": "pong"}]}]}).encode(),
+            "body": json.dumps({
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "pong"}],
+                }],
+            }).encode(),
             "more_body": False,
         },
     ]
@@ -345,6 +393,8 @@ def test_middleware_tracks_responses_path(tmp_path):
     assert snap.recent[0].path == "/v1/responses"
     assert snap.recent[0].model == "kiro-s-4.6"
     assert snap.recent[0].ok is True
+    assert "ping" in snap.recent[0].question_preview
+    assert "pong" in snap.recent[0].answer_preview
 
 
 def test_stale_active_filtered_on_load(tmp_path):
