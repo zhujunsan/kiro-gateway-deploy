@@ -136,7 +136,7 @@ def test_format_duration_and_menu_lines():
         question_preview="帮我改代码",
     )
     line = format_active_line(active, now=active.started_at + 12)
-    assert "流式中" in line
+    assert "生成中" in line
     assert "帮我改代码" in line
 
     recent = ra.RecentRequest(

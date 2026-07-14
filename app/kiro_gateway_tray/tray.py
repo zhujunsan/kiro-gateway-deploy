@@ -19,6 +19,7 @@ from . import (
     paths,
     platform_compat,
     request_activity,
+    tray_live,
     usage,
 )
 from .async_cache import AsyncRefreshCache
@@ -45,6 +46,8 @@ _STATUS_ZH = {
 # Prefixes used to find live-updatable NSMenuItems while the menu is open.
 _ACTIVITY_ACTIVE_PREFIX = "📡 进行中"
 _ACTIVITY_RECENT_TITLE = "💬 最近对话"
+_GATEWAY_PREFIX = "🖥 网关:"
+_TUNNEL_PREFIX = "🌐 隧道:"
 
 
 def _local_url(cfg) -> str:
@@ -175,6 +178,27 @@ class _ThrottleGate:
             self._busy = False
 
 
+class _FallbackLiveClickDelegate:
+    """Plain stand-in for ``macos_menu.make_live_click_delegate`` in unit tests."""
+
+    def __init__(self) -> None:
+        self._handlers: dict[int, Callable[[], None]] = {}
+
+    def clear(self) -> None:
+        self._handlers.clear()
+
+    def setHandler_forTag_(self, handler, tag) -> None:
+        if handler is None:
+            self._handlers.pop(int(tag), None)
+        else:
+            self._handlers[int(tag)] = handler
+
+    def activateLiveItem_(self, sender) -> None:
+        handler = self._handlers.get(int(sender.tag()))
+        if handler is not None:
+            handler()
+
+
 class _UsageCache:
     """Thread-safe cache for the /usage result, rendered by the menu line.
 
@@ -243,9 +267,15 @@ class TrayApp:
             on_update=self._on_activity_update,
         )
         self._activity_fingerprint: str | None = None
+        self._live_active_ids: tuple[str, ...] | None = None
+        self._live_recent_fp: str | None = None
+        self._live_active_click_delegate = None
+        self._live_recent_click_delegate = None
+        self._active_autorebuild_delegate = None
+        self._recent_autorebuild_delegate = None
         self._redraw_deferred = False
         self._menu_session_open = False
-        self.sup.on_status_change = self._request_redraw
+        self.sup.on_status_change = self._on_supervisor_status_change
 
         self._update_info = None
         self._update_gate = _ThrottleGate()
@@ -275,7 +305,10 @@ class TrayApp:
             # Structure changed under an open menu: refresh titles in place and
             # defer a full rebuild until menuDidClose.
             self._redraw_deferred = True
-            self._live_patch_open_menu(snap)
+            if sys.platform == "darwin":
+                self._live_patch_open_menu(snap)
+            else:
+                self._live_patch_open_menu_crossplatform(snap)
             return
         self._request_redraw()
 
@@ -311,8 +344,40 @@ class TrayApp:
         elapsed = request_activity.format_duration(time.time() - oldest.started_at)
         return f"{_ACTIVITY_ACTIVE_PREFIX} ({n})\t最长 {elapsed}"
 
-    def _live_patch_open_menu(self, snap: ActivitySnapshot, nsmenu=None) -> None:
-        """In-place title updates for an already-open status menu (macOS)."""
+    def _gateway_title(self) -> str:
+        s = self.sup.status()
+        return f"{_GATEWAY_PREFIX} 本地 Kiro Gateway\t{_STATUS_ZH.get(s['gateway'], s['gateway'])}"
+
+    def _tunnel_title(self) -> str:
+        s = self.sup.status()
+        return f"{_TUNNEL_PREFIX} Cloudflare Tunnel\t{_STATUS_ZH.get(s['tunnel'], s['tunnel'])}"
+
+    @staticmethod
+    def _recent_fingerprint_of(snap: ActivitySnapshot) -> str:
+        return repr(
+            tuple(
+                (r.id, r.ok, r.duration_ms, r.question_preview, r.answer_preview, r.error_preview)
+                for r in snap.recent
+            )
+        )
+
+    def _ensure_live_click_delegate(self, which: str):
+        attr = (
+            "_live_active_click_delegate"
+            if which == "active"
+            else "_live_recent_click_delegate"
+        )
+        delegate = getattr(self, attr)
+        if delegate is None:
+            delegate = macos_menu.make_live_click_delegate()
+            # Non-AppKit fallback for unit tests: a plain object with the same API.
+            if delegate is None:
+                delegate = _FallbackLiveClickDelegate()
+            setattr(self, attr, delegate)
+        return delegate
+
+    def _live_patch_status_titles(self, nsmenu=None) -> None:
+        """Refresh gateway/tunnel status labels without setMenu:."""
         if nsmenu is None:
             ic = self._icon
             handle = getattr(ic, "_menu_handle", None) if ic is not None else None
@@ -322,6 +387,171 @@ class TrayApp:
         if nsmenu is None:
             return
         try:
+            gw_item = macos_menu.find_menu_item_by_title_prefix(nsmenu, _GATEWAY_PREFIX)
+            if gw_item is not None:
+                macos_menu.apply_menu_item_title(gw_item, self._gateway_title())
+            tunnel_item = macos_menu.find_menu_item_by_title_prefix(nsmenu, _TUNNEL_PREFIX)
+            if tunnel_item is not None:
+                macos_menu.apply_menu_item_title(tunnel_item, self._tunnel_title())
+        except Exception:
+            logger.debug("live status title patch failed", exc_info=True)
+
+    def _rebuild_active_submenu(self, active_item, snap: ActivitySnapshot) -> None:
+        submenu = active_item.submenu() if active_item is not None else None
+        if submenu is None:
+            return
+        gw = self.sup.status()["gateway"]
+        if gw != "running":
+            label = _STATUS_ZH.get(gw, gw)
+            rows = [(f"网关未运行（{label}）", False, None)]
+        elif not snap.active:
+            rows = [("当前无进行中的请求", False, None)]
+        else:
+            now = time.time()
+            rows = []
+            for entry in snap.active:
+                detail = entry.question_preview or entry.model
+                handler = self._on_copy_activity_text(detail, "进行中请求")
+                # Live-click handlers are zero-arg; pystray handlers take (icon, item).
+                rows.append((
+                    request_activity.format_active_line(entry, now=now),
+                    True,
+                    lambda h=handler: h(self._icon, None),
+                ))
+        macos_menu.replace_submenu_rows(
+            submenu, rows, click_delegate=self._ensure_live_click_delegate("active")
+        )
+        self._live_active_ids = tuple(a.id for a in snap.active)
+
+    def _rebuild_recent_submenu(self, recent_item, snap: ActivitySnapshot) -> None:
+        submenu = recent_item.submenu() if recent_item is not None else None
+        if submenu is None:
+            return
+        if not snap.recent:
+            rows = [("暂无最近对话", False, None)]
+        else:
+            rows = []
+            for r in snap.recent:
+                detail = (
+                    f"问: {r.question_preview or '（无）'}\n"
+                    f"答: {r.answer_preview or '（无）'}"
+                    if r.ok
+                    else (
+                        f"问: {r.question_preview or '（无）'}\n"
+                        f"错误: {r.error_preview or '失败'}"
+                    )
+                )
+                handler = self._on_copy_activity_text(detail, "最近对话")
+                rows.append((
+                    request_activity.format_recent_line(r),
+                    True,
+                    lambda h=handler: h(self._icon, None),
+                ))
+        macos_menu.replace_submenu_rows(
+            submenu, rows, click_delegate=self._ensure_live_click_delegate("recent")
+        )
+        self._live_recent_fp = self._recent_fingerprint_of(snap)
+
+    def _resolve_status_menu(self, nsmenu=None):
+        if nsmenu is not None:
+            return nsmenu
+        ic = self._icon
+        handle = getattr(ic, "_menu_handle", None) if ic is not None else None
+        if not handle:
+            return None
+        return handle[0]
+
+    def _attach_submenu_autorebuild(self, nsmenu=None) -> None:
+        """Attach ``menuNeedsUpdate:`` delegates so dynamic submenus refill on
+        each expand.
+
+        AppKit re-renders a submenu that is refilled *before* it is displayed,
+        but not one edited while already open. Rebuilding on ``menuNeedsUpdate:``
+        guarantees every expand shows the current snapshot. Re-attached on each
+        root open because ``setMenu:`` (redraw) builds fresh NSMenu objects.
+        """
+        nsmenu = self._resolve_status_menu(nsmenu)
+        if nsmenu is None:
+            return
+        try:
+            active_item = macos_menu.find_menu_item_by_title_prefix(
+                nsmenu, _ACTIVITY_ACTIVE_PREFIX
+            )
+            if active_item is not None and active_item.submenu() is not None:
+                self._active_autorebuild_delegate = macos_menu.attach_submenu_autorebuild(
+                    active_item.submenu(),
+                    lambda _sub, it=active_item: self._rebuild_active_submenu(
+                        it, request_activity.load_snapshot()
+                    ),
+                )
+            recent_item = macos_menu.find_menu_item_by_exact_title(
+                nsmenu, _ACTIVITY_RECENT_TITLE
+            )
+            if recent_item is not None and recent_item.submenu() is not None:
+                self._recent_autorebuild_delegate = macos_menu.attach_submenu_autorebuild(
+                    recent_item.submenu(),
+                    lambda _sub, it=recent_item: self._rebuild_recent_submenu(
+                        it, request_activity.load_snapshot()
+                    ),
+                )
+        except Exception:
+            logger.debug("attach submenu autorebuild failed", exc_info=True)
+
+    def _inplace_patch_active_submenu(self, active_item, snap: ActivitySnapshot) -> None:
+        """Refresh visible active rows in place (works while the submenu is open).
+
+        Structural add/remove does not re-render an already-displayed submenu,
+        so we only ``setTitle:`` existing rows. When the request set went empty
+        we rewrite row 0 to the idle placeholder instead of leaving a stale
+        "生成中" line; ``menuNeedsUpdate:`` fixes the structure on the next expand.
+        """
+        submenu = active_item.submenu() if active_item is not None else None
+        if submenu is None:
+            return
+        try:
+            n = int(submenu.numberOfItems())
+        except Exception:
+            return
+        if n <= 0:
+            return
+        gw = self.sup.status()["gateway"]
+        if gw != "running":
+            first = submenu.itemAtIndex_(0)
+            if first is not None and not first.isSeparatorItem():
+                macos_menu.apply_menu_item_title(
+                    first, f"网关未运行（{_STATUS_ZH.get(gw, gw)}）"
+                )
+            return
+        if not snap.active:
+            first = submenu.itemAtIndex_(0)
+            if first is not None and not first.isSeparatorItem():
+                macos_menu.apply_menu_item_title(first, "当前无进行中的请求")
+            return
+        now = time.time()
+        for i, entry in enumerate(snap.active):
+            if i >= n:
+                break
+            row = submenu.itemAtIndex_(i)
+            if row is None or row.isSeparatorItem():
+                continue
+            macos_menu.apply_menu_item_title(
+                row, request_activity.format_active_line(entry, now=now)
+            )
+
+    def _live_patch_open_menu(self, snap: ActivitySnapshot, nsmenu=None, *, force_rebuild: bool = False) -> None:
+        """In-place updates for an already-open status menu (macOS).
+
+        Patches gateway/tunnel status titles and the "进行中" header/rows without
+        setMenu:. Submenu *structure* is refreshed by the ``menuNeedsUpdate:``
+        delegates on each expand; here we only touch titles so changes render
+        while a submenu is being displayed.
+        """
+        nsmenu = self._resolve_status_menu(nsmenu)
+        if nsmenu is None:
+            return
+        try:
+            self._live_patch_status_titles(nsmenu)
+
             active_item = macos_menu.find_menu_item_by_title_prefix(
                 nsmenu, _ACTIVITY_ACTIVE_PREFIX
             )
@@ -329,61 +559,145 @@ class TrayApp:
                 macos_menu.apply_menu_item_title(
                     active_item, self._activity_active_title(snap)
                 )
-                submenu = active_item.submenu()
-                if submenu is not None and snap.active:
-                    now = time.time()
-                    n = int(submenu.numberOfItems())
-                    for i, entry in enumerate(snap.active):
-                        if i >= n:
-                            break
-                        row = submenu.itemAtIndex_(i)
-                        if row is None or row.isSeparatorItem():
-                            continue
-                        macos_menu.apply_menu_item_title(
-                            row,
-                            request_activity.format_active_line(entry, now=now),
-                        )
+                if force_rebuild:
+                    self._rebuild_active_submenu(active_item, snap)
+                else:
+                    # Menu is open: structural add/remove won't re-render a
+                    # displayed submenu, so only patch titles in place (this
+                    # rewrites a finished row to the idle placeholder too). The
+                    # menuNeedsUpdate: delegate rebuilds structure on next expand.
+                    self._inplace_patch_active_submenu(active_item, snap)
+                    self._live_active_ids = tuple(a.id for a in snap.active)
+
             recent_item = macos_menu.find_menu_item_by_exact_title(
                 nsmenu, _ACTIVITY_RECENT_TITLE
             )
-            if recent_item is not None and snap.recent:
-                submenu = recent_item.submenu()
-                if submenu is not None:
-                    n = int(submenu.numberOfItems())
-                    for i, entry in enumerate(snap.recent):
-                        if i >= n:
-                            break
-                        row = submenu.itemAtIndex_(i)
-                        if row is None or row.isSeparatorItem():
-                            continue
-                        macos_menu.apply_menu_item_title(
-                            row, request_activity.format_recent_line(entry)
-                        )
+            if recent_item is not None:
+                recent_fp = self._recent_fingerprint_of(snap)
+                if force_rebuild:
+                    self._rebuild_recent_submenu(recent_item, snap)
+                else:
+                    # Recent rows only change when a request finishes; structure
+                    # is handled by menuNeedsUpdate: on the next expand. Track the
+                    # fingerprint so the post-close redraw stays consistent.
+                    self._live_recent_fp = recent_fp
         except Exception:
             logger.debug("live activity title patch failed", exc_info=True)
 
     def _on_status_menu_will_open(self, nsmenu) -> None:
         """Fresh snapshot + in-place titles at the moment the menu opens."""
         self._menu_session_open = True
+        # Forget live submenu membership so the open path always rebuilds from
+        # the latest snapshot (empty→items and stale placeholders included).
+        self._live_active_ids = None
+        self._live_recent_fp = None
         self._on_menu_open()
         try:
+            self._attach_submenu_autorebuild(nsmenu)
+            self._live_patch_status_titles(nsmenu)
             snap = request_activity.load_snapshot()
             self._set_activity_cache_value(snap)
             self._activity_fingerprint = self._activity_fingerprint_of(snap)
-            self._live_patch_open_menu(snap, nsmenu)
+            self._live_patch_open_menu(snap, nsmenu, force_rebuild=True)
         except Exception:
             logger.debug("status menu will-open refresh failed", exc_info=True)
 
     def _on_status_menu_did_close(self, _nsmenu) -> None:
         self._menu_session_open = False
+        self._live_active_ids = None
+        self._live_recent_fp = None
         if self._redraw_deferred:
             self._request_redraw()
+
+    def _refresh_activity_cache_quiet(self) -> None:
+        """Load the latest activity snapshot into the cache without on_update."""
+        try:
+            snap = request_activity.load_snapshot()
+            self._set_activity_cache_value(snap)
+            self._activity_fingerprint = self._activity_fingerprint_of(snap)
+        except Exception:
+            logger.debug("quiet activity cache refresh failed", exc_info=True)
+
+    def _on_non_macos_menu_will_open(self) -> None:
+        """Win/Linux: refresh caches and rebuild the menu before it pops up.
+
+        Unlike macOS, ``update_menu()`` is safe here — and required, because
+        pystray does not re-evaluate label callables on open. Setting
+        ``_menu_session_open`` also defers mid-popup redraws: Win32's
+        ``_update_menu`` ``DestroyMenu``s the tracked ``hmenu``, which is
+        unsafe during ``TrackPopupMenuEx``. While open, ``tray_live`` ticks
+        and patches titles in place instead.
+        """
+        if self._menu_session_open:
+            # Re-entrant (e.g. AppIndicator show → rebuild → show). Only
+            # refresh caches; do not rebuild again.
+            self._on_menu_open()
+            self._refresh_activity_cache_quiet()
+            return
+        self._menu_session_open = True
+        self._on_menu_open()
+        self._refresh_activity_cache_quiet()
+        tray_live.sync_rebuild_menu(self._icon)
+
+    def _on_non_macos_menu_did_close(self) -> None:
+        self._menu_session_open = False
+        if self._redraw_deferred:
+            self._request_redraw()
+
+    def _on_non_macos_menu_tick(self) -> None:
+        """1s tick while Win/Linux popup is open: in-place title refresh."""
+        if not self._menu_session_open or sys.platform == "darwin":
+            return
+        try:
+            snap = request_activity.load_snapshot()
+            self._set_activity_cache_value(snap)
+            fp = self._activity_fingerprint_of(snap)
+            if fp != self._activity_fingerprint:
+                self._activity_fingerprint = fp
+                self._redraw_deferred = True
+            self._live_patch_open_menu_crossplatform(snap)
+        except Exception:
+            logger.debug("non-macos menu live tick failed", exc_info=True)
+
+    def _live_patch_open_menu_crossplatform(self, snap: ActivitySnapshot) -> None:
+        """In-place Win/Linux title updates (no DestroyMenu / set_menu)."""
+        gw = self.sup.status()["gateway"]
+        if gw != "running":
+            active_rows = [f"网关未运行（{_STATUS_ZH.get(gw, gw)}）"]
+        elif not snap.active:
+            active_rows = ["当前无进行中的请求"]
+        else:
+            now = time.time()
+            active_rows = [
+                request_activity.format_active_line(a, now=now) for a in snap.active
+            ]
+
+        if not snap.recent:
+            recent_rows = ["暂无最近对话"]
+        else:
+            recent_rows = [request_activity.format_recent_line(r) for r in snap.recent]
+
+        tray_live.apply_live_titles(
+            self._icon,
+            top_level_prefixes=[
+                (_GATEWAY_PREFIX, self._gateway_title()),
+                (_TUNNEL_PREFIX, self._tunnel_title()),
+                (_ACTIVITY_ACTIVE_PREFIX, self._activity_active_title(snap)),
+            ],
+            submenu_by_parent_prefix={
+                _ACTIVITY_ACTIVE_PREFIX: active_rows,
+            },
+            submenu_by_parent_exact={
+                _ACTIVITY_RECENT_TITLE: recent_rows,
+            },
+        )
 
     def _on_status_menu_tick(self) -> None:
         """1s tick while menu is open: refresh elapsed titles without setMenu:."""
         if not self._menu_session_open:
             return
         try:
+            self._live_patch_status_titles()
             snap = request_activity.load_snapshot()
             self._set_activity_cache_value(snap)
             fp = self._activity_fingerprint_of(snap)
@@ -393,6 +707,22 @@ class TrayApp:
             self._live_patch_open_menu(snap)
         except Exception:
             logger.debug("status menu live tick failed", exc_info=True)
+
+    def _on_supervisor_status_change(self) -> None:
+        """Keep gateway/tunnel labels live even while the status menu is open."""
+        if self._menu_session_open or macos_menu.is_status_menu_open(self._icon):
+            self._redraw_deferred = True
+
+            def _patch():
+                if sys.platform == "darwin":
+                    self._live_patch_status_titles()
+                else:
+                    snap = self._activity_snapshot()
+                    self._live_patch_open_menu_crossplatform(snap)
+
+            macos_menu.run_on_main_thread(_patch)
+            return
+        self._request_redraw()
 
     # --- redraw / notify helpers ---
 
@@ -569,12 +899,10 @@ class TrayApp:
 
     def _gateway_line(self, _item):
         self._on_menu_open()
-        s = self.sup.status()
-        return f"🖥 网关: 本地 Kiro Gateway\t{_STATUS_ZH.get(s['gateway'], s['gateway'])}"
+        return self._gateway_title()
 
     def _tunnel_line(self, _item):
-        s = self.sup.status()
-        return f"🌐 隧道: Cloudflare Tunnel\t{_STATUS_ZH.get(s['tunnel'], s['tunnel'])}"
+        return self._tunnel_title()
 
     def _usage_line(self, _item):
         gw = self.sup.status()["gateway"]
@@ -905,7 +1233,14 @@ class TrayApp:
             on_tick=self._on_status_menu_tick,
             tick_interval=1.0,
         )
+        tray_live.install_open_refresh(
+            on_will_open=self._on_non_macos_menu_will_open,
+            on_did_close=self._on_non_macos_menu_did_close,
+            on_tick=self._on_non_macos_menu_tick,
+            tick_interval=1.0,
+        )
         macos_menu.install_reopen_handler(self._icon, self._on_app_reopen)
+        self._attach_submenu_autorebuild()
         threading.Thread(target=_startup, daemon=True).start()
         self._kick_update_check()
         self._start_usage_refresh_loop()

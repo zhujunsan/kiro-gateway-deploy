@@ -184,6 +184,201 @@ def apply_menu_item_title(item, title: str) -> None:
             pass
 
 
+def attach_submenu_autorebuild(submenu, rebuild_cb) -> Any:
+    """Attach an ``NSMenuDelegate`` that refills ``submenu`` on each expand.
+
+    AppKit calls ``menuNeedsUpdate:`` right before a submenu is displayed. That
+    is the reliable hook to rebuild dynamic rows: structural edits made while a
+    submenu is *already* displayed do not re-render, but a fresh
+    ``menuNeedsUpdate:`` rebuild before each expand always shows current data.
+
+    Returns the delegate (kept alive by the caller) or None off macOS.
+    """
+    if submenu is None:
+        return None
+    if sys.platform != "darwin":
+        # Tests: invoke immediately so non-AppKit doubles still get filled.
+        try:
+            rebuild_cb(submenu)
+        except Exception:
+            pass
+        return None
+    try:
+        import AppKit
+        import objc
+    except Exception:
+        return None
+
+    class _SubmenuAutoRebuild(AppKit.NSObject):
+        def init(self):
+            self = objc.super(_SubmenuAutoRebuild, self).init()
+            if self is None:
+                return None
+            self._cb = None
+            return self
+
+        def setCallback_(self, cb):
+            self._cb = cb
+
+        def menuNeedsUpdate_(self, menu):
+            if self._cb is None:
+                return
+            try:
+                self._cb(menu)
+            except Exception:
+                pass
+
+    try:
+        delegate = _SubmenuAutoRebuild.alloc().init()
+        delegate.setCallback_(rebuild_cb)
+        submenu.setDelegate_(delegate)
+        return delegate
+    except Exception:
+        return None
+
+
+def make_live_click_delegate():
+    """Return an NSObject that routes live-rebuilt submenu clicks, or None.
+
+    pystray's callback list is frozen at ``update_menu`` time. Submenus rebuilt
+    while the status menu is open must use a separate target/action pair so
+    clicks (e.g. copy recent conversation) still work.
+    """
+    if sys.platform != "darwin":
+        return None
+    try:
+        import AppKit
+        import objc
+    except Exception:
+        return None
+
+    class _LiveClickDelegate(AppKit.NSObject):
+        def init(self):
+            self = objc.super(_LiveClickDelegate, self).init()
+            if self is None:
+                return None
+            self._handlers: dict[int, Callable[[], None]] = {}
+            return self
+
+        def clear(self) -> None:
+            self._handlers.clear()
+
+        def setHandler_forTag_(self, handler, tag) -> None:
+            if handler is None:
+                self._handlers.pop(int(tag), None)
+            else:
+                self._handlers[int(tag)] = handler
+
+        def activateLiveItem_(self, sender) -> None:
+            handler = self._handlers.get(int(sender.tag()))
+            if handler is None:
+                return
+            try:
+                handler()
+            except Exception:
+                pass
+
+    try:
+        return _LiveClickDelegate.alloc().init()
+    except Exception:
+        return None
+
+
+def replace_submenu_rows(submenu, rows, click_delegate=None) -> None:
+    """Replace all items in ``submenu`` in place (safe while the menu is open).
+
+    ``rows`` is an iterable of ``(title, enabled, on_click_or_None)``.
+    Clickable rows require a ``click_delegate`` from ``make_live_click_delegate``.
+
+    Works with real ``NSMenu`` and with test doubles that expose
+    ``removeAllItems`` / ``addItem_``.
+    """
+    if submenu is None:
+        return
+    try:
+        submenu.removeAllItems()
+    except Exception:
+        return
+    if click_delegate is not None:
+        try:
+            click_delegate.clear()
+        except Exception:
+            pass
+
+    appkit = None
+    if sys.platform == "darwin":
+        try:
+            import AppKit as appkit
+        except Exception:
+            appkit = None
+
+    for i, (title, enabled, on_click) in enumerate(rows):
+        try:
+            if appkit is not None:
+                item = appkit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                    title or "", None, ""
+                )
+            else:
+                item = _StubMenuItem(title or "", enabled=bool(enabled))
+            item.setEnabled_(bool(enabled))
+            if on_click is not None and click_delegate is not None:
+                try:
+                    item.setTarget_(click_delegate)
+                    item.setAction_(b"activateLiveItem:")
+                    item.setTag_(i)
+                except Exception:
+                    pass
+                click_delegate.setHandler_forTag_(on_click, i)
+            apply_menu_item_title(item, title or "")
+            submenu.addItem_(item)
+        except Exception:
+            continue
+
+
+class _StubMenuItem:
+    """Minimal menu-item stand-in for non-AppKit unit tests."""
+
+    def __init__(self, title: str, *, enabled: bool = True):
+        self._title = title
+        self._enabled = enabled
+        self._target = None
+        self._action = None
+        self._tag = 0
+
+    def title(self):
+        return self._title
+
+    def setTitle_(self, title):
+        self._title = title
+
+    def setAttributedTitle_(self, _attr):
+        pass
+
+    def isSeparatorItem(self):
+        return False
+
+    def isEnabled(self):
+        return self._enabled
+
+    def setEnabled_(self, enabled):
+        self._enabled = bool(enabled)
+
+    def setTarget_(self, target):
+        self._target = target
+
+    def setAction_(self, action):
+        self._action = action
+
+    def setTag_(self, tag):
+        self._tag = int(tag)
+
+    def tag(self):
+        return self._tag
+
+    def submenu(self):
+        return None
+
+
 def _apply_multiline_attributed_title(item, title: str, AppKit, Foundation) -> None:
     """Render an explicit multi-line menu title via attributed string.
 

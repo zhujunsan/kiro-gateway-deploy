@@ -11,6 +11,7 @@ Tracks only ``POST /v1/chat/completions`` and ``POST /v1/messages``.
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 import uuid
@@ -31,6 +32,27 @@ _NOISE_PREFIXES = (
     "<system_reminder",
     "<user-context",
 )
+# Cursor/Claude Code wrap the *actual* prompt in a <user_query> tag, preceded
+# by large injected-context blocks (open files, attachments, timestamp, ...).
+# Those wrapper blocks live in the SAME text block as the real query rather
+# than as a separate message part, so a simple startswith() check on the
+# whole block misses them. Prefer whatever is inside the last <user_query>
+# tag; otherwise strip known noise blocks from anywhere in the text.
+_USER_QUERY_RE = re.compile(r"<user_query>(.*?)</user_query>", re.DOTALL | re.IGNORECASE)
+_NOISE_BLOCK_TAGS = (
+    "system-reminder",
+    "system_reminder",
+    "user-context",
+    "open_and_recently_viewed_files",
+    "image_files",
+    "attached_files",
+    "attachment",
+    "timestamp",
+)
+_NOISE_BLOCK_RE = re.compile(
+    r"<(" + "|".join(_NOISE_BLOCK_TAGS) + r")\b[^>]*>.*?</\1>",
+    re.DOTALL | re.IGNORECASE,
+)
 _REQ_BODY_CAP = 4_000_000
 _STALE_ACTIVE_SECONDS = 600  # drop orphaned in-flight rows after 10 minutes
 _ACTIVITY_FILENAME = "request_activity.json"
@@ -40,9 +62,9 @@ _PHASE_STREAMING = "streaming"
 _PHASE_RESPONDING = "responding"
 
 _PHASE_ZH = {
-    _PHASE_WAITING: "等待首包",
-    _PHASE_STREAMING: "流式中",
-    _PHASE_RESPONDING: "响应中",
+    _PHASE_WAITING: "等待响应",
+    _PHASE_STREAMING: "生成中",
+    _PHASE_RESPONDING: "生成中",
 }
 
 
@@ -98,10 +120,27 @@ def _is_injected_noise(text: str) -> bool:
     return any(t.startswith(p) for p in _NOISE_PREFIXES)
 
 
+def _extract_real_user_text(text: str) -> str:
+    """Pull the actual user prompt out of IDE-injected wrapper text.
+
+    Prefers the content of the last ``<user_query>`` tag (Cursor/Claude Code
+    append it after big open-files/attachment/timestamp blocks). Falls back
+    to stripping known noise blocks from anywhere in the text.
+    """
+    if not text:
+        return ""
+    matches = list(_USER_QUERY_RE.finditer(text))
+    if matches:
+        return matches[-1].group(1).strip()
+    if _is_injected_noise(text):
+        return ""
+    return _NOISE_BLOCK_RE.sub("", text).strip()
+
+
 def _flatten_content(content: Any, *, skip_noise: bool = False) -> str:
     if isinstance(content, str):
-        if skip_noise and _is_injected_noise(content):
-            return ""
+        if skip_noise:
+            return _extract_real_user_text(content)
         return content
     if isinstance(content, list):
         parts: list[str] = []
@@ -116,7 +155,9 @@ def _flatten_content(content: Any, *, skip_noise: bool = False) -> str:
                     piece = str(block.get("text") or "")
             if not piece:
                 continue
-            if skip_noise and _is_injected_noise(piece):
+            if skip_noise:
+                piece = _extract_real_user_text(piece)
+            if not piece:
                 continue
             parts.append(piece)
         return "".join(parts)

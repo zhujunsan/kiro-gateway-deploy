@@ -101,7 +101,7 @@ def test_activity_submenus_render_rows(monkeypatch):
 
     active_items = app._activity_active_submenu()
     assert len(active_items) == 1
-    assert "等待首包" in active_items[0].text
+    assert "等待响应" in active_items[0].text
 
     recent_items = app._activity_recent_submenu()
     assert len(recent_items) == 1
@@ -201,7 +201,10 @@ def test_status_menu_will_open_patches_without_update_menu(monkeypatch, tmp_path
     from kiro_gateway_tray import macos_menu
 
     app = _make_app()
-    monkeypatch.setattr(app.sup, "status", lambda: {"gateway": "running"})
+    monkeypatch.setattr(app.sup, "status", lambda: {
+        "gateway": "running",
+        "tunnel": "connecting",
+    })
     monkeypatch.setattr(app, "_on_menu_open", lambda: None)
     redraws = {"n": 0}
     monkeypatch.setattr(app, "_request_redraw", lambda: redraws.__setitem__("n", redraws["n"] + 1))
@@ -210,6 +213,11 @@ def test_status_menu_will_open_patches_without_update_menu(monkeypatch, tmp_path
     store = ra.RequestActivityStore(path)
     rid = store.begin(model="m", path="/v1/messages", question_preview="live?")
     store.set_phase(rid, "streaming")
+    store.finish(
+        store.begin(model="m", path="/v1/messages", question_preview="old q"),
+        ok=True,
+        answer_preview="old a",
+    )
 
     orig_load = ra.load_snapshot
     monkeypatch.setattr(
@@ -221,6 +229,7 @@ def test_status_menu_will_open_patches_without_update_menu(monkeypatch, tmp_path
         def __init__(self, title, submenu=None):
             self._title = title
             self._submenu = submenu
+            self._enabled = True
 
         def title(self):
             return self._title
@@ -237,15 +246,36 @@ def test_status_menu_will_open_patches_without_update_menu(monkeypatch, tmp_path
         def setAttributedTitle_(self, _attr):
             pass
 
+        def setEnabled_(self, enabled):
+            self._enabled = bool(enabled)
+
+        def isEnabled(self):
+            return self._enabled
+
+        def setTarget_(self, _t):
+            pass
+
+        def setAction_(self, _a):
+            pass
+
+        def setTag_(self, _tag):
+            pass
+
     class _Sub:
         def __init__(self, items):
-            self._items = items
+            self._items = list(items)
 
         def numberOfItems(self):
             return len(self._items)
 
         def itemAtIndex_(self, i):
             return self._items[i]
+
+        def removeAllItems(self):
+            self._items.clear()
+
+        def addItem_(self, item):
+            self._items.append(item)
 
     class _Root:
         def __init__(self, items):
@@ -257,14 +287,20 @@ def test_status_menu_will_open_patches_without_update_menu(monkeypatch, tmp_path
         def itemAtIndex_(self, i):
             return self._items[i]
 
-    row = _Item("等待首包 · 0.0s · m\thello")
-    sub = _Sub([row])
-    active = _Item("📡 进行中\t空闲", submenu=sub)
-    recent = _Item("💬 最近对话", submenu=_Sub([]))
-    root = _Root([active, recent])
+    active_sub = _Sub([_Item("当前无进行中的请求")])
+    recent_sub = _Sub([_Item("暂无最近对话")])
+    gateway = _Item("🖥 网关: 本地 Kiro Gateway\t启动中")
+    tunnel = _Item("🌐 隧道: Cloudflare Tunnel\t已停止")
+    active = _Item("📡 进行中\t空闲", submenu=active_sub)
+    recent = _Item("💬 最近对话", submenu=recent_sub)
+    root = _Root([gateway, tunnel, active, recent])
+
+    for sub in (active_sub, recent_sub):
+        sub.setDelegate_ = lambda _d: None
 
     # Bypass AppKit attributed path in tests
     monkeypatch.setattr(macos_menu, "apply_menu_item_title", lambda item, title: item.setTitle_(title))
+    monkeypatch.setattr(macos_menu, "make_live_click_delegate", lambda: None)
     monkeypatch.setattr(
         macos_menu,
         "find_menu_item_by_title_prefix",
@@ -286,9 +322,16 @@ def test_status_menu_will_open_patches_without_update_menu(monkeypatch, tmp_path
 
     app._on_status_menu_will_open(root)
     assert app._menu_session_open is True
+    assert gateway._title.endswith("运行中")
+    assert tunnel._title.endswith("连接中")
     assert "进行中 (1)" in active._title
     assert "最长" in active._title
-    assert "流式中" in row._title
+    assert active_sub.numberOfItems() == 1
+    assert "生成中" in active_sub.itemAtIndex_(0).title()
+    assert recent_sub.numberOfItems() == 1
+    recent_title = recent_sub.itemAtIndex_(0).title()
+    assert "old q" in recent_title
+    assert "old a" in recent_title
     assert redraws["n"] == 0
 
     app._redraw_deferred = True
@@ -297,14 +340,40 @@ def test_status_menu_will_open_patches_without_update_menu(monkeypatch, tmp_path
     assert redraws["n"] == 1
 
 
+def test_supervisor_status_change_live_patches_while_menu_open(monkeypatch):
+    from kiro_gateway_tray import macos_menu
+
+    app = _make_app()
+    app._menu_session_open = True
+    patched = {"n": 0}
+    redraws = {"n": 0}
+    monkeypatch.setattr(app, "_live_patch_status_titles", lambda nsmenu=None: patched.__setitem__("n", patched["n"] + 1))
+    monkeypatch.setattr(app, "_request_redraw", lambda: redraws.__setitem__("n", redraws["n"] + 1))
+    monkeypatch.setattr(macos_menu, "run_on_main_thread", lambda fn: fn())
+
+    app._on_supervisor_status_change()
+    assert patched["n"] == 1
+    assert redraws["n"] == 0
+    assert app._redraw_deferred is True
+
+    app._menu_session_open = False
+    monkeypatch.setattr(macos_menu, "is_status_menu_open", lambda _ic: False)
+    app._on_supervisor_status_change()
+    assert redraws["n"] == 1
+
+
 def test_activity_update_while_menu_open_defers_and_patches(monkeypatch):
     app = _make_app()
-    monkeypatch.setattr(app.sup, "status", lambda: {"gateway": "running"})
+    monkeypatch.setattr(app.sup, "status", lambda: {"gateway": "running", "tunnel": "running"})
     app._menu_session_open = True
     redraws = {"n": 0}
     patches = {"n": 0}
     monkeypatch.setattr(app, "_request_redraw", lambda: redraws.__setitem__("n", redraws["n"] + 1))
-    monkeypatch.setattr(app, "_live_patch_open_menu", lambda snap, nsmenu=None: patches.__setitem__("n", patches["n"] + 1))
+    monkeypatch.setattr(
+        app,
+        "_live_patch_open_menu",
+        lambda snap, nsmenu=None, force_rebuild=False: patches.__setitem__("n", patches["n"] + 1),
+    )
 
     snap = ActivitySnapshot(active=[
         ActiveRequest(
