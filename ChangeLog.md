@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.3.15 (2026-07-14)
+
+**Fixed**
+- 修复 macOS 27 测试版上托盘启动约 2–3 秒后 SIGTRAP 闪退：后台线程直接调用 `NSStatusItem.setMenu:` / 设置菜单栏图标，触发 AppKit 主队列断言。启动、重启、停止、自启切换与图标刷新现统一经 `run_on_main_thread` 走主线程。
+
 ## v0.3.14 (2026-07-13)
 
 **Changed**

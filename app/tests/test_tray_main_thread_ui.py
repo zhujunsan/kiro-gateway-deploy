@@ -1,0 +1,103 @@
+# app/tests/test_tray_main_thread_ui.py
+"""AppKit menu-bar updates must be marshaled onto the main thread.
+
+On macOS 27+, ``NSStatusItem.setMenu:`` asserts the main-queue barrier. Calling
+it from a pystray/worker thread hard-crashes with SIGTRAP and no Python
+traceback (seen 2026-07-14 on 26A5378n). These tests pin that every UI refresh
+path goes through ``macos_menu.run_on_main_thread``.
+"""
+from __future__ import annotations
+
+import sys
+import types
+from unittest.mock import MagicMock
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _stub_pystray(monkeypatch):
+    if "pystray" not in sys.modules:
+        monkeypatch.setitem(sys.modules, "pystray", types.ModuleType("pystray"))
+
+
+def _make_app(monkeypatch):
+    from kiro_gateway_tray import macos_menu, tray as tray_mod
+
+    app = tray_mod.TrayApp()
+    icon = MagicMock()
+    app._icon = icon
+
+    marshaled = []
+
+    def _capture(fn):
+        marshaled.append(fn)
+        fn()
+
+    monkeypatch.setattr(macos_menu, "run_on_main_thread", _capture)
+    monkeypatch.setattr(tray_mod, "make_icon", lambda _running: "fake-icon")
+    monkeypatch.setattr(app.sup, "status", lambda: {"gateway": "running"})
+    return app, icon, marshaled
+
+
+def test_request_redraw_marshals_update_menu(monkeypatch):
+    app, icon, marshaled = _make_app(monkeypatch)
+    app._request_redraw()
+    assert len(marshaled) == 1
+    icon.update_menu.assert_called_once_with()
+
+
+def test_refresh_icon_marshals_set_icon(monkeypatch):
+    app, icon, marshaled = _make_app(monkeypatch)
+    app._refresh_icon()
+    assert len(marshaled) == 1
+    assert icon.icon == "fake-icon"
+
+
+def test_start_or_restart_worker_does_not_call_update_menu_directly(monkeypatch):
+    """Regression: daemon thread used to call icon.update_menu() → SIGTRAP on macOS 27."""
+    import threading
+
+    from kiro_gateway_tray import tray as tray_mod
+
+    app, icon, marshaled = _make_app(monkeypatch)
+    done = threading.Event()
+
+    monkeypatch.setattr(app.sup, "status", lambda: {"gateway": "stopped"})
+    monkeypatch.setattr(app.sup, "start", lambda: None)
+    monkeypatch.setattr(app, "_notify", lambda *_a, **_k: None)
+    monkeypatch.setattr(tray_mod.appconfig, "load", lambda: MagicMock(
+        cloudflare=MagicMock(hostname="x.example"),
+    ))
+    monkeypatch.setattr(tray_mod, "_tunnel_url", lambda _cfg: "https://x.example")
+
+    orig_redraw = app._request_redraw
+
+    def _redraw_and_signal():
+        orig_redraw()
+        done.set()
+
+    monkeypatch.setattr(app, "_request_redraw", _redraw_and_signal)
+
+    app._on_start_or_restart(icon, None)
+    assert done.wait(timeout=2.0)
+
+    assert icon.update_menu.call_count == 1  # only via _request_redraw → marshal
+    assert len(marshaled) >= 2  # _refresh_icon + _request_redraw
+    assert icon.icon == "fake-icon"
+
+
+def test_source_has_no_bare_update_menu_outside_request_redraw():
+    """Static guard: worker paths must not call ``*.update_menu()`` directly."""
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parents[1] / "kiro_gateway_tray" / "tray.py"
+    text = src.read_text(encoding="utf-8")
+    bare = []
+    for line in text.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith("#"):
+            continue
+        if ".update_menu()" in line:
+            bare.append(line)
+    assert bare == ["                ic.update_menu()"], bare

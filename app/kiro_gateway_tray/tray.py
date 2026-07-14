@@ -230,6 +230,12 @@ class TrayApp:
     # --- redraw / notify helpers ---
 
     def _request_redraw(self) -> None:
+        """Rebuild the tray NSMenu on the AppKit main thread.
+
+        pystray's macOS backend ends in ``NSStatusItem.setMenu:``. On macOS 27+
+        that path asserts the main-queue barrier; calling it from a worker
+        thread hard-crashes with SIGTRAP and no Python traceback.
+        """
         ic = self._icon
         if ic is None:
             return
@@ -246,20 +252,31 @@ class TrayApp:
         _notify_mod.notify(self._icon, title, msg)
 
     def _refresh_icon(self) -> None:
-        try:
-            self._icon.icon = make_icon(self.sup.status()["gateway"] == "running")
-        except Exception:
-            logger.debug("_refresh_icon failed", exc_info=True)
+        """Update the menu-bar glyph on the AppKit main thread.
+
+        Setting ``icon.icon`` touches ``NSStatusItem.button().setImage_`` on
+        macOS; same main-thread rule as ``update_menu``. Off macOS,
+        ``run_on_main_thread`` runs inline, so Windows ThemeWatcher is fine.
+        """
+        ic = self._icon
+        if ic is None:
+            return
+
+        def _do():
+            try:
+                ic.icon = make_icon(self.sup.status()["gateway"] == "running")
+            except Exception:
+                logger.debug("_refresh_icon failed", exc_info=True)
+
+        macos_menu.run_on_main_thread(_do)
 
     def _on_theme_change(self, light_theme: bool) -> None:
         """Windows taskbar theme changed: re-render the icon for the new theme.
 
-        Called from the ThemeWatcher daemon thread. pystray on Windows allows
-        setting ``icon.icon`` from any thread, so we refresh directly — we must
-        NOT route through ``macos_menu.run_on_main_thread`` here (that helper is
-        macOS-specific and there is no Windows main-thread requirement). The
-        ``light_theme`` argument is informational; ``_refresh_icon`` re-detects
-        via ``make_icon`` auto-detect, keeping a single rendering path.
+        Called from the ThemeWatcher daemon thread. ``_refresh_icon`` marshals
+        to the main thread on macOS and runs inline elsewhere, so this is safe
+        on every platform. ``light_theme`` is informational; ``_refresh_icon``
+        re-detects via ``make_icon`` auto-detect, keeping a single path.
         """
         self._refresh_icon()
 
@@ -280,15 +297,16 @@ class TrayApp:
                 self._notify(APP_NAME, f"{verb}\n{_tunnel_url(cfg)}")
             except Exception as e:
                 self._notify(f"{APP_NAME} 错误", str(e)[:200])
+            # Never call icon.update_menu() here — worker thread; see _request_redraw.
             self._refresh_icon()
-            icon.update_menu()
+            self._request_redraw()
         threading.Thread(target=_work, daemon=True).start()
 
     def _on_stop(self, icon, _item):
         self.sup.stop()
         self._notify(APP_NAME, "网关已停止")
         self._refresh_icon()
-        icon.update_menu()
+        self._request_redraw()
 
     def _copy(self, value: str, label: str) -> None:
         try:
@@ -349,7 +367,7 @@ class TrayApp:
         except Exception as e:
             logger.exception("toggle autostart failed")
             self._notify(f"{APP_NAME} 错误", f"设置开机自启失败：{str(e)[:160]}")
-            icon.update_menu()
+            self._request_redraw()
             return
         if want:
             extra = ""
@@ -358,7 +376,7 @@ class TrayApp:
             self._notify(APP_NAME, f"已开启开机自启，下次登录将自动启动。{extra}")
         else:
             self._notify(APP_NAME, "已关闭开机自启。")
-        icon.update_menu()
+        self._request_redraw()
 
     def _on_copy_model(self, model_id):
         def _handler(_icon, _item):
@@ -598,8 +616,10 @@ class TrayApp:
                 print(f"[kiro-gateway-tray startup error] {e}", file=sys.stderr)
                 logger.exception("supervisor start failed")
                 self._notify(f"{APP_NAME} 错误", str(e)[:200])
+            # _startup runs on a daemon thread; AppKit setMenu:/setImage_ must
+            # hit the main queue (macOS 27 asserts otherwise → SIGTRAP flash-quit).
             self._refresh_icon()
-            self._icon.update_menu()
+            self._request_redraw()
             self._models_cache.refresh(force=True)
 
         self.sup.mark_starting()
