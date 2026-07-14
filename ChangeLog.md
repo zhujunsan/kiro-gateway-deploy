@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.3.16 (2026-07-14)
+
+**Changed**
+- 同步上游网关至 `main-0ad6313`：下线上游已不可用的 `claude-opus-4.5` / `claude-sonnet-4` / `claude-sonnet-4.5` 及其 `kiro-o-4.5` / `kiro-s-4` / `kiro-s-4.5` 别名（并加入 `HIDDEN_FROM_LIST`，避免 ListAvailableModels 仍返回时出现在 `/v1/models`）。
+- 合入上游高优修复：Anthropic `messages[].role=system` 接受并合并进 system prompt（Claude Code 不再 422）；`ToolReferenceContentBlock` 前向引用 `model_rebuild`；`output_config.effort` 自适应 thinking（Opus 4.8）；多分片 dict `tool_input` 改为合并而非字符串拼接。
+
 ## v0.3.15 (2026-07-14)
 
 **Fixed**
