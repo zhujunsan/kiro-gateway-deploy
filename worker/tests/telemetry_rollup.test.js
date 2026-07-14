@@ -1,5 +1,5 @@
 /**
- * Tests for usage_rollup credit field normalization.
+ * Tests for usage_rollup field normalization (credits + latency).
  * Run: node --test worker/tests/telemetry_rollup.test.js
  */
 const { describe, it } = require("node:test");
@@ -54,6 +54,11 @@ function normalizeRollupRow(row, receivedAt) {
     toInt(row.total_tokens_sum),
     toInt(row.request_bytes_sum),
     toInt(row.response_bytes_sum),
+    toInt(row.ttft_ms_sum),
+    toInt(row.ttft_count),
+    toInt(row.generation_ms_sum),
+    toInt(row.generation_count),
+    toInt(row.generation_completion_tokens_sum),
     toOptionalNonNegFloat(row.estimated_credits),
     toOptionalNonNegInt(row.credit_estimate_segments),
     toOptionalNonNegInt(row.credit_estimate_missing_segments),
@@ -78,11 +83,13 @@ describe("normalizeRollupRow credit fields", () => {
       request_bytes_sum: 100,
       response_bytes_sum: 200,
     }, 999);
-    assert.equal(params.length, 17);
-    assert.equal(params[13], null); // estimated_credits
-    assert.equal(params[14], null); // segments
-    assert.equal(params[15], null); // missing
-    assert.equal(params[16], 999);
+    assert.equal(params.length, 22);
+    assert.equal(params[13], 0); // ttft_ms_sum (omitted → 0)
+    assert.equal(params[17], 0); // generation_completion_tokens_sum
+    assert.equal(params[18], null); // estimated_credits
+    assert.equal(params[19], null); // segments
+    assert.equal(params[20], null); // missing
+    assert.equal(params[21], 999);
   });
 
   it("explicit zero credits stay zero", () => {
@@ -96,9 +103,9 @@ describe("normalizeRollupRow credit fields", () => {
       credit_estimate_segments: 1,
       credit_estimate_missing_segments: 0,
     }, 1);
-    assert.equal(params[13], 0);
-    assert.equal(params[14], 1);
-    assert.equal(params[15], 0);
+    assert.equal(params[18], 0);
+    assert.equal(params[19], 1);
+    assert.equal(params[20], 0);
   });
 
   it("accepts valid estimated_credits", () => {
@@ -112,24 +119,46 @@ describe("normalizeRollupRow credit fields", () => {
       credit_estimate_segments: 2,
       credit_estimate_missing_segments: 1,
     }, 1);
-    assert.equal(params[13], 12.5);
-    assert.equal(params[14], 2);
-    assert.equal(params[15], 1);
+    assert.equal(params[18], 12.5);
+    assert.equal(params[19], 2);
+    assert.equal(params[20], 1);
   });
 
   it("invalid / negative credits become null", () => {
     assert.equal(normalizeRollupRow({
       bucket_start: 1, bucket_seconds: 600, username: "abc123def456",
       model: "m", app_version: "v", estimated_credits: -3,
-    }, 1)[13], null);
+    }, 1)[18], null);
     assert.equal(normalizeRollupRow({
       bucket_start: 1, bucket_seconds: 600, username: "abc123def456",
       model: "m", app_version: "v", estimated_credits: "NaN",
-    }, 1)[13], null);
+    }, 1)[18], null);
   });
 });
 
-describe("index.js SQL includes credit columns", () => {
+describe("normalizeRollupRow latency fields", () => {
+  it("accepts ttft / generation throughput sums", () => {
+    const params = normalizeRollupRow({
+      bucket_start: 1200,
+      bucket_seconds: 600,
+      username: "abc123def456",
+      model: "m",
+      app_version: "v",
+      ttft_ms_sum: 2500,
+      ttft_count: 5,
+      generation_ms_sum: 10000,
+      generation_count: 4,
+      generation_completion_tokens_sum: 800,
+    }, 1);
+    assert.equal(params[13], 2500);
+    assert.equal(params[14], 5);
+    assert.equal(params[15], 10000);
+    assert.equal(params[16], 4);
+    assert.equal(params[17], 800);
+  });
+});
+
+describe("index.js SQL includes credit and latency columns", () => {
   const src = fs.readFileSync(
     path.join(__dirname, "..", "src", "index.js"),
     "utf8",
@@ -141,5 +170,15 @@ describe("index.js SQL includes credit columns", () => {
     assert.match(src, /credit_estimate_missing_segments/);
     assert.match(src, /SUM\(estimated_credits\)/);
     assert.match(src, /toOptionalNonNegFloat/);
+  });
+
+  it("INSERT and daily rollup mention ttft / generation fields", () => {
+    assert.match(src, /ttft_ms_sum/);
+    assert.match(src, /ttft_count/);
+    assert.match(src, /generation_ms_sum/);
+    assert.match(src, /generation_count/);
+    assert.match(src, /generation_completion_tokens_sum/);
+    assert.match(src, /SUM\(ttft_ms_sum\)/);
+    assert.match(src, /SUM\(generation_completion_tokens_sum\)/);
   });
 });

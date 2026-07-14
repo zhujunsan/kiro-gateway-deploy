@@ -156,6 +156,12 @@ class _Bucket:
     total_tokens_sum: int = 0
     request_bytes_sum: int = 0
     response_bytes_sum: int = 0
+    # Latency / throughput (streaming): TTFT + generation after first token.
+    ttft_ms_sum: int = 0
+    ttft_count: int = 0
+    generation_ms_sum: int = 0
+    generation_count: int = 0
+    generation_completion_tokens_sum: int = 0
     # Estimated Credit usage from /usage segment diffs (Kiro billing may lag).
     estimated_credits: float = 0.0
     credit_estimate_segments: int = 0
@@ -185,6 +191,11 @@ class _Bucket:
             "total_tokens_sum": self.total_tokens_sum,
             "request_bytes_sum": self.request_bytes_sum,
             "response_bytes_sum": self.response_bytes_sum,
+            "ttft_ms_sum": self.ttft_ms_sum,
+            "ttft_count": self.ttft_count,
+            "generation_ms_sum": self.generation_ms_sum,
+            "generation_count": self.generation_count,
+            "generation_completion_tokens_sum": self.generation_completion_tokens_sum,
             "estimated_credits": (
                 float(self.estimated_credits) if has_credit_estimate else None
             ),
@@ -208,6 +219,10 @@ class RequestSample:
     total_tokens: int | None = None
     request_bytes: int = 0
     response_bytes: int = 0
+    # Optional latency: set when first non-empty body byte was observed.
+    ttft_ms: int | None = None
+    # Optional generation window (SSE only): first token → response end.
+    generation_ms: int | None = None
 
 
 @dataclass
@@ -224,6 +239,9 @@ class _ResponseState:
     is_sse: bool = False
     is_json: bool = False
     completed: bool = False
+    started_at: float = 0.0
+    first_token_at: float | None = None
+    ended_at: float | None = None
     sse_tail: bytearray = field(default_factory=bytearray)
     json_buf: bytearray = field(default_factory=bytearray)
 
@@ -270,6 +288,20 @@ class Aggregator:
                 b.total_tokens_sum += int(sample.total_tokens)
             b.request_bytes_sum += max(0, int(sample.request_bytes))
             b.response_bytes_sum += max(0, int(sample.response_bytes))
+            if sample.ttft_ms is not None and sample.ttft_ms >= 0:
+                b.ttft_ms_sum += int(sample.ttft_ms)
+                b.ttft_count += 1
+            # tokens/s uses generation window after first token (SSE only).
+            if (
+                sample.generation_ms is not None
+                and sample.generation_ms > 0
+                and sample.completion_tokens is not None
+            ):
+                b.generation_ms_sum += int(sample.generation_ms)
+                b.generation_count += 1
+                b.generation_completion_tokens_sum += max(
+                    0, int(sample.completion_tokens)
+                )
 
     def record_credit_estimate(
         self,
@@ -1100,7 +1132,7 @@ class TelemetryMiddleware:
 
         # --- response side: forward every chunk verbatim; retain only what we
         # need to recover the final usage afterwards. ---
-        state = _ResponseState()
+        state = _ResponseState(started_at=time.perf_counter())
 
         async def wrapped_send(message: dict) -> None:
             try:
@@ -1142,6 +1174,10 @@ class TelemetryMiddleware:
         elif mtype == "http.response.body":
             chunk = message.get("body", b"") or b""
             state.response_bytes += len(chunk)
+            now = time.perf_counter()
+            # First non-empty body byte ≈ first token / first SSE event.
+            if chunk and state.first_token_at is None:
+                state.first_token_at = now
             if state.is_sse:
                 tail = state.sse_tail
                 tail.extend(chunk)
@@ -1153,6 +1189,7 @@ class TelemetryMiddleware:
                     buf.extend(chunk)
             if not message.get("more_body", False):
                 state.completed = True
+                state.ended_at = now
 
     def _finalise(self, sample: RequestSample, state: _ResponseState, *, ok: bool) -> None:
         """Extract usage from the retained buffers and record the sample. Never
@@ -1173,6 +1210,21 @@ class TelemetryMiddleware:
             # Success = the request completed AND we recovered a final usage
             # (design 六: successes == "got final usage").
             sample.success = bool(ok and status_ok and state.completed and has_usage)
+            if state.first_token_at is not None and state.started_at > 0:
+                sample.ttft_ms = max(
+                    0, int((state.first_token_at - state.started_at) * 1000)
+                )
+            # tokens/s: completion_tokens / generation_ms after first token.
+            # Only for SSE — non-stream JSON arrives in one shot (generation≈0).
+            if (
+                state.is_sse
+                and state.first_token_at is not None
+                and state.ended_at is not None
+                and completion is not None
+            ):
+                sample.generation_ms = max(
+                    1, int((state.ended_at - state.first_token_at) * 1000)
+                )
             self.reporter.aggregator.record(sample)
         except Exception:
             logger.debug("telemetry: finalise failed", exc_info=True)

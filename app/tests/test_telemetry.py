@@ -159,10 +159,12 @@ def test_aggregator_accumulates_same_bucket():
     base = 1200.0
     agg.record(RequestSample(model="m", success=True, prompt_tokens=10,
                              completion_tokens=5, total_tokens=15,
-                             request_bytes=100, response_bytes=200), now=base)
+                             request_bytes=100, response_bytes=200,
+                             ttft_ms=400, generation_ms=2000), now=base)
     agg.record(RequestSample(model="m", success=False, prompt_tokens=3,
                              completion_tokens=None, total_tokens=None,
-                             request_bytes=50, response_bytes=10), now=base + 10)
+                             request_bytes=50, response_bytes=10,
+                             ttft_ms=100), now=base + 10)
     rows = agg.drain_all()
     assert len(rows) == 1
     r = rows[0]
@@ -175,11 +177,28 @@ def test_aggregator_accumulates_same_bucket():
     assert r["request_bytes_sum"] == 150
     assert r["response_bytes_sum"] == 210
     assert r["bucket_start"] == 1200
+    assert r["ttft_ms_sum"] == 500
+    assert r["ttft_count"] == 2
+    # Only the successful sample had generation_ms + completion_tokens.
+    assert r["generation_ms_sum"] == 2000
+    assert r["generation_count"] == 1
+    assert r["generation_completion_tokens_sum"] == 5
     # No credit settle → null (unknown), not 0.
     assert r["estimated_credits"] is None
     assert r["credit_estimate_segments"] is None
     assert r["credit_estimate_missing_segments"] is None
 
+
+def test_aggregator_tokens_per_sec_skips_without_generation():
+    agg = Aggregator("user", "0.1.0", 600)
+    # Non-stream style: TTFT only, no generation window.
+    agg.record(RequestSample(model="m", success=True, completion_tokens=20,
+                             ttft_ms=300, generation_ms=None), now=1200)
+    r = agg.drain_all()[0]
+    assert r["ttft_count"] == 1
+    assert r["generation_count"] == 0
+    assert r["generation_completion_tokens_sum"] == 0
+    assert r["completion_tokens_sum"] == 20
 
 def test_aggregator_splits_by_dimension():
     agg = Aggregator("user", "0.1.0", 600)
@@ -616,6 +635,36 @@ def test_middleware_extracts_sse_usage(tmp_path):
     assert r["completion_tokens_sum"] == 2
     assert r["total_tokens_sum"] == 9
     assert r["successes"] == 1
+    # Streaming: TTFT + generation window recorded.
+    assert r["ttft_count"] == 1
+    assert r["ttft_ms_sum"] >= 0
+    assert r["generation_count"] == 1
+    assert r["generation_ms_sum"] >= 1
+    assert r["generation_completion_tokens_sum"] == 2
+
+
+def test_middleware_json_records_ttft_not_generation(tmp_path):
+    """Non-SSE JSON: TTFT (first body) is kept; tokens/s generation is not."""
+    rep, _, _ = _reporter(tmp_path)
+    mw = TelemetryMiddleware(None, rep)
+    body = json.dumps({"model": "m", "messages": []}).encode()
+    resp_json = json.dumps({
+        "usage": {"prompt_tokens": 1, "completion_tokens": 4, "total_tokens": 5}
+    }).encode()
+    _run(_drive_http(
+        mw, method="POST", path="/v1/chat/completions", body=body,
+        response_messages=[
+            {"type": "http.response.start", "status": 200,
+             "headers": [(b"content-type", b"application/json")]},
+            {"type": "http.response.body", "body": resp_json, "more_body": False},
+        ],
+        capture={},
+    ))
+    r = rep.aggregator.drain_all()[0]
+    assert r["ttft_count"] == 1
+    assert r["generation_count"] == 0
+    assert r["generation_completion_tokens_sum"] == 0
+    assert r["completion_tokens_sum"] == 4
 
 
 def test_middleware_model_fallback_unknown(tmp_path):

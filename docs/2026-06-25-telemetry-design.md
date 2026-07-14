@@ -124,6 +124,9 @@
 | `total_tokens_sum` | 总 token 之和 |
 | `request_bytes_sum` | 请求体字节之和 |
 | `response_bytes_sum` | 响应体字节之和 |
+| `ttft_ms_sum` / `ttft_count` | 首包延迟累计（首个非空 body 字节）；平均 TTFT = sum / count |
+| `generation_ms_sum` / `generation_count` | 流式生成窗累计（首 token → 响应结束，仅 SSE） |
+| `generation_completion_tokens_sum` | 计入生成窗的 completion tokens；token/s = 该值 / (generation_ms_sum/1000) |
 | `estimated_credits` | 估算 Credit 消耗（本机 `/usage` 模型段 diff；**NULL=未上报/未知，0=测得零消耗**；Kiro 计费有延迟） |
 | `credit_estimate_segments` | 成功结算的 Credit 段数（NULL=未上报） |
 | `credit_estimate_missing_segments` | 未能结算的段数（采样失败 / 负 diff / 月度重置；NULL=未上报） |
@@ -170,6 +173,11 @@ CREATE TABLE IF NOT EXISTS usage_rollup (
   total_tokens_sum    INTEGER NOT NULL DEFAULT 0,
   request_bytes_sum   INTEGER NOT NULL DEFAULT 0,
   response_bytes_sum  INTEGER NOT NULL DEFAULT 0,
+  ttft_ms_sum         INTEGER NOT NULL DEFAULT 0,
+  ttft_count          INTEGER NOT NULL DEFAULT 0,
+  generation_ms_sum   INTEGER NOT NULL DEFAULT 0,
+  generation_count    INTEGER NOT NULL DEFAULT 0,
+  generation_completion_tokens_sum INTEGER NOT NULL DEFAULT 0,
   estimated_credits   REAL,              -- NULL=未知；0=测得零
   credit_estimate_segments INTEGER,
   credit_estimate_missing_segments INTEGER,
@@ -194,6 +202,11 @@ CREATE TABLE IF NOT EXISTS usage_daily (
   total_tokens_sum    INTEGER NOT NULL DEFAULT 0,
   request_bytes_sum   INTEGER NOT NULL DEFAULT 0,
   response_bytes_sum  INTEGER NOT NULL DEFAULT 0,
+  ttft_ms_sum         INTEGER NOT NULL DEFAULT 0,
+  ttft_count          INTEGER NOT NULL DEFAULT 0,
+  generation_ms_sum   INTEGER NOT NULL DEFAULT 0,
+  generation_count    INTEGER NOT NULL DEFAULT 0,
+  generation_completion_tokens_sum INTEGER NOT NULL DEFAULT 0,
   estimated_credits   REAL,
   credit_estimate_segments INTEGER,
   credit_estimate_missing_segments INTEGER,
@@ -220,6 +233,8 @@ POST /telemetry
           username, model, app_version, requests, successes, errors,
           prompt_tokens_sum, completion_tokens_sum, total_tokens_sum,
           request_bytes_sum, response_bytes_sum,
+          ttft_ms_sum, ttft_count,
+          generation_ms_sum, generation_count, generation_completion_tokens_sum,
           estimated_credits, credit_estimate_segments, credit_estimate_missing_segments} , ... ] }
   → 200 { ok: true, accepted: N }
   → 401 { error: "unauthorized" }   // 密钥缺失或不匹配
@@ -274,9 +289,11 @@ INSERT INTO usage_rollup (bucket_start, bucket_seconds, username, model, app_ver
                           requests, successes, errors,
                           prompt_tokens_sum, completion_tokens_sum, total_tokens_sum,
                           request_bytes_sum, response_bytes_sum,
+                          ttft_ms_sum, ttft_count,
+                          generation_ms_sum, generation_count, generation_completion_tokens_sum,
                           estimated_credits, credit_estimate_segments, credit_estimate_missing_segments,
                           received_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(bucket_start, bucket_seconds, username, model, app_version)
 DO UPDATE SET
   requests = excluded.requests,
@@ -287,6 +304,11 @@ DO UPDATE SET
   total_tokens_sum = excluded.total_tokens_sum,
   request_bytes_sum = excluded.request_bytes_sum,
   response_bytes_sum = excluded.response_bytes_sum,
+  ttft_ms_sum = excluded.ttft_ms_sum,
+  ttft_count = excluded.ttft_count,
+  generation_ms_sum = excluded.generation_ms_sum,
+  generation_count = excluded.generation_count,
+  generation_completion_tokens_sum = excluded.generation_completion_tokens_sum,
   estimated_credits = excluded.estimated_credits,
   credit_estimate_segments = excluded.credit_estimate_segments,
   credit_estimate_missing_segments = excluded.credit_estimate_missing_segments,

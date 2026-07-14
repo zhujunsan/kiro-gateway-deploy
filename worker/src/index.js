@@ -266,6 +266,8 @@ const ROLLUP_FIELDS = [
   "requests", "successes", "errors",
   "prompt_tokens_sum", "completion_tokens_sum", "total_tokens_sum",
   "request_bytes_sum", "response_bytes_sum",
+  "ttft_ms_sum", "ttft_count",
+  "generation_ms_sum", "generation_count", "generation_completion_tokens_sum",
   "estimated_credits", "credit_estimate_segments", "credit_estimate_missing_segments",
 ];
 
@@ -274,9 +276,11 @@ INSERT INTO usage_rollup (bucket_start, bucket_seconds, username, model, app_ver
                           requests, successes, errors,
                           prompt_tokens_sum, completion_tokens_sum, total_tokens_sum,
                           request_bytes_sum, response_bytes_sum,
+                          ttft_ms_sum, ttft_count,
+                          generation_ms_sum, generation_count, generation_completion_tokens_sum,
                           estimated_credits, credit_estimate_segments, credit_estimate_missing_segments,
                           received_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(bucket_start, bucket_seconds, username, model, app_version)
 DO UPDATE SET
   requests = excluded.requests,
@@ -287,6 +291,11 @@ DO UPDATE SET
   total_tokens_sum = excluded.total_tokens_sum,
   request_bytes_sum = excluded.request_bytes_sum,
   response_bytes_sum = excluded.response_bytes_sum,
+  ttft_ms_sum = excluded.ttft_ms_sum,
+  ttft_count = excluded.ttft_count,
+  generation_ms_sum = excluded.generation_ms_sum,
+  generation_count = excluded.generation_count,
+  generation_completion_tokens_sum = excluded.generation_completion_tokens_sum,
   estimated_credits = excluded.estimated_credits,
   credit_estimate_segments = excluded.credit_estimate_segments,
   credit_estimate_missing_segments = excluded.credit_estimate_missing_segments,
@@ -339,6 +348,12 @@ function normalizeRollupRow(row, receivedAt) {
     toInt(row.total_tokens_sum),
     toInt(row.request_bytes_sum),
     toInt(row.response_bytes_sum),
+    // Old clients omit latency fields → 0 (averages use NULLIF count).
+    toInt(row.ttft_ms_sum),
+    toInt(row.ttft_count),
+    toInt(row.generation_ms_sum),
+    toInt(row.generation_count),
+    toInt(row.generation_completion_tokens_sum),
     // Old clients omit these → NULL (unknown). Explicit 0 means measured zero.
     toOptionalNonNegFloat(row.estimated_credits),
     toOptionalNonNegInt(row.credit_estimate_segments),
@@ -684,12 +699,16 @@ INSERT INTO usage_daily (day, username, model,
                          requests, successes, errors,
                          prompt_tokens_sum, completion_tokens_sum, total_tokens_sum,
                          request_bytes_sum, response_bytes_sum,
+                         ttft_ms_sum, ttft_count,
+                         generation_ms_sum, generation_count, generation_completion_tokens_sum,
                          estimated_credits, credit_estimate_segments, credit_estimate_missing_segments)
 SELECT date(bucket_start, 'unixepoch') AS day,
        username, model,
        SUM(requests), SUM(successes), SUM(errors),
        SUM(prompt_tokens_sum), SUM(completion_tokens_sum), SUM(total_tokens_sum),
        SUM(request_bytes_sum), SUM(response_bytes_sum),
+       SUM(ttft_ms_sum), SUM(ttft_count),
+       SUM(generation_ms_sum), SUM(generation_count), SUM(generation_completion_tokens_sum),
        SUM(estimated_credits), SUM(credit_estimate_segments), SUM(credit_estimate_missing_segments)
 FROM usage_rollup
 WHERE date(bucket_start, 'unixepoch') = ?
@@ -704,6 +723,11 @@ DO UPDATE SET
   total_tokens_sum = excluded.total_tokens_sum,
   request_bytes_sum = excluded.request_bytes_sum,
   response_bytes_sum = excluded.response_bytes_sum,
+  ttft_ms_sum = excluded.ttft_ms_sum,
+  ttft_count = excluded.ttft_count,
+  generation_ms_sum = excluded.generation_ms_sum,
+  generation_count = excluded.generation_count,
+  generation_completion_tokens_sum = excluded.generation_completion_tokens_sum,
   estimated_credits = excluded.estimated_credits,
   credit_estimate_segments = excluded.credit_estimate_segments,
   credit_estimate_missing_segments = excluded.credit_estimate_missing_segments`;
