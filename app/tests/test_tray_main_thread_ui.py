@@ -42,9 +42,23 @@ def _make_app(monkeypatch):
 
 def test_request_redraw_marshals_update_menu(monkeypatch):
     app, icon, marshaled = _make_app(monkeypatch)
+    monkeypatch.setattr(
+        "kiro_gateway_tray.macos_menu.is_status_menu_open", lambda _ic: False
+    )
     app._request_redraw()
     assert len(marshaled) == 1
     icon.update_menu.assert_called_once_with()
+
+
+def test_request_redraw_skips_update_menu_while_menu_open(monkeypatch):
+    app, icon, marshaled = _make_app(monkeypatch)
+    monkeypatch.setattr(
+        "kiro_gateway_tray.macos_menu.is_status_menu_open", lambda _ic: True
+    )
+    app._request_redraw()
+    assert len(marshaled) == 1
+    icon.update_menu.assert_not_called()
+    assert app._redraw_deferred is True
 
 
 def test_refresh_icon_marshals_set_icon(monkeypatch):
@@ -52,6 +66,46 @@ def test_refresh_icon_marshals_set_icon(monkeypatch):
     app._refresh_icon()
     assert len(marshaled) == 1
     assert icon.icon == "fake-icon"
+
+
+def test_macos_reopen_event_calls_existing_instance_handler(monkeypatch):
+    from kiro_gateway_tray import macos_menu
+
+    class _NSObject:
+        @classmethod
+        def alloc(cls):
+            return cls()
+
+        def init(self):
+            return self
+
+    class _FakeApplication:
+        def __init__(self):
+            self.delegate = None
+
+        def setDelegate_(self, delegate):
+            self.delegate = delegate
+
+    fake_appkit = types.ModuleType("AppKit")
+    fake_appkit.NSObject = _NSObject
+    fake_appkit.NSApplication = types.SimpleNamespace(
+        sharedApplication=lambda: _FakeApplication()
+    )
+    monkeypatch.setitem(sys.modules, "AppKit", fake_appkit)
+    monkeypatch.setitem(sys.modules, "objc", types.ModuleType("objc"))
+    monkeypatch.setattr(macos_menu.sys, "platform", "darwin")
+
+    app = _FakeApplication()
+    icon = types.SimpleNamespace(_app=app)
+    calls = []
+    macos_menu.install_reopen_handler(icon, lambda: calls.append("reopen"))
+
+    assert app.delegate is icon._kg_reopen_delegate
+    handled = app.delegate.applicationShouldHandleReopen_hasVisibleWindows_(
+        app, False
+    )
+    assert handled is False
+    assert calls == ["reopen"]
 
 
 def test_start_or_restart_worker_does_not_call_update_menu_directly(monkeypatch):

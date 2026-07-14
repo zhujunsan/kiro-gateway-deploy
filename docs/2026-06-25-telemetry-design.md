@@ -124,6 +124,20 @@
 | `total_tokens_sum` | 总 token 之和 |
 | `request_bytes_sum` | 请求体字节之和 |
 | `response_bytes_sum` | 响应体字节之和 |
+| `estimated_credits` | 估算 Credit 消耗（本机 `/usage` 模型段 diff；**NULL=未上报/未知，0=测得零消耗**；Kiro 计费有延迟） |
+| `credit_estimate_segments` | 成功结算的 Credit 段数（NULL=未上报） |
+| `credit_estimate_missing_segments` | 未能结算的段数（采样失败 / 负 diff / 月度重置；NULL=未上报） |
+
+### Credit 分段估算（账户级 `/usage` → 模型桶）
+
+上游 SSE 从不返回 per-request `credits_used`，因此改为：
+
+1. 首次见到模型 A：后台调本机 `GET /usage`，取各 `breakdowns[].used` 总和作起点（不计费）。
+2. 模型切到 B：再采一次；`当前值 − A 起点` 记入 A 的当前 10 分钟桶，同一读数作为 B 起点。
+3. 每次上报前 checkpoint：再采一次结算当前模型，终点继续作为下一段起点。
+4. 采样在独立后台线程串行执行，**不阻塞**真实请求；负 diff / `nextDateReset` 变化 / 采样失败 → `credit_estimate_missing_segments++`，不伪造 0 消耗。
+
+金额（$0.04/Credit、人民币）只在本地 `report.py` / 看板层换算，不上报 D1。
 
 ### 容量测算（活跃 10h = 600 分钟，人均同时段约 2 个模型）
 
@@ -156,6 +170,9 @@ CREATE TABLE IF NOT EXISTS usage_rollup (
   total_tokens_sum    INTEGER NOT NULL DEFAULT 0,
   request_bytes_sum   INTEGER NOT NULL DEFAULT 0,
   response_bytes_sum  INTEGER NOT NULL DEFAULT 0,
+  estimated_credits   REAL,              -- NULL=未知；0=测得零
+  credit_estimate_segments INTEGER,
+  credit_estimate_missing_segments INTEGER,
   received_at         INTEGER NOT NULL,   -- Worker 落库时间
   UNIQUE (bucket_start, bucket_seconds, username, model, app_version)
 );
@@ -177,6 +194,9 @@ CREATE TABLE IF NOT EXISTS usage_daily (
   total_tokens_sum    INTEGER NOT NULL DEFAULT 0,
   request_bytes_sum   INTEGER NOT NULL DEFAULT 0,
   response_bytes_sum  INTEGER NOT NULL DEFAULT 0,
+  estimated_credits   REAL,
+  credit_estimate_segments INTEGER,
+  credit_estimate_missing_segments INTEGER,
   PRIMARY KEY (day, username, model)
 );
 
@@ -199,7 +219,8 @@ POST /telemetry
   body: { schema_version, rows: [ {bucket_start, bucket_seconds,
           username, model, app_version, requests, successes, errors,
           prompt_tokens_sum, completion_tokens_sum, total_tokens_sum,
-          request_bytes_sum, response_bytes_sum} , ... ] }
+          request_bytes_sum, response_bytes_sum,
+          estimated_credits, credit_estimate_segments, credit_estimate_missing_segments} , ... ] }
   → 200 { ok: true, accepted: N }
   → 401 { error: "unauthorized" }   // 密钥缺失或不匹配
 ```
@@ -253,8 +274,9 @@ INSERT INTO usage_rollup (bucket_start, bucket_seconds, username, model, app_ver
                           requests, successes, errors,
                           prompt_tokens_sum, completion_tokens_sum, total_tokens_sum,
                           request_bytes_sum, response_bytes_sum,
+                          estimated_credits, credit_estimate_segments, credit_estimate_missing_segments,
                           received_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(bucket_start, bucket_seconds, username, model, app_version)
 DO UPDATE SET
   requests = excluded.requests,
@@ -265,6 +287,9 @@ DO UPDATE SET
   total_tokens_sum = excluded.total_tokens_sum,
   request_bytes_sum = excluded.request_bytes_sum,
   response_bytes_sum = excluded.response_bytes_sum,
+  estimated_credits = excluded.estimated_credits,
+  credit_estimate_segments = excluded.credit_estimate_segments,
+  credit_estimate_missing_segments = excluded.credit_estimate_missing_segments,
   received_at = excluded.received_at;
 ```
 
@@ -493,7 +518,8 @@ wrangler deploy
 
 ## 十四、待办验证清单（实现阶段）
 
-- [x] `credits_used` / `credits_used_sum` 已从全链路移除（上游恒不返回 metering，字段恒 NULL）。
+- [x] `credits_used` / `credits_used_sum`（上游 SSE metering）已从全链路移除（上游恒不返回，字段恒 NULL）。
+- [x] 改为账户级 `GET /usage` 模型段 diff → `estimated_credits`（rollup/daily）；金额仅在报告层按 $0.04/Credit 换算。
 - [ ] 确认 SSE usage chunk 跨 TCP 包分帧时尾部缓冲提取的可靠性。
 - [ ] 非流式（`stream=false`）响应能从 JSON body 正确提取 usage。
 - [ ] ASGI request body 回放正确：下游 app 仍能读到完整 body（含分帧 `more_body`）。

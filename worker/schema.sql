@@ -16,6 +16,10 @@ CREATE TABLE IF NOT EXISTS usage_rollup (
   total_tokens_sum    INTEGER NOT NULL DEFAULT 0,
   request_bytes_sum   INTEGER NOT NULL DEFAULT 0,
   response_bytes_sum  INTEGER NOT NULL DEFAULT 0,
+  -- NULL = not reported (old client / no estimate); 0 = measured zero.
+  estimated_credits   REAL,
+  credit_estimate_segments INTEGER,
+  credit_estimate_missing_segments INTEGER,
   received_at         INTEGER NOT NULL,   -- Worker 落库时间
   UNIQUE (bucket_start, bucket_seconds, username, model, app_version)
 );
@@ -37,6 +41,9 @@ CREATE TABLE IF NOT EXISTS usage_daily (
   total_tokens_sum    INTEGER NOT NULL DEFAULT 0,
   request_bytes_sum   INTEGER NOT NULL DEFAULT 0,
   response_bytes_sum  INTEGER NOT NULL DEFAULT 0,
+  estimated_credits   REAL,
+  credit_estimate_segments INTEGER,
+  credit_estimate_missing_segments INTEGER,
   PRIMARY KEY (day, username, model)
 );
 

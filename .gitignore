@@ -39,6 +39,7 @@ node_modules/
 worker/wrangler.toml
 # 真实 Worker secrets，不入库；改用 secrets.json.example
 worker/secrets.json
+worker/.cf-api-token
 npm-debug.log*
 yarn-error.log*
 pnpm-debug.log*

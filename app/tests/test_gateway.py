@@ -57,6 +57,27 @@ def test_child_command_frozen_mode(monkeypatch):
     assert cmd == ["/Apps/KiroGatewayTray", "--run-gateway"]
 
 
+def test_start_records_gateway_child_pid(tmp_path, monkeypatch):
+    monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
+    recorded = []
+
+    class _FakeProc:
+        pid = 2468
+
+    monkeypatch.setattr(
+        gateway.subprocess, "Popen", lambda *args, **kwargs: _FakeProc()
+    )
+    monkeypatch.setattr(
+        gateway.proc_guard, "record_gateway_pid", recorded.append
+    )
+
+    proc = gateway.GatewayProcess()
+    proc.start(appconfig.AppCfg())
+    proc._close_bootstrap_log()
+
+    assert recorded == [2468]
+
+
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
@@ -95,6 +116,11 @@ def test_stop_waits_after_kill(monkeypatch):
     # If terminate() doesn't make the child exit in time, stop() must kill AND
     # wait again so it never returns while the port-holding child is still alive.
     events = []
+    monkeypatch.setattr(
+        gateway.proc_guard,
+        "clear_gateway_pid",
+        lambda: events.append("clear-pid"),
+    )
 
     class _FakeProc:
         def __init__(self):
@@ -120,5 +146,5 @@ def test_stop_waits_after_kill(monkeypatch):
     gp._proc = _FakeProc()
     gp.stop()
 
-    assert events == ["terminate", "wait:10", "kill", "wait:5"]
+    assert events == ["terminate", "wait:10", "kill", "wait:5", "clear-pid"]
     assert gp._proc is None

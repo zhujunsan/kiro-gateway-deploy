@@ -25,7 +25,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import appconfig, paths
+from . import appconfig, paths, proc_guard
 from .appconfig import AppCfg
 from .log import logger
 
@@ -132,6 +132,7 @@ class GatewayProcess:
             stderr=subprocess.STDOUT,
             **popen_kwargs,
         )
+        proc_guard.record_gateway_pid(self._proc.pid)
 
     def _close_bootstrap_log(self) -> None:
         if self._bootstrap_log is not None:
@@ -162,6 +163,7 @@ class GatewayProcess:
                 except subprocess.TimeoutExpired:
                     logger.error("gateway still alive after SIGKILL; port may stay busy")
         self._proc = None
+        proc_guard.clear_gateway_pid()
         self._close_bootstrap_log()
 
     def is_alive(self) -> bool:
@@ -269,6 +271,12 @@ def run_gateway_blocking() -> int:
     # overwrites that whole tree. No-op when TELEMETRY_URL is unset.
     from . import telemetry
     app = telemetry.wrap_app(main.app)
+
+    # Local in-flight / recent request snapshots for the tray menu. Always on
+    # (unlike telemetry): writes {data_dir}/request_activity.json only; never
+    # uploads prompt/reply text.
+    from . import request_activity
+    app = request_activity.wrap_app(app)
 
     # Register the error-incident uploader against vendor debug_logger's
     # snapshot callback. Must run AFTER vendor import so kiro.debug_logger is

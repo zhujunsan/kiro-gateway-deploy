@@ -8,11 +8,24 @@ import time
 import webbrowser
 from typing import Callable
 
-from . import __version__, GITHUB_REPO, appconfig, autostart, dialogs, macos_menu, notify as _notify_mod, paths, platform_compat, usage
+from . import (
+    __version__,
+    GITHUB_REPO,
+    appconfig,
+    autostart,
+    dialogs,
+    macos_menu,
+    notify as _notify_mod,
+    paths,
+    platform_compat,
+    request_activity,
+    usage,
+)
 from .async_cache import AsyncRefreshCache
 from .icon import make_icon
 from .log import logger
 from .notify import APP_NAME
+from .request_activity import ActivitySnapshot
 from .supervisor import Supervisor
 from .theme_watcher import ThemeWatcher
 
@@ -28,6 +41,10 @@ _STATUS_ZH = {
     "connecting": "连接中",
     "error": "异常",
 }
+
+# Prefixes used to find live-updatable NSMenuItems while the menu is open.
+_ACTIVITY_ACTIVE_PREFIX = "📡 进行中"
+_ACTIVITY_RECENT_TITLE = "💬 最近对话"
 
 
 def _local_url(cfg) -> str:
@@ -204,6 +221,9 @@ class TrayApp:
 
     _PROBE_MIN_INTERVAL = 2.0  # seconds between on-open health probes
     _USAGE_REFRESH_INTERVAL = 60  # seconds between background usage refreshes
+    # Poll the activity file often enough to notice start/finish; do NOT redraw
+    # on this cadence just to tick elapsed time (see _on_activity_update).
+    _ACTIVITY_REFRESH_INTERVAL = 3.0
 
     def __init__(self) -> None:
         import pystray
@@ -217,6 +237,14 @@ class TrayApp:
         self._models_cache = AsyncRefreshCache(
             usage.fetch_models, cooldown=14400, on_update=self._request_redraw,
         )
+        self._activity_cache = AsyncRefreshCache(
+            request_activity.load_snapshot,
+            cooldown=0,
+            on_update=self._on_activity_update,
+        )
+        self._activity_fingerprint: str | None = None
+        self._redraw_deferred = False
+        self._menu_session_open = False
         self.sup.on_status_change = self._request_redraw
 
         self._update_info = None
@@ -227,6 +255,145 @@ class TrayApp:
         # theme. Constructed in run(); start() is a no-op off Windows.
         self._theme_watcher: ThemeWatcher | None = None
 
+    def _on_activity_update(self) -> None:
+        """Redraw only when the activity snapshot's contents change.
+
+        Never rebuild the menu just to refresh elapsed-time labels: on macOS,
+        ``update_menu`` → ``setMenu:`` while the status menu is open breaks
+        AppKit menu tracking and can freeze keyboard input system-wide until
+        the tray process exits. While the menu is open, elapsed times are
+        patched in place via ``macos_menu`` live titles instead.
+        """
+        snap = self._activity_cache.get()
+        if snap is None:
+            return
+        fp = self._activity_fingerprint_of(snap)
+        if fp == self._activity_fingerprint:
+            return
+        self._activity_fingerprint = fp
+        if self._menu_session_open or macos_menu.is_status_menu_open(self._icon):
+            # Structure changed under an open menu: refresh titles in place and
+            # defer a full rebuild until menuDidClose.
+            self._redraw_deferred = True
+            self._live_patch_open_menu(snap)
+            return
+        self._request_redraw()
+
+    @staticmethod
+    def _activity_fingerprint_of(snap: ActivitySnapshot) -> str:
+        active = tuple(
+            (a.id, a.phase, a.question_preview, a.model) for a in snap.active
+        )
+        recent = tuple(
+            (r.id, r.ok, r.duration_ms, r.question_preview, r.answer_preview, r.error_preview)
+            for r in snap.recent
+        )
+        return repr((active, recent))
+
+    def _set_activity_cache_value(self, snap: ActivitySnapshot) -> None:
+        """Write the activity cache without firing on_update (avoids redraw storms)."""
+        cache = self._activity_cache
+        with cache._lock:
+            cache._value = snap
+            cache._succeeded = True
+            cache._last_fetch = time.monotonic()
+            cache._backoff = 0.0
+
+    def _activity_active_title(self, snap: ActivitySnapshot | None = None) -> str:
+        gw = self.sup.status()["gateway"]
+        if gw != "running":
+            return f"{_ACTIVITY_ACTIVE_PREFIX}\t({_STATUS_ZH.get(gw, gw)})"
+        snap = self._activity_snapshot() if snap is None else snap
+        n = len(snap.active)
+        if n == 0:
+            return f"{_ACTIVITY_ACTIVE_PREFIX}\t空闲"
+        oldest = min(snap.active, key=lambda a: a.started_at)
+        elapsed = request_activity.format_duration(time.time() - oldest.started_at)
+        return f"{_ACTIVITY_ACTIVE_PREFIX} ({n})\t最长 {elapsed}"
+
+    def _live_patch_open_menu(self, snap: ActivitySnapshot, nsmenu=None) -> None:
+        """In-place title updates for an already-open status menu (macOS)."""
+        if nsmenu is None:
+            ic = self._icon
+            handle = getattr(ic, "_menu_handle", None) if ic is not None else None
+            if not handle:
+                return
+            nsmenu = handle[0]
+        if nsmenu is None:
+            return
+        try:
+            active_item = macos_menu.find_menu_item_by_title_prefix(
+                nsmenu, _ACTIVITY_ACTIVE_PREFIX
+            )
+            if active_item is not None:
+                macos_menu.apply_menu_item_title(
+                    active_item, self._activity_active_title(snap)
+                )
+                submenu = active_item.submenu()
+                if submenu is not None and snap.active:
+                    now = time.time()
+                    n = int(submenu.numberOfItems())
+                    for i, entry in enumerate(snap.active):
+                        if i >= n:
+                            break
+                        row = submenu.itemAtIndex_(i)
+                        if row is None or row.isSeparatorItem():
+                            continue
+                        macos_menu.apply_menu_item_title(
+                            row,
+                            request_activity.format_active_line(entry, now=now),
+                        )
+            recent_item = macos_menu.find_menu_item_by_exact_title(
+                nsmenu, _ACTIVITY_RECENT_TITLE
+            )
+            if recent_item is not None and snap.recent:
+                submenu = recent_item.submenu()
+                if submenu is not None:
+                    n = int(submenu.numberOfItems())
+                    for i, entry in enumerate(snap.recent):
+                        if i >= n:
+                            break
+                        row = submenu.itemAtIndex_(i)
+                        if row is None or row.isSeparatorItem():
+                            continue
+                        macos_menu.apply_menu_item_title(
+                            row, request_activity.format_recent_line(entry)
+                        )
+        except Exception:
+            logger.debug("live activity title patch failed", exc_info=True)
+
+    def _on_status_menu_will_open(self, nsmenu) -> None:
+        """Fresh snapshot + in-place titles at the moment the menu opens."""
+        self._menu_session_open = True
+        self._on_menu_open()
+        try:
+            snap = request_activity.load_snapshot()
+            self._set_activity_cache_value(snap)
+            self._activity_fingerprint = self._activity_fingerprint_of(snap)
+            self._live_patch_open_menu(snap, nsmenu)
+        except Exception:
+            logger.debug("status menu will-open refresh failed", exc_info=True)
+
+    def _on_status_menu_did_close(self, _nsmenu) -> None:
+        self._menu_session_open = False
+        if self._redraw_deferred:
+            self._request_redraw()
+
+    def _on_status_menu_tick(self) -> None:
+        """1s tick while menu is open: refresh elapsed titles without setMenu:."""
+        if not self._menu_session_open:
+            return
+        try:
+            snap = request_activity.load_snapshot()
+            self._set_activity_cache_value(snap)
+            fp = self._activity_fingerprint_of(snap)
+            if fp != self._activity_fingerprint:
+                self._activity_fingerprint = fp
+                self._redraw_deferred = True
+            self._live_patch_open_menu(snap)
+        except Exception:
+            logger.debug("status menu live tick failed", exc_info=True)
+
     # --- redraw / notify helpers ---
 
     def _request_redraw(self) -> None:
@@ -235,6 +402,9 @@ class TrayApp:
         pystray's macOS backend ends in ``NSStatusItem.setMenu:``. On macOS 27+
         that path asserts the main-queue barrier; calling it from a worker
         thread hard-crashes with SIGTRAP and no Python traceback.
+
+        If the status menu is currently open, defer the rebuild until it
+        closes — replacing the menu mid-tracking hijacks keyboard input.
         """
         ic = self._icon
         if ic is None:
@@ -242,6 +412,10 @@ class TrayApp:
 
         def _do():
             try:
+                if self._menu_session_open or macos_menu.is_status_menu_open(ic):
+                    self._redraw_deferred = True
+                    return
+                self._redraw_deferred = False
                 ic.update_menu()
             except Exception:
                 logger.debug("update_menu failed during redraw", exc_info=True)
@@ -250,6 +424,10 @@ class TrayApp:
 
     def _notify(self, title: str, msg: str) -> None:
         _notify_mod.notify(self._icon, title, msg)
+
+    def _on_app_reopen(self) -> None:
+        """macOS sends this when the running .app is opened again."""
+        dialogs.alert(APP_NAME, "Kiro Gateway Tray 已在运行中，不允许启动多个实例。")
 
     def _refresh_icon(self) -> None:
         """Update the menu-bar glyph on the AppKit main thread.
@@ -405,6 +583,67 @@ class TrayApp:
         self._usage_cache.refresh()
         return f"📊 额度: {self._usage_cache.display()}"
 
+    def _activity_snapshot(self) -> ActivitySnapshot:
+        snap = self._activity_cache.get()
+        return snap if snap is not None else ActivitySnapshot()
+
+    def _activity_active_line(self, _item):
+        if self.sup.status()["gateway"] == "running":
+            self._activity_cache.refresh()
+        return self._activity_active_title()
+
+    def _activity_active_submenu(self):
+        pystray = self._pystray
+        gw = self.sup.status()["gateway"]
+        if gw != "running":
+            label = _STATUS_ZH.get(gw, gw)
+            return [pystray.MenuItem(f"网关未运行（{label}）", None, enabled=False)]
+        self._activity_cache.refresh()
+        snap = self._activity_snapshot()
+        if not snap.active:
+            return [pystray.MenuItem("当前无进行中的请求", None, enabled=False)]
+        now = time.time()
+        return [
+            pystray.MenuItem(
+                request_activity.format_active_line(a, now=now),
+                self._on_copy_activity_text(
+                    a.question_preview or a.model,
+                    "进行中请求",
+                ),
+            )
+            for a in snap.active
+        ]
+
+    def _activity_recent_submenu(self):
+        pystray = self._pystray
+        self._activity_cache.refresh()
+        snap = self._activity_snapshot()
+        if not snap.recent:
+            return [pystray.MenuItem("暂无最近对话", None, enabled=False)]
+        items = []
+        for r in snap.recent:
+            detail = (
+                f"问: {r.question_preview or '（无）'}\n"
+                f"答: {r.answer_preview or '（无）'}"
+                if r.ok
+                else (
+                    f"问: {r.question_preview or '（无）'}\n"
+                    f"错误: {r.error_preview or '失败'}"
+                )
+            )
+            items.append(
+                pystray.MenuItem(
+                    request_activity.format_recent_line(r),
+                    self._on_copy_activity_text(detail, "最近对话"),
+                )
+            )
+        return items
+
+    def _on_copy_activity_text(self, text: str, label: str):
+        def _handler(_icon, _item):
+            self._copy(text, label)
+        return _handler
+
     def _local_url_line(self, _item):
         cfg = appconfig.load(use_cache=True)
         return f"🔗 本地 URL: {_local_url(cfg)}\t复制"
@@ -436,8 +675,7 @@ class TrayApp:
             return [pystray.MenuItem("加载中…", None, enabled=False)]
         if not items:
             return [pystray.MenuItem("无可用模型", None, enabled=False)]
-        regular = [m for m in items if not m.startswith("kiro")]
-        aliases = [m for m in items if m.startswith("kiro")]
+        regular, aliases = usage.split_models_for_menu(items)
         menu_items = [
             pystray.MenuItem(f"{m}\t复制", self._on_copy_model(m))
             for m in regular
@@ -557,6 +795,32 @@ class TrayApp:
 
         threading.Thread(target=_loop, daemon=True).start()
 
+    def _start_activity_refresh_loop(self) -> None:
+        """Keep in-flight / recent request rows live on the tray menu.
+
+        Same macOS static-NSMenu constraint as usage: without a background tick,
+        newly started/finished conversations would freeze until some other
+        status change forced a redraw. Elapsed-time labels are only refreshed
+        when the snapshot contents change (or another redraw happens) — we
+        deliberately do not call update_menu on a timer while requests are
+        in flight, because that races with an open status menu.
+        """
+        def _loop():
+            while not self._usage_refresh_stop.wait(self._ACTIVITY_REFRESH_INTERVAL):
+                if self.sup.status()["gateway"] != "running":
+                    # Still flush a deferred redraw after the menu closes.
+                    if self._redraw_deferred:
+                        self._request_redraw()
+                    continue
+                try:
+                    self._activity_cache.refresh(force=True)
+                except Exception:
+                    logger.debug("activity refresh tick failed", exc_info=True)
+                if self._redraw_deferred:
+                    self._request_redraw()
+
+        threading.Thread(target=_loop, daemon=True).start()
+
     # --- build the menu and run the loop ---
 
     def _build_menu(self):
@@ -571,6 +835,14 @@ class TrayApp:
             pystray.MenuItem(
                 "🤖 模型列表",
                 pystray.Menu(self._models_submenu_items),
+            ),
+            pystray.MenuItem(
+                self._activity_active_line,
+                pystray.Menu(self._activity_active_submenu),
+            ),
+            pystray.MenuItem(
+                _ACTIVITY_RECENT_TITLE,
+                pystray.Menu(self._activity_recent_submenu),
             ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(self._local_url_line, self._on_copy_local_url),
@@ -627,9 +899,17 @@ class TrayApp:
         self._icon = pystray.Icon("kiro-gateway-tray", make_icon(False), "Kiro Gateway", menu)
         macos_menu.install_retina_icon_fix()
         macos_menu.install_menu_gray_suffix()
+        macos_menu.install_live_status_menu(
+            on_will_open=self._on_status_menu_will_open,
+            on_did_close=self._on_status_menu_did_close,
+            on_tick=self._on_status_menu_tick,
+            tick_interval=1.0,
+        )
+        macos_menu.install_reopen_handler(self._icon, self._on_app_reopen)
         threading.Thread(target=_startup, daemon=True).start()
         self._kick_update_check()
         self._start_usage_refresh_loop()
+        self._start_activity_refresh_loop()
         # Windows-only taskbar theme auto-adaptation. start() is a no-op on
         # macOS/Linux, so it's safe to call unconditionally.
         self._theme_watcher = ThemeWatcher(self._on_theme_change)

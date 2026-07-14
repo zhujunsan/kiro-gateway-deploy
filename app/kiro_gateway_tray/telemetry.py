@@ -9,9 +9,10 @@ follows sections 五 (middleware), 六 (local aggregation), 八 (worker payload)
 Pipeline:
   request ─▶ TelemetryMiddleware ─▶ vendored main.app
                  │ per request: model / status / bytes / usage (SSE + JSON)
+                 │ also note_model → CreditTracker (background /usage segments)
                  ▼ accumulate into the currently-open in-memory bucket
             Aggregator (keyed by username × model × app_version × bucket_start)
-                 ▲ a background timer thread closes & uploads expired buckets
+                 ▲ a background timer thread checkpoints credits, closes & uploads
                  ▼ on upload failure: append to <data_dir>/telemetry/pending.jsonl
             Uploader ─▶ POST {TELEMETRY_URL}  (Authorization: Bearer …)
 
@@ -28,15 +29,16 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import httpx
 
-from .httpclient import resolve_proxy
+from .httpclient import local_client, resolve_proxy
 from .log import logger
 
 # --- constants ---------------------------------------------------------------
@@ -87,6 +89,9 @@ class TelemetryConfig:
     # same-origin as /provision and authenticated with the activation code.
     provision_url: str = ""
     shared_secret: str = ""
+    # Local gateway probe for CreditTracker (already in child env via to_gateway_env).
+    gateway_port: int = 64005
+    proxy_api_key: str = ""
 
     @property
     def enabled(self) -> bool:
@@ -99,6 +104,11 @@ class TelemetryConfig:
         """A 401 can only be recovered when we have both an activation code and
         the provision origin to call /telemetry-secret against."""
         return bool(self.provision_url and self.shared_secret and self.username)
+
+    @property
+    def can_sample_credits(self) -> bool:
+        """Credit sampling needs a local API key to call GET /usage."""
+        return bool(self.proxy_api_key and self.gateway_port > 0)
 
 
 def from_env(env: dict[str, str] | None = None) -> TelemetryConfig:
@@ -122,6 +132,8 @@ def from_env(env: dict[str, str] | None = None) -> TelemetryConfig:
         max_retention_days=_int("TELEMETRY_MAX_RETENTION_DAYS", DEFAULT_MAX_RETENTION_DAYS),
         provision_url=(e.get("TELEMETRY_PROVISION_URL") or "").strip(),
         shared_secret=(e.get("TELEMETRY_SHARED_SECRET") or "").strip(),
+        gateway_port=_int("SERVER_PORT", 64005),
+        proxy_api_key=(e.get("PROXY_API_KEY") or "").strip(),
     )
 
 
@@ -144,9 +156,21 @@ class _Bucket:
     total_tokens_sum: int = 0
     request_bytes_sum: int = 0
     response_bytes_sum: int = 0
+    # Estimated Credit usage from /usage segment diffs (Kiro billing may lag).
+    estimated_credits: float = 0.0
+    credit_estimate_segments: int = 0
+    credit_estimate_missing_segments: int = 0
 
     def to_row(self) -> dict[str, Any]:
-        """Serialise to the worker payload row shape (design 八)."""
+        """Serialise to the worker payload row shape (design 八).
+
+        Credit fields are null when no segment was settled for this bucket
+        (unknown). Explicit 0 means a settle measured zero Credit consumed.
+        """
+        has_credit_estimate = (
+            self.credit_estimate_segments > 0
+            or self.credit_estimate_missing_segments > 0
+        )
         return {
             "bucket_start": self.bucket_start,
             "bucket_seconds": self.bucket_seconds,
@@ -161,6 +185,16 @@ class _Bucket:
             "total_tokens_sum": self.total_tokens_sum,
             "request_bytes_sum": self.request_bytes_sum,
             "response_bytes_sum": self.response_bytes_sum,
+            "estimated_credits": (
+                float(self.estimated_credits) if has_credit_estimate else None
+            ),
+            "credit_estimate_segments": (
+                int(self.credit_estimate_segments) if has_credit_estimate else None
+            ),
+            "credit_estimate_missing_segments": (
+                int(self.credit_estimate_missing_segments)
+                if has_credit_estimate else None
+            ),
         }
 
 
@@ -237,6 +271,39 @@ class Aggregator:
             b.request_bytes_sum += max(0, int(sample.request_bytes))
             b.response_bytes_sum += max(0, int(sample.response_bytes))
 
+    def record_credit_estimate(
+        self,
+        model: str,
+        *,
+        credits: float | None = None,
+        missing: bool = False,
+        now: float | None = None,
+    ) -> None:
+        """Accumulate a settled Credit segment (or mark an unestimable gap).
+
+        Credits are attributed to the bucket that contains ``now`` (segment end).
+        Creates the bucket if needed so a late segment settle is not dropped."""
+        ts = time.time() if now is None else now
+        bstart = bucket_start_for(ts, self.bucket_seconds)
+        model = model or "unknown"
+        key = (self.username, model, self.app_version, bstart)
+        with self._lock:
+            b = self._buckets.get(key)
+            if b is None:
+                b = _Bucket(
+                    bucket_start=bstart,
+                    bucket_seconds=self.bucket_seconds,
+                    username=self.username,
+                    model=model,
+                    app_version=self.app_version,
+                )
+                self._buckets[key] = b
+            if missing:
+                b.credit_estimate_missing_segments += 1
+            elif credits is not None and credits >= 0:
+                b.estimated_credits += float(credits)
+                b.credit_estimate_segments += 1
+
     def collect_closed(self, now: float | None = None) -> list[dict[str, Any]]:
         """Remove & return rows for buckets whose window has fully elapsed.
 
@@ -259,6 +326,231 @@ class Aggregator:
             rows = [b.to_row() for b in self._buckets.values()]
             self._buckets.clear()
         return rows
+
+
+# --- Credit segment tracker --------------------------------------------------
+
+@dataclass(frozen=True)
+class CreditReading:
+    """One snapshot of account Credit usage from GET /usage."""
+    credits_used: float
+    reset_key: str = ""
+
+
+def parse_credits_used(data: dict[str, Any] | None) -> CreditReading | None:
+    """Sum ``breakdowns[].used`` into a single account Credit reading.
+
+    Returns None when the payload is unusable. ``reset_key`` is ``nextDateReset``
+    (stringified) so a billing-cycle reset can invalidate an open segment."""
+    if not isinstance(data, dict):
+        return None
+    breakdowns = data.get("breakdowns")
+    if not isinstance(breakdowns, list) or not breakdowns:
+        return None
+    total = 0.0
+    any_used = False
+    for b in breakdowns:
+        if not isinstance(b, dict):
+            continue
+        raw = b.get("used")
+        if raw is None:
+            continue
+        try:
+            total += float(raw)
+            any_used = True
+        except (TypeError, ValueError):
+            continue
+    if not any_used:
+        return None
+    reset = data.get("nextDateReset")
+    reset_key = "" if reset is None else str(reset)
+    return CreditReading(credits_used=total, reset_key=reset_key)
+
+
+def fetch_credits_used(
+    *,
+    port: int,
+    api_key: str,
+    timeout: float = 10.0,
+) -> CreditReading | None:
+    """Probe localhost GET /usage and return the Credit reading, or None."""
+    if not api_key or port <= 0:
+        return None
+    url = f"http://127.0.0.1:{int(port)}/usage"
+    headers = {"Authorization": f"Bearer {api_key}"}
+    try:
+        with local_client(timeout=timeout) as client:
+            resp = client.get(url, headers=headers)
+        if resp.status_code != 200:
+            logger.debug("telemetry: /usage returned {}", resp.status_code)
+            return None
+        return parse_credits_used(resp.json())
+    except Exception:
+        logger.debug("telemetry: /usage credit sample failed", exc_info=True)
+        return None
+
+
+class CreditTracker:
+    """Background model-segment Credit estimator.
+
+    Middleware calls :meth:`note_model` (non-blocking). A dedicated worker thread
+    serialises model switches and samples GET /usage so request latency is never
+    blocked. :meth:`checkpoint` waits for a sample+settle of the current model
+    before the reporter closes expired buckets.
+    """
+
+    def __init__(
+        self,
+        aggregator: Aggregator,
+        *,
+        sample_fn: Callable[[], CreditReading | None] | None = None,
+        bucket_seconds: int = DEFAULT_BUCKET_SECONDS,
+    ) -> None:
+        self.aggregator = aggregator
+        self._sample_fn = sample_fn
+        self.bucket_seconds = bucket_seconds if bucket_seconds > 0 else DEFAULT_BUCKET_SECONDS
+        self._queue: queue.Queue[tuple] = queue.Queue()
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+        # Open segment state (only touched on the worker thread).
+        self._current_model: str | None = None
+        self._baseline: float | None = None
+        self._reset_key: str | None = None
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._loop, name="telemetry-credit", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self, *, timeout: float = 5.0) -> None:
+        """Drain pending events then stop the worker thread."""
+        self._queue.put(("stop",))
+        t = self._thread
+        if t and t.is_alive() and t is not threading.current_thread():
+            t.join(timeout=timeout)
+        self._thread = None
+
+    def note_model(self, model: str) -> None:
+        """Enqueue a model sighting. Never blocks on /usage."""
+        try:
+            self._queue.put(("model", model or "unknown", time.time()))
+        except Exception:
+            logger.debug("telemetry: note_model enqueue failed", exc_info=True)
+
+    def checkpoint(self, *, now: float | None = None, timeout: float = 15.0) -> None:
+        """Sample+settle the current model segment; wait until done or timeout."""
+        done = threading.Event()
+        ts = time.time() if now is None else now
+        try:
+            self._queue.put(("checkpoint", done, ts))
+        except Exception:
+            logger.debug("telemetry: checkpoint enqueue failed", exc_info=True)
+            return
+        if not done.wait(timeout=timeout):
+            logger.debug("telemetry: credit checkpoint timed out after {}s", timeout)
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                item = self._queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                kind = item[0]
+                if kind == "stop":
+                    self._stop.set()
+                    break
+                if kind == "model":
+                    self._handle_model(item[1], item[2])
+                elif kind == "checkpoint":
+                    self._handle_checkpoint(item[1], item[2])
+            except Exception:
+                logger.debug("telemetry: credit tracker event failed", exc_info=True)
+                if item[0] == "checkpoint":
+                    try:
+                        item[1].set()
+                    except Exception:
+                        pass
+
+    def _sample(self) -> CreditReading | None:
+        if self._sample_fn is None:
+            return None
+        try:
+            return self._sample_fn()
+        except Exception:
+            logger.debug("telemetry: credit sample_fn failed", exc_info=True)
+            return None
+
+    def _handle_model(self, model: str, ts: float) -> None:
+        model = model or "unknown"
+        if self._current_model is None:
+            reading = self._sample()
+            if reading is None:
+                # No baseline yet — keep waiting; next note_model retries.
+                return
+            self._current_model = model
+            self._baseline = reading.credits_used
+            self._reset_key = reading.reset_key
+            return
+        if model == self._current_model:
+            if self._baseline is None:
+                reading = self._sample()
+                if reading is not None:
+                    self._baseline = reading.credits_used
+                    self._reset_key = reading.reset_key
+            return
+        # Switch A → B: one sample settles A and starts B.
+        reading = self._sample()
+        self._settle(self._current_model, reading, now=ts)
+        if reading is None:
+            # Lost baseline; next successful sample re-establishes.
+            self._current_model = model
+            self._baseline = None
+            self._reset_key = None
+            return
+        self._current_model = model
+        self._baseline = reading.credits_used
+        self._reset_key = reading.reset_key
+
+    def _handle_checkpoint(self, done: threading.Event, ts: float) -> None:
+        try:
+            if self._current_model is None:
+                return
+            reading = self._sample()
+            self._settle(self._current_model, reading, now=ts)
+            if reading is not None:
+                # Continue the same model from the checkpoint reading.
+                self._baseline = reading.credits_used
+                self._reset_key = reading.reset_key
+            else:
+                self._baseline = None
+                self._reset_key = None
+        finally:
+            done.set()
+
+    def _settle(
+        self,
+        model: str,
+        reading: CreditReading | None,
+        *,
+        now: float,
+    ) -> None:
+        if self._baseline is None or reading is None:
+            self.aggregator.record_credit_estimate(model, missing=True, now=now)
+            return
+        if self._reset_key is not None and reading.reset_key != self._reset_key:
+            # Billing cycle reset — discard the open segment.
+            self.aggregator.record_credit_estimate(model, missing=True, now=now)
+            return
+        delta = float(reading.credits_used) - float(self._baseline)
+        if delta < 0:
+            self.aggregator.record_credit_estimate(model, missing=True, now=now)
+            return
+        self.aggregator.record_credit_estimate(model, credits=delta, now=now)
 
 
 # --- local spool (pending.jsonl) ---------------------------------------------
@@ -443,6 +735,7 @@ class Reporter:
         pending: PendingStore,
         refresher: "SecretRefresher | None" = None,
         on_secret_refresh: Any = None,
+        credit_tracker: "CreditTracker | None" = None,
     ) -> None:
         self.config = config
         self.aggregator = aggregator
@@ -452,6 +745,7 @@ class Reporter:
         # Optional callback(new_secret) to persist a refreshed secret back to
         # config so it survives the next restart. Failures are swallowed.
         self.on_secret_refresh = on_secret_refresh
+        self.credit_tracker = credit_tracker
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._next_pending_retry = 0.0
@@ -460,6 +754,11 @@ class Reporter:
     # -- timer lifecycle --
     def start(self) -> None:
         """Start the background timer thread (idempotent)."""
+        if self.credit_tracker is not None:
+            try:
+                self.credit_tracker.start()
+            except Exception:
+                logger.debug("telemetry: credit tracker start failed", exc_info=True)
         if self._thread and self._thread.is_alive():
             return
         self._stop.clear()
@@ -491,16 +790,35 @@ class Reporter:
             self.flush_all()
         except Exception:
             logger.debug("telemetry: final flush failed", exc_info=True)
+        if self.credit_tracker is not None:
+            try:
+                self.credit_tracker.stop()
+            except Exception:
+                logger.debug("telemetry: credit tracker stop failed", exc_info=True)
 
     # -- upload paths --
     def tick(self, *, now: float | None = None) -> None:
-        """One timer iteration: close+upload expired buckets, then retry spool."""
-        closed = self.aggregator.collect_closed(now)
+        """One timer iteration: credit checkpoint, close+upload, then retry spool."""
+        ts = time.time() if now is None else now
+        if self.credit_tracker is not None:
+            try:
+                # Attribute the settle to the bucket that is about to close.
+                # At the exact boundary ``ts == bucket_start + bucket_seconds``,
+                # ``bucket_start_for(ts)`` would land in the *next* window.
+                self.credit_tracker.checkpoint(now=ts - 1e-6)
+            except Exception:
+                logger.debug("telemetry: credit checkpoint failed", exc_info=True)
+        closed = self.aggregator.collect_closed(now=ts)
         self._upload_or_spool(closed)
-        self._retry_pending(now=now)
+        self._retry_pending(now=ts)
 
     def flush_all(self, *, now: float | None = None) -> None:
         """Upload every open bucket regardless of age (shutdown). Failures spool."""
+        if self.credit_tracker is not None:
+            try:
+                self.credit_tracker.checkpoint(now=now)
+            except Exception:
+                logger.debug("telemetry: credit checkpoint on flush failed", exc_info=True)
         rows = self.aggregator.drain_all()
         self._upload_or_spool(rows)
         # One best-effort backlog drain on the way out.
@@ -762,6 +1080,14 @@ class TelemetryMiddleware:
         except Exception:
             logger.debug("telemetry: model extraction failed", exc_info=True)
 
+        # Non-blocking: enqueue model sighting for Credit segment tracking.
+        try:
+            tracker = getattr(self.reporter, "credit_tracker", None)
+            if tracker is not None:
+                tracker.note_model(model)
+        except Exception:
+            logger.debug("telemetry: note_model failed", exc_info=True)
+
         replay_index = 0
 
         async def replay_receive() -> dict:
@@ -876,8 +1202,24 @@ def build_reporter(config: TelemetryConfig, data_dir: Path) -> Reporter:
             )
         refresher = SecretRefresher(_do_refresh)
         on_secret_refresh = _persist_refreshed_secret
-    return Reporter(config, aggregator, uploader, pending,
-                    refresher=refresher, on_secret_refresh=on_secret_refresh)
+    credit_tracker: CreditTracker | None = None
+    if config.can_sample_credits:
+        port = config.gateway_port
+        api_key = config.proxy_api_key
+
+        def _sample() -> CreditReading | None:
+            return fetch_credits_used(port=port, api_key=api_key)
+
+        credit_tracker = CreditTracker(
+            aggregator,
+            sample_fn=_sample,
+            bucket_seconds=config.bucket_seconds,
+        )
+    return Reporter(
+        config, aggregator, uploader, pending,
+        refresher=refresher, on_secret_refresh=on_secret_refresh,
+        credit_tracker=credit_tracker,
+    )
 
 
 def _persist_refreshed_secret(new_secret: str) -> None:

@@ -66,6 +66,52 @@ def test_kill_orphan_terminates_live_cloudflared(monkeypatch, tmp_path):
     assert proc_guard.read_pid() is None  # cleared after reaping
 
 
+def test_kill_gateway_orphans_reaps_recorded_and_legacy_children(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(proc_guard.paths, "data_dir", lambda: tmp_path)
+    monkeypatch.setattr(proc_guard.paths, "ensure_dirs", lambda: None)
+    proc_guard.record_gateway_pid(4321)
+    monkeypatch.setattr(
+        proc_guard, "_gateway_pids_from_process_table", lambda: [4321, 5678]
+    )
+    monkeypatch.setattr(proc_guard, "_pid_is_alive", lambda _pid: True)
+    monkeypatch.setattr(proc_guard, "_looks_like_gateway", lambda _pid: True)
+    killed = []
+    monkeypatch.setattr(proc_guard, "_terminate", lambda pid: killed.append(pid))
+
+    assert proc_guard.kill_gateway_orphans() is True
+    assert killed == [4321, 5678]
+    assert (tmp_path / "gateway.pid").exists() is False
+
+
+def test_kill_gateway_orphans_does_not_kill_reused_pid(monkeypatch, tmp_path):
+    monkeypatch.setattr(proc_guard.paths, "data_dir", lambda: tmp_path)
+    monkeypatch.setattr(proc_guard.paths, "ensure_dirs", lambda: None)
+    proc_guard.record_gateway_pid(999)
+    monkeypatch.setattr(proc_guard, "_gateway_pids_from_process_table", lambda: [])
+    monkeypatch.setattr(proc_guard, "_pid_is_alive", lambda _pid: True)
+    monkeypatch.setattr(proc_guard, "_looks_like_gateway", lambda _pid: False)
+    killed = []
+    monkeypatch.setattr(proc_guard, "_terminate", lambda pid: killed.append(pid))
+
+    assert proc_guard.kill_gateway_orphans() is False
+    assert killed == []
+    assert (tmp_path / "gateway.pid").exists() is False
+
+
+def test_gateway_command_identity_requires_app_and_hidden_argument():
+    assert proc_guard._command_looks_like_gateway(
+        "/Applications/KiroGatewayTray.app/Contents/MacOS/KiroGatewayTray "
+        "--run-gateway"
+    )
+    assert proc_guard._command_looks_like_gateway(
+        "python -m kiro_gateway_tray --run-gateway"
+    )
+    assert not proc_guard._command_looks_like_gateway("other-app --run-gateway")
+    assert not proc_guard._command_looks_like_gateway("KiroGatewayTray")
+
+
 def test_pid_is_alive_self():
     # The current process is, definitionally, alive.
     assert proc_guard._pid_is_alive(os.getpid()) is True

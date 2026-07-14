@@ -11,6 +11,8 @@ Constraints (Cloudflare Workers Logs):
   client-side; the Worker rejects anything over 192 KiB with 413.
 
 Never raises into the request path. Failures spool to pending-errors.jsonl.
+On stop, any still-queued records are flushed to the same spool so a restart
+can retry them (manifest stays first so orphan manifests remain visible).
 """
 from __future__ import annotations
 
@@ -406,6 +408,24 @@ class IncidentReporter:
         t = self._thread
         if t and t.is_alive():
             t.join(timeout=timeout)
+        # Persist anything still queued so a restart can retry (manifest-first
+        # ordering is kept; orphan manifests remain a signal of missing chunks).
+        self._flush_queue_to_pending()
+
+    def _flush_queue_to_pending(self) -> None:
+        with self._lock:
+            leftover = self._queue
+            self._queue = []
+        if not leftover:
+            return
+        try:
+            self.pending.append(leftover)
+            logger.info(
+                "incident_report: flushed {} queued record(s) to spool on stop",
+                len(leftover),
+            )
+        except Exception:
+            logger.debug("incident_report: stop flush failed", exc_info=True)
 
     def enqueue_snapshot(self, snapshot: dict[str, Any]) -> None:
         """Called from the debug_logger callback (request thread). Never raises."""

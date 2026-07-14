@@ -37,10 +37,16 @@ wrangler deploy
 
 遥测复用本 worker（方案 A），新增三块能力（详见 `docs/2026-06-25-telemetry-design.md`）：
 
-- `POST /telemetry`：用 `Authorization: Bearer <TELEMETRY_SECRET>` 鉴权（恒定时间比较），把上报的桶写入 D1 `usage_rollup`（`ON CONFLICT DO UPDATE` 覆盖，last-write-wins）。返回 `{ ok, accepted }`。
+- `POST /telemetry`：用 `Authorization: Bearer <TELEMETRY_SECRET>` 鉴权（恒定时间比较），把上报的桶写入 D1 `usage_rollup`（`ON CONFLICT DO UPDATE` 覆盖，last-write-wins）。返回 `{ ok, accepted }`。行内可选 `estimated_credits` / `credit_estimate_*`（旧客户端缺省为 `NULL`=未知；显式 `0`=测得零消耗）。
 - `POST /telemetry/errors`：同一 Bearer 鉴权。每次请求只收一条 `record`（`manifest` 或 `artifact_chunk`），校验后写入 **一条** `console.error` 到 Workers Logs（不写 D1）。单条序列化上限 192 KiB，超出返回 413。查询时按 `kind=kiro_gateway_incident` / `incident_id` / `source` / `code` 过滤；`artifact_chunk` 用 `part_id`/`part_index` 去重重组。**日志可能含完整请求/响应正文，请收紧 Cloudflare 账号访问权限。**
 - `GET|POST /q/<name>`：只读查询，仅开放写死的参数化固定查询（`daily-by-user` / `model-distribution` / `active-users` / `user-totals`），默认查 `usage_daily`，结果缓存 60 分钟。**`/q/*` 不在 worker 内校验密钥，由 Cloudflare Access 在边缘保护**。
-- `scheduled()`（cron）：每小时把 `usage_rollup` 卷成 `usage_daily`（按天 × user × model 聚合，幂等可重入）。
+- `scheduled()`（cron）：每小时把 `usage_rollup` 卷成 `usage_daily`（按天 × user × model 聚合，含 `estimated_credits` SUM，幂等可重入）。
+
+线上已有库加列：
+
+```bash
+wrangler d1 execute kiro-telemetry --remote --file=./migrations/2026-07-14-estimated-credits.sql
+```
 
 部署时请在 `wrangler.toml` 打开 `[observability]`（见 `wrangler.toml.sample`）：`enabled=true`、`head_sampling_rate=1`、`invocation_logs=false`。
 

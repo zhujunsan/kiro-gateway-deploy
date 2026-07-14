@@ -1,14 +1,32 @@
 # app/kiro_gateway_tray/macos_menu.py
-"""macOS-only cosmetic patches for pystray's Cocoa backend.
+"""macOS-only cosmetic / live-update patches for pystray's Cocoa backend.
 
-Both functions are no-ops off macOS and swallow import errors, so callers can
-invoke them unconditionally. They monkey-patch ``pystray._darwin.Icon`` to:
+All public helpers are no-ops off macOS and swallow import errors, so callers
+can invoke them unconditionally. They monkey-patch ``pystray._darwin.Icon`` to:
+
   - right-align a smaller gray "tag" after a ``\\t`` in menu item titles
   - render the menu-bar glyph at Retina resolution so it isn't blurry
+  - attach an ``NSMenuDelegate`` so the tray can refresh titles while open
+    *without* calling ``setMenu:`` (which breaks AppKit menu tracking)
 """
 from __future__ import annotations
 
 import sys
+from typing import Any, Callable
+
+# Set True between menuWillOpen: and menuDidClose: for the status-item root menu.
+# Prefer this over button.isHighlighted() when deciding whether setMenu: is safe.
+_status_menu_session_open = False
+
+_LiveWillOpen = Callable[[Any], None]
+_LiveDidClose = Callable[[Any], None]
+_LiveTick = Callable[[], None]
+
+_live_hooks: dict[str, Any] = {
+    "will_open": None,
+    "did_close": None,
+    "tick": None,
+}
 
 
 def run_on_main_thread(fn) -> None:
@@ -29,18 +47,250 @@ def run_on_main_thread(fn) -> None:
     NSOperationQueue.mainQueue().addOperationWithBlock_(fn)
 
 
+def install_reopen_handler(icon, on_reopen: Callable[[], None]) -> None:
+    """Handle Finder/LaunchServices attempts to open an already-running app.
+
+    macOS normally reuses the existing application process instead of launching
+    a second executable, so the file-based single-instance lock is never
+    reached. ``applicationShouldHandleReopen:hasVisibleWindows:`` is the event
+    delivered to the existing process for that case.
+    """
+    if sys.platform != "darwin" or icon is None:
+        return
+    try:
+        import AppKit
+        import objc
+    except Exception:
+        return
+
+    class _ReopenDelegate(AppKit.NSObject):
+        def applicationShouldHandleReopen_hasVisibleWindows_(
+            self, _application, _has_visible_windows
+        ):
+            try:
+                on_reopen()
+            except Exception:
+                pass
+            return False
+
+    try:
+        delegate = _ReopenDelegate.alloc().init()
+        app = getattr(icon, "_app", None) or AppKit.NSApplication.sharedApplication()
+        app.setDelegate_(delegate)
+        # NSApplication's delegate is not retained. Keep it alive for the same
+        # lifetime as pystray's icon.
+        icon._kg_reopen_delegate = delegate
+    except Exception:
+        return
+
+
+def is_status_menu_open(icon) -> bool:
+    """True while the user has the tray status-item menu pulled down.
+
+    Replacing the menu via ``NSStatusItem.setMenu:`` (pystray ``update_menu``)
+    during AppKit menu tracking breaks the tracking session: the menu freezes
+    and keyboard events can appear system-wide "hijacked" until the tray app
+    exits. Off macOS, or if the status item isn't available, return False.
+    """
+    if _status_menu_session_open:
+        return True
+    if sys.platform != "darwin" or icon is None:
+        return False
+    try:
+        status_item = getattr(icon, "_status_item", None)
+        if status_item is None:
+            return False
+        # pystray's real NSStatusItem; ignore plain mocks without a real button.
+        button = status_item.button()
+        if button is None:
+            return False
+        highlighted = button.isHighlighted()
+        # AppKit returns a real bool; refuse MagicsMock / other truthy junk.
+        return highlighted is True or highlighted == 1
+    except Exception:
+        return False
+
+
+def find_menu_item_by_title_prefix(nsmenu, prefix: str):
+    """Return the first ``NSMenuItem`` whose title starts with ``prefix``, or None."""
+    if nsmenu is None:
+        return None
+    try:
+        for i in range(int(nsmenu.numberOfItems())):
+            item = nsmenu.itemAtIndex_(i)
+            if item is None or item.isSeparatorItem():
+                continue
+            title = str(item.title() or "")
+            if title.startswith(prefix):
+                return item
+    except Exception:
+        return None
+    return None
+
+
+def find_menu_item_by_exact_title(nsmenu, title: str):
+    if nsmenu is None:
+        return None
+    try:
+        for i in range(int(nsmenu.numberOfItems())):
+            item = nsmenu.itemAtIndex_(i)
+            if item is None or item.isSeparatorItem():
+                continue
+            if str(item.title() or "") == title:
+                return item
+    except Exception:
+        return None
+    return None
+
+
+def apply_menu_item_title(item, title: str) -> None:
+    """Set an item title, re-applying macOS attributed styles when needed.
+
+    Safe to call while the menu is open (unlike ``setMenu:`` / ``update_menu``).
+
+    - Titles with ``\\t`` get the right-aligned gray suffix treatment.
+    - Titles with ``\\n`` get a real multi-line attributed title (plain
+      ``setTitle:`` collapses newlines on AppKit menus).
+    """
+    if item is None:
+        return
+    title = title or ""
+    if sys.platform != "darwin":
+        try:
+            item.setTitle_(title)
+        except Exception:
+            pass
+        return
+    try:
+        import AppKit
+        import Foundation
+    except Exception:
+        try:
+            item.setTitle_(title)
+        except Exception:
+            pass
+        return
+    try:
+        if "\n" in title:
+            _apply_multiline_attributed_title(item, title, AppKit, Foundation)
+        elif "\t" in title:
+            _apply_tab_attributed_title(item, title, AppKit, Foundation)
+        else:
+            item.setTitle_(title)
+    except Exception:
+        try:
+            item.setTitle_(title)
+        except Exception:
+            pass
+
+
+def _apply_multiline_attributed_title(item, title: str, AppKit, Foundation) -> None:
+    """Render an explicit multi-line menu title via attributed string.
+
+    AppKit's plain ``setTitle:`` ignores/collapses ``\\n``. Using
+    ``setAttributedTitle:`` with a paragraph style keeps the line breaks and
+    grows the menu row height. Line 0 stays the primary menu font; following
+    lines are smaller secondary (gray) text for 问/答 previews.
+    """
+    menu_font = AppKit.NSFont.menuFontOfSize_(0)
+    font_size = menu_font.pointSize()
+    small_font = AppKit.NSFont.menuFontOfSize_(max(10.0, font_size - 2))
+    gray = AppKit.NSColor.secondaryLabelColor()
+
+    para = AppKit.NSMutableParagraphStyle.alloc().init()
+    para.setLineBreakMode_(AppKit.NSLineBreakByTruncatingTail)
+    # Slightly tighter than default so 3-line recent items stay compact.
+    para.setLineSpacing_(1.0)
+    para.setParagraphSpacing_(1.0)
+
+    attr = Foundation.NSMutableAttributedString.alloc().initWithString_(title)
+    full_range = Foundation.NSRange(0, attr.length())
+    attr.addAttribute_value_range_(AppKit.NSFontAttributeName, menu_font, full_range)
+    attr.addAttribute_value_range_(
+        AppKit.NSParagraphStyleAttributeName, para, full_range
+    )
+
+    # Style everything after the first newline as secondary preview text.
+    first_nl = title.find("\n")
+    if first_nl >= 0:
+        # NSString length matches UTF-16 length used by NSRange.
+        ns_first = Foundation.NSString.stringWithString_(title[: first_nl + 1]).length()
+        rest_len = attr.length() - ns_first
+        if rest_len > 0:
+            rest_range = Foundation.NSRange(ns_first, rest_len)
+            attr.addAttribute_value_range_(
+                AppKit.NSFontAttributeName, small_font, rest_range
+            )
+            attr.addAttribute_value_range_(
+                AppKit.NSForegroundColorAttributeName, gray, rest_range
+            )
+
+    item.setAttributedTitle_(attr)
+
+
+def _apply_tab_attributed_title(item, title: str, AppKit, Foundation) -> None:
+    left, right = title.split("\t", 1)
+    menu_font = AppKit.NSFont.menuFontOfSize_(0)
+    font_size = menu_font.pointSize()
+    small_font = AppKit.NSFont.menuFontOfSize_(font_size - 2)
+    gray = AppKit.NSColor.secondaryLabelColor()
+    bg = AppKit.NSColor.colorWithCalibratedWhite_alpha_(0.5, 0.15)
+    is_badge = right.strip() == "复制"
+    if is_badge:
+        right = f"   {right}   "
+    composed = left + "\t" + right
+
+    # Match install_menu_gray_suffix: one right-aligned tab sized to this item.
+    left_w = _text_width(left, menu_font, AppKit, Foundation)
+    right_w = _text_width(right, small_font, AppKit, Foundation)
+    tab_pos = left_w + 16.0 + right_w
+
+    para = AppKit.NSMutableParagraphStyle.alloc().init()
+    tab = AppKit.NSTextTab.alloc().initWithType_location_(
+        AppKit.NSRightTabStopType, tab_pos
+    )
+    para.setTabStops_([tab])
+
+    attr = Foundation.NSMutableAttributedString.alloc().initWithString_(composed)
+    full_range = Foundation.NSRange(0, attr.length())
+    attr.addAttribute_value_range_(AppKit.NSFontAttributeName, menu_font, full_range)
+    attr.addAttribute_value_range_(
+        AppKit.NSParagraphStyleAttributeName, para, full_range
+    )
+
+    ns_left_len = Foundation.NSString.stringWithString_(left).length()
+    ns_right_len = Foundation.NSString.stringWithString_(right).length()
+    right_range = Foundation.NSRange(ns_left_len + 1, ns_right_len)
+    attr.addAttribute_value_range_(
+        AppKit.NSForegroundColorAttributeName, gray, right_range
+    )
+    attr.addAttribute_value_range_(
+        AppKit.NSFontAttributeName, small_font, right_range
+    )
+    if is_badge:
+        attr.addAttribute_value_range_(
+            AppKit.NSBackgroundColorAttributeName, bg, right_range
+        )
+    item.setAttributedTitle_(attr)
+
+
+def _text_width(s, font, AppKit, Foundation) -> float:
+    ns = Foundation.NSString.stringWithString_(s)
+    attrs = Foundation.NSDictionary.dictionaryWithObject_forKey_(
+        font, AppKit.NSFontAttributeName
+    )
+    return ns.sizeWithAttributes_(attrs).width
+
+
 def install_menu_gray_suffix() -> None:
-    """Post-process each NSMenu after it's built. For every item whose title
-    contains ``\\t``:
+    """Post-process each NSMenu after it's built.
 
-    1. Measure the left-side text width of ALL tab items in the same menu.
-    2. Set a single right-aligned tab stop at ``max_left_width + pad`` so all
-       right-side tags line up, adapting to the actual content width.
-    3. Style the right part as smaller gray text, with a background badge on
-       clickable items.
+    - Titles with ``\\t``: right-align a smaller gray tag (and badge ``复制``).
+    - Titles with ``\\n``: apply multi-line attributed titles so AppKit actually
+      shows more than one row (plain ``setTitle:`` collapses newlines).
 
-    Runs per-menu (including submenus), so the main menu and the models submenu
-    each get their own optimal width.
+    Runs per-menu (including submenus), so the main menu and the models /
+    recent-conversation submenus each get their own treatment.
     """
     if sys.platform != "darwin":
         return
@@ -57,13 +307,6 @@ def install_menu_gray_suffix() -> None:
     def _ns_len(s):
         return Foundation.NSString.stringWithString_(s).length()
 
-    def _text_width(s, font):
-        ns = Foundation.NSString.stringWithString_(s)
-        attrs = Foundation.NSDictionary.dictionaryWithObject_forKey_(
-            font, AppKit.NSFontAttributeName
-        )
-        return ns.sizeWithAttributes_(attrs).width
-
     def _patched_create_menu(self, descriptors, callbacks):
         nsmenu = _orig_create_menu(self, descriptors, callbacks)
         if nsmenu is None:
@@ -76,6 +319,7 @@ def install_menu_gray_suffix() -> None:
         bg = AppKit.NSColor.colorWithCalibratedWhite_alpha_(0.5, 0.15)
 
         tab_items = []
+        multiline_items = []
         max_total_w = 0.0
 
         for i in range(nsmenu.numberOfItems()):
@@ -83,17 +327,26 @@ def install_menu_gray_suffix() -> None:
             if item.isSeparatorItem():
                 continue
             title = str(item.title() or "")
+            if "\n" in title:
+                multiline_items.append((item, title))
+                continue
             if "\t" not in title:
                 continue
             left, right = title.split("\t", 1)
             is_badge = right.strip() == "复制"
             padded_right = f"   {right}   " if is_badge else right
-            left_w = _text_width(left, menu_font)
-            right_w = _text_width(padded_right, small_font)
+            left_w = _text_width(left, menu_font, AppKit, Foundation)
+            right_w = _text_width(padded_right, small_font, AppKit, Foundation)
             total_w = left_w + _TAG_GAP + right_w
             if total_w > max_total_w:
                 max_total_w = total_w
             tab_items.append((item, left, right))
+
+        for item, title in multiline_items:
+            try:
+                _apply_multiline_attributed_title(item, title, AppKit, Foundation)
+            except Exception:
+                pass
 
         if not tab_items:
             return nsmenu
@@ -144,6 +397,115 @@ def install_menu_gray_suffix() -> None:
         return nsmenu
 
     _darwin.Icon._create_menu = _patched_create_menu
+
+
+def install_live_status_menu(
+    *,
+    on_will_open: _LiveWillOpen | None = None,
+    on_did_close: _LiveDidClose | None = None,
+    on_tick: _LiveTick | None = None,
+    tick_interval: float = 1.0,
+) -> None:
+    """Attach an NSMenuDelegate so titles can refresh while the menu is open.
+
+    - ``menuWillOpen:`` / ``menuDidClose:`` drive tray callbacks.
+    - A 1s timer in ``NSRunLoopCommonModes`` keeps firing during menu tracking
+      (default-mode timers do not), so elapsed-time labels can tick via
+      ``setTitle:`` without ``setMenu:``.
+    """
+    if sys.platform != "darwin":
+        return
+    try:
+        import AppKit
+        import Foundation
+        import objc
+        from pystray import _darwin
+    except Exception:
+        return
+
+    _live_hooks["will_open"] = on_will_open
+    _live_hooks["did_close"] = on_did_close
+    _live_hooks["tick"] = on_tick
+    interval = max(0.25, float(tick_interval))
+
+    class _StatusMenuLiveDelegate(AppKit.NSObject):
+        def init(self):
+            self = objc.super(_StatusMenuLiveDelegate, self).init()
+            if self is None:
+                return None
+            self._timer = None
+            return self
+
+        def menuWillOpen_(self, menu):
+            global _status_menu_session_open
+            _status_menu_session_open = True
+            cb = _live_hooks.get("will_open")
+            if cb is not None:
+                try:
+                    cb(menu)
+                except Exception:
+                    pass
+            self._start_timer()
+
+        def menuDidClose_(self, menu):
+            global _status_menu_session_open
+            self._stop_timer()
+            _status_menu_session_open = False
+            cb = _live_hooks.get("did_close")
+            if cb is not None:
+                try:
+                    cb(menu)
+                except Exception:
+                    pass
+
+        def liveTick_(self, _timer):
+            cb = _live_hooks.get("tick")
+            if cb is not None:
+                try:
+                    cb()
+                except Exception:
+                    pass
+
+        def _start_timer(self):
+            self._stop_timer()
+            # CommonModes: must fire during NSEventTrackingRunLoopMode (menu open).
+            timer = Foundation.NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
+                interval, self, b"liveTick:", None, True
+            )
+            Foundation.NSRunLoop.currentRunLoop().addTimer_forMode_(
+                timer, Foundation.NSRunLoopCommonModes
+            )
+            self._timer = timer
+
+        def _stop_timer(self):
+            timer = self._timer
+            self._timer = None
+            if timer is not None:
+                try:
+                    timer.invalidate()
+                except Exception:
+                    pass
+
+    _orig_update_menu = _darwin.Icon._update_menu
+
+    def _patched_update_menu(self):
+        _orig_update_menu(self)
+        handle = getattr(self, "_menu_handle", None)
+        if not handle:
+            return
+        nsmenu = handle[0]
+        if nsmenu is None:
+            return
+        delegate = getattr(self, "_kg_live_menu_delegate", None)
+        if delegate is None:
+            delegate = _StatusMenuLiveDelegate.alloc().init()
+            self._kg_live_menu_delegate = delegate
+        try:
+            nsmenu.setDelegate_(delegate)
+        except Exception:
+            pass
+
+    _darwin.Icon._update_menu = _patched_update_menu
 
 
 def install_retina_icon_fix() -> None:

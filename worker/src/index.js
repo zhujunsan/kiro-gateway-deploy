@@ -266,6 +266,7 @@ const ROLLUP_FIELDS = [
   "requests", "successes", "errors",
   "prompt_tokens_sum", "completion_tokens_sum", "total_tokens_sum",
   "request_bytes_sum", "response_bytes_sum",
+  "estimated_credits", "credit_estimate_segments", "credit_estimate_missing_segments",
 ];
 
 const ROLLUP_INSERT_SQL = `
@@ -273,8 +274,9 @@ INSERT INTO usage_rollup (bucket_start, bucket_seconds, username, model, app_ver
                           requests, successes, errors,
                           prompt_tokens_sum, completion_tokens_sum, total_tokens_sum,
                           request_bytes_sum, response_bytes_sum,
+                          estimated_credits, credit_estimate_segments, credit_estimate_missing_segments,
                           received_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(bucket_start, bucket_seconds, username, model, app_version)
 DO UPDATE SET
   requests = excluded.requests,
@@ -285,11 +287,30 @@ DO UPDATE SET
   total_tokens_sum = excluded.total_tokens_sum,
   request_bytes_sum = excluded.request_bytes_sum,
   response_bytes_sum = excluded.response_bytes_sum,
+  estimated_credits = excluded.estimated_credits,
+  credit_estimate_segments = excluded.credit_estimate_segments,
+  credit_estimate_missing_segments = excluded.credit_estimate_missing_segments,
   received_at = excluded.received_at`;
 
 function toInt(v, def = 0) {
   const n = parseInt(v, 10);
   return Number.isFinite(n) ? n : def;
+}
+
+/** Optional non-negative float: missing/invalid → null; explicit 0 stays 0. */
+function toOptionalNonNegFloat(v) {
+  if (v === undefined || v === null || v === "") return null;
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < 0) return null;
+  return n;
+}
+
+/** Optional non-negative int: missing/invalid → null; explicit 0 stays 0. */
+function toOptionalNonNegInt(v) {
+  if (v === undefined || v === null || v === "") return null;
+  const n = parseInt(v, 10);
+  if (!Number.isFinite(n) || n < 0) return null;
+  return n;
 }
 
 // 把一行上报数据归一成 INSERT 的参数数组。无效行（缺 username/model 等）返回 null。
@@ -318,6 +339,10 @@ function normalizeRollupRow(row, receivedAt) {
     toInt(row.total_tokens_sum),
     toInt(row.request_bytes_sum),
     toInt(row.response_bytes_sum),
+    // Old clients omit these → NULL (unknown). Explicit 0 means measured zero.
+    toOptionalNonNegFloat(row.estimated_credits),
+    toOptionalNonNegInt(row.credit_estimate_segments),
+    toOptionalNonNegInt(row.credit_estimate_missing_segments),
     receivedAt,
   ];
 }
@@ -658,12 +683,14 @@ const DAILY_ROLLUP_SQL = `
 INSERT INTO usage_daily (day, username, model,
                          requests, successes, errors,
                          prompt_tokens_sum, completion_tokens_sum, total_tokens_sum,
-                         request_bytes_sum, response_bytes_sum)
+                         request_bytes_sum, response_bytes_sum,
+                         estimated_credits, credit_estimate_segments, credit_estimate_missing_segments)
 SELECT date(bucket_start, 'unixepoch') AS day,
        username, model,
        SUM(requests), SUM(successes), SUM(errors),
        SUM(prompt_tokens_sum), SUM(completion_tokens_sum), SUM(total_tokens_sum),
-       SUM(request_bytes_sum), SUM(response_bytes_sum)
+       SUM(request_bytes_sum), SUM(response_bytes_sum),
+       SUM(estimated_credits), SUM(credit_estimate_segments), SUM(credit_estimate_missing_segments)
 FROM usage_rollup
 WHERE date(bucket_start, 'unixepoch') = ?
 GROUP BY day, username, model
@@ -676,7 +703,10 @@ DO UPDATE SET
   completion_tokens_sum = excluded.completion_tokens_sum,
   total_tokens_sum = excluded.total_tokens_sum,
   request_bytes_sum = excluded.request_bytes_sum,
-  response_bytes_sum = excluded.response_bytes_sum`;
+  response_bytes_sum = excluded.response_bytes_sum,
+  estimated_credits = excluded.estimated_credits,
+  credit_estimate_segments = excluded.credit_estimate_segments,
+  credit_estimate_missing_segments = excluded.credit_estimate_missing_segments`;
 
 async function rollupToDaily(env) {
   // 覆盖当天与前一天：cron 在 UTC 边界附近触发时，前一天可能还有迟到的桶进来。

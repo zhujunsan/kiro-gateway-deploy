@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.3.18 (2026-07-14)
+
+**New**
+- 托盘菜单新增「进行中 / 最近对话」：本地记录对话请求预览（不上传正文），macOS 打开菜单时可就地刷新耗时，避免整表重建打断输入。
+- 遥测新增账户级 Credit 分段估算：按模型段差分本机 `/usage`，写入 `estimated_credits` / `credit_estimate_*`（旧客户端缺字段存 `NULL`，显式 `0` 表示测得零消耗）；Worker/D1 同步落库与日汇总。
+- 模型菜单按「真实 ID / Cursor 别名」分组对齐展示；`auto` 仅显示真实 id。
+
+**Fixed**
+- 单实例拒绝启动时弹出可见提示；启动前清理崩溃遗留的 gateway / cloudflared 孤儿进程。
+- 停止时把仍在队列中的 incident 分片刷入本地 spool，重启后可继续上报。
+
 ## v0.3.17 (2026-07-14)
 
 **Changed**

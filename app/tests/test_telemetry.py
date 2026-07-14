@@ -114,6 +114,8 @@ def test_from_env_reads_all_fields():
         "TELEMETRY_USERNAME": "abc123",
         "APP_VERSION": "0.1.25",
         "TELEMETRY_BUCKET_SECONDS": "300",
+        "SERVER_PORT": "64010",
+        "PROXY_API_KEY": "local-key",
     })
     assert cfg.endpoint_url == "https://w/telemetry"
     assert cfg.secret == "sek"
@@ -121,6 +123,9 @@ def test_from_env_reads_all_fields():
     assert cfg.app_version == "0.1.25"
     assert cfg.bucket_seconds == 300
     assert cfg.enabled is True
+    assert cfg.gateway_port == 64010
+    assert cfg.proxy_api_key == "local-key"
+    assert cfg.can_sample_credits is True
 
 
 def test_from_env_defaults_and_disabled():
@@ -129,7 +134,7 @@ def test_from_env_defaults_and_disabled():
     assert cfg.username == "unknown"
     assert cfg.app_version == "unknown"
     assert cfg.bucket_seconds == telemetry.DEFAULT_BUCKET_SECONDS
-
+    assert cfg.can_sample_credits is False
 
 def test_from_env_bad_bucket_falls_back():
     cfg = from_env({"TELEMETRY_URL": "x", "TELEMETRY_BUCKET_SECONDS": "0"})
@@ -170,6 +175,10 @@ def test_aggregator_accumulates_same_bucket():
     assert r["request_bytes_sum"] == 150
     assert r["response_bytes_sum"] == 210
     assert r["bucket_start"] == 1200
+    # No credit settle → null (unknown), not 0.
+    assert r["estimated_credits"] is None
+    assert r["credit_estimate_segments"] is None
+    assert r["credit_estimate_missing_segments"] is None
 
 
 def test_aggregator_splits_by_dimension():
@@ -691,3 +700,137 @@ def test_middleware_lifespan_passthrough_and_flush(tmp_path):
     assert {m["type"] for m in inner_sends} == {
         "lifespan.startup.complete", "lifespan.shutdown.complete"
     }
+
+
+# --- CreditTracker ----------------------------------------------------------
+
+def test_parse_credits_used_sums_breakdowns():
+    reading = telemetry.parse_credits_used({
+        "nextDateReset": "2026-08-01",
+        "breakdowns": [
+            {"used": 100.5, "limit": 1000},
+            {"used": 20, "limit": 100},
+        ],
+    })
+    assert reading is not None
+    assert reading.credits_used == 120.5
+    assert reading.reset_key == "2026-08-01"
+
+
+def test_parse_credits_used_empty():
+    assert telemetry.parse_credits_used(None) is None
+    assert telemetry.parse_credits_used({}) is None
+    assert telemetry.parse_credits_used({"breakdowns": []}) is None
+
+
+def test_credit_tracker_a_to_b_then_checkpoint(tmp_path):
+    """First model sets baseline only; switch settles A; checkpoint settles B."""
+    readings = iter([
+        telemetry.CreditReading(100.0, "r1"),  # baseline A
+        telemetry.CreditReading(110.0, "r1"),  # A→B settle A=10
+        telemetry.CreditReading(125.0, "r1"),  # checkpoint settle B=15
+    ])
+    agg = Aggregator("u", "v", 600)
+    tracker = telemetry.CreditTracker(agg, sample_fn=lambda: next(readings), bucket_seconds=600)
+    tracker.start()
+    try:
+        tracker.note_model("model-a")
+        tracker.note_model("model-b")
+        tracker.checkpoint(now=1500.0)
+    finally:
+        tracker.stop()
+
+    rows = {r["model"]: r for r in agg.drain_all()}
+    assert rows["model-a"]["estimated_credits"] == 10.0
+    assert rows["model-a"]["credit_estimate_segments"] == 1
+    assert rows["model-b"]["estimated_credits"] == 15.0
+    assert rows["model-b"]["credit_estimate_segments"] == 1
+
+
+def test_credit_tracker_negative_diff_counts_missing():
+    readings = iter([
+        telemetry.CreditReading(100.0, "r1"),
+        telemetry.CreditReading(90.0, "r1"),  # negative → missing
+    ])
+    agg = Aggregator("u", "v", 600)
+    tracker = telemetry.CreditTracker(agg, sample_fn=lambda: next(readings), bucket_seconds=600)
+    tracker.start()
+    try:
+        tracker.note_model("m")
+        tracker.checkpoint(now=1500.0)
+    finally:
+        tracker.stop()
+    rows = agg.drain_all()
+    assert len(rows) == 1
+    assert rows[0]["estimated_credits"] == 0.0
+    assert rows[0]["credit_estimate_missing_segments"] == 1
+    assert rows[0]["credit_estimate_segments"] == 0
+
+
+def test_credit_tracker_reset_key_change_counts_missing():
+    readings = iter([
+        telemetry.CreditReading(100.0, "cycle-1"),
+        telemetry.CreditReading(5.0, "cycle-2"),
+    ])
+    agg = Aggregator("u", "v", 600)
+    tracker = telemetry.CreditTracker(agg, sample_fn=lambda: next(readings), bucket_seconds=600)
+    tracker.start()
+    try:
+        tracker.note_model("m")
+        tracker.checkpoint(now=1500.0)
+    finally:
+        tracker.stop()
+    rows = agg.drain_all()
+    assert rows[0]["credit_estimate_missing_segments"] == 1
+    assert rows[0]["estimated_credits"] == 0.0
+
+
+def test_credit_tracker_sample_failure_counts_missing():
+    calls = {"n": 0}
+
+    def sample():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return telemetry.CreditReading(50.0, "r")
+        return None
+
+    agg = Aggregator("u", "v", 600)
+    tracker = telemetry.CreditTracker(agg, sample_fn=sample, bucket_seconds=600)
+    tracker.start()
+    try:
+        tracker.note_model("m")
+        tracker.checkpoint(now=1500.0)
+    finally:
+        tracker.stop()
+    rows = agg.drain_all()
+    assert rows[0]["credit_estimate_missing_segments"] == 1
+
+
+def test_reporter_tick_checkpoints_before_close(tmp_path):
+    readings = iter([
+        telemetry.CreditReading(10.0, "r"),
+        telemetry.CreditReading(22.0, "r"),
+    ])
+    cfg = TelemetryConfig(endpoint_url="https://w", secret="s",
+                          username="u", app_version="v",
+                          bucket_seconds=600, flush_interval=600)
+    agg = Aggregator("u", "v", 600)
+    up = FakeUploader(ok=True)
+    pend = PendingStore(tmp_path / "pending.jsonl")
+    tracker = telemetry.CreditTracker(agg, sample_fn=lambda: next(readings), bucket_seconds=600)
+    rep = Reporter(cfg, agg, up, pend, credit_tracker=tracker)
+    tracker.start()
+    try:
+        tracker.note_model("m")
+        agg.record(RequestSample(model="m", success=True, total_tokens=100), now=1200)
+        # tick at bucket close: checkpoint should settle credits into the open bucket
+        # before collect_closed removes it.
+        rep.tick(now=1800)
+    finally:
+        tracker.stop()
+    assert len(up.batches) == 1
+    row = up.batches[0][0]
+    assert row["model"] == "m"
+    assert row["estimated_credits"] == 12.0
+    assert row["credit_estimate_segments"] == 1
+    assert row["total_tokens_sum"] == 100

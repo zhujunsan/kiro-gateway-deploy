@@ -196,6 +196,49 @@ def test_reporter_spools_on_failure(tmp_path, monkeypatch):
     assert pending.load_all()
 
 
+def test_reporter_stop_flushes_queue_to_spool(tmp_path):
+    """Unsent in-memory records must land in the spool on stop (no silent drop)."""
+    class NeverUploader:
+        secret = "s"
+
+        def upload_record(self, record):
+            raise AssertionError("stop flush must not upload")
+
+    cfg = ir.IncidentConfig(endpoint_url="https://x/telemetry/errors", secret="s",
+                            username="userhash12ab")
+    pending = ir.PendingErrorStore(tmp_path / "pending-errors.jsonl")
+    rep = ir.IncidentReporter(cfg, NeverUploader(), pending)
+    # Do not start the background thread; enqueue then stop → flush only.
+    rep.enqueue_snapshot({
+        "incident_id": "inc-stop",
+        "ts": 1,
+        "duration_ms": 1,
+        "path": "/v1/chat/completions",
+        "model": "m",
+        "stream": False,
+        "status_code": 400,
+        "gateway_status": 400,
+        "upstream_status": 400,
+        "source": "kiro_upstream",
+        "code": "x",
+        "phase": "response_parse",
+        "client_disconnected": False,
+        "error_message": "e",
+        "artifacts": {"request_body.json": b"{}", "app_logs.txt": b"log\n"},
+    })
+    with rep._lock:
+        queued = len(rep._queue)
+    assert queued >= 2  # manifest + chunks
+    rep.stop(timeout=0.1)
+    with rep._lock:
+        assert rep._queue == []
+    rows = pending.load_all()
+    assert len(rows) == queued
+    assert rows[0]["record_type"] == "manifest"
+    assert rows[0]["incident_id"] == "inc-stop"
+    assert any(r.get("record_type") == "artifact_chunk" for r in rows)
+
+
 def test_enqueue_never_raises(tmp_path):
     cfg = ir.IncidentConfig(endpoint_url="")  # disabled
     pending = ir.PendingErrorStore(tmp_path / "p.jsonl")
