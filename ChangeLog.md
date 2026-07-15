@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.4.4 (2026-07-15)
+
+**Fixed**
+- 修复 Responses API `output_tokens` 漏计 function_call：纯工具调用不再报 ⬇ 0，正文+工具调用也不再只统计可见文本。
+
+**Changed**
+- 同步上游网关至 `main-a5e04c8`；docker-compose 镜像 pin 至 `ghcr.io/zhujunsan/kiro-gateway:main-a5e04c8`。
+
 ## v0.4.3 (2026-07-15)
 
 **Fixed**
