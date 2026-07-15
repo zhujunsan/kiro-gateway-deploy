@@ -203,7 +203,7 @@ def test_apply_live_titles_gtk_updates_in_place(monkeypatch):
         def get_children(self):
             return self._items
 
-    row = _Item("等待响应 · 1s · m\told")
+    row = _Item("等待响应 · 1s · m\n⬆ 0 · ⬇ 0\n问: old")
     active_sub = _Menu([row])
     gateway = _Item("🖥 网关: 本地 Kiro Gateway\t启动中")
     active = _Item("📡 进行中\t空闲", submenu=active_sub)
@@ -219,12 +219,13 @@ def test_apply_live_titles_gtk_updates_in_place(monkeypatch):
             ("📡 进行中", "📡 进行中 (1)\t最长 5s"),
         ],
         submenu_by_parent_prefix={
-            "📡 进行中": ["生成中 · 5s · m\tnew"],
+            "📡 进行中": ["生成中 · 5s · m\n⬆ 12 · ⬇ 3\n问: new"],
         },
     )
     assert gateway.get_label().endswith("运行中")
     assert "进行中 (1)" in active.get_label()
     assert "生成中 · 5s" in row.get_label()
+    assert "⬆ 12" in row.get_label()
 
 
 def test_non_macos_menu_will_open_defers_redraw(monkeypatch):

@@ -455,8 +455,8 @@ def test_inplace_patch_flips_finished_rows_to_completed(monkeypatch):
             return self._submenu
 
     t0 = time.time() - 30
-    row_a = _Item("生成中 · 30s · glm-5\told-a")
-    row_b = _Item("生成中 · 16s · glm-5\told-b")
+    row_a = _Item("生成中 · 30s · glm-5\n⬆ 10 · ⬇ 2\n问: old-a")
+    row_b = _Item("生成中 · 16s · glm-5\n⬆ 8 · ⬇ 1\n问: old-b")
     parent = _Parent(_Sub([row_a, row_b]))
     app._live_active_ids = ("a", "b")
 
@@ -527,6 +527,86 @@ def test_inplace_patch_flips_finished_rows_to_completed(monkeypatch):
     assert row_a._title.startswith("已完成 ·")
     assert row_b._title.startswith("失败 ·")
     assert app._live_active_ids == ("a", "b")
+
+
+def test_inplace_patch_replaces_finished_slot_with_new_active(monkeypatch):
+    """Regression: open submenu must show the new in-flight request, not stale 已完成."""
+    from kiro_gateway_tray import macos_menu
+
+    app = _make_app()
+    monkeypatch.setattr(app.sup, "status", lambda: {"gateway": "running"})
+    monkeypatch.setattr(macos_menu, "apply_menu_item_title", lambda item, title: item.setTitle_(title))
+
+    class _Item:
+        def __init__(self, title):
+            self._title = title
+
+        def title(self):
+            return self._title
+
+        def setTitle_(self, t):
+            self._title = t
+
+        def isSeparatorItem(self):
+            return False
+
+    class _Sub:
+        def __init__(self, items):
+            self._items = list(items)
+
+        def numberOfItems(self):
+            return len(self._items)
+
+        def itemAtIndex_(self, i):
+            return self._items[i]
+
+    class _Parent:
+        def __init__(self, submenu):
+            self._submenu = submenu
+
+        def submenu(self):
+            return self._submenu
+
+    t0 = time.time() - 20
+    row = _Item("已完成 · 6.2s · claude-opus-4.8\n⬆ 98.7k · ⬇ 18\n问: old")
+    parent = _Parent(_Sub([row]))
+    # Previous request finished while the submenu stayed open.
+    app._live_active_ids = ("old",)
+
+    snap = ActivitySnapshot(
+        active=[
+            ActiveRequest(
+                id="new",
+                started_at=t0 + 14,
+                model="claude-opus-4.8",
+                path="/v1/messages",
+                phase="streaming",
+                question_preview="new question",
+                prompt_tokens=100,
+                completion_tokens=5,
+            ),
+        ],
+        recent=[
+            RecentRequest(
+                id="old",
+                started_at=t0,
+                finished_at=t0 + 6,
+                model="claude-opus-4.8",
+                path="/v1/messages",
+                ok=True,
+                duration_ms=6200,
+                question_preview="old",
+                answer_preview="done",
+                prompt_tokens=98700,
+                completion_tokens=18,
+            ),
+        ],
+    )
+    app._inplace_patch_active_submenu(parent, snap)
+    assert "生成中" in row._title
+    assert "new question" in row._title
+    assert "已完成" not in row._title
+    assert app._live_active_ids == ("new",)
 
 
 def test_live_active_row_titles_crossplatform_keeps_finished_slots(monkeypatch):

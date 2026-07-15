@@ -61,6 +61,7 @@ _NOISE_BLOCK_RE = re.compile(
 _REQ_BODY_CAP = 4_000_000
 _STALE_ACTIVE_SECONDS = 600  # drop orphaned in-flight rows after 10 minutes
 _ACTIVITY_FILENAME = "request_activity.json"
+_TOKEN_PERSIST_INTERVAL = 0.45  # throttle disk writes while tokens climb
 
 _PHASE_WAITING = "waiting"
 _PHASE_STREAMING = "streaming"
@@ -83,6 +84,8 @@ class ActiveRequest:
     path: str
     phase: str
     question_preview: str
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
 
 
 @dataclass
@@ -97,6 +100,8 @@ class RecentRequest:
     question_preview: str
     answer_preview: str
     error_preview: str = ""
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
 
 
 @dataclass
@@ -317,17 +322,83 @@ def extract_error_preview(buf: bytes, limit: int = PREVIEW_CHARS) -> str:
     return ""
 
 
+def estimate_tokens_from_bytes(n: int) -> int:
+    """Rough token estimate from UTF-8 byte length (≈4 bytes/token)."""
+    return max(0, int(n) // 4)
+
+
+def estimate_tokens_from_text(text: str) -> int:
+    if not text:
+        return 0
+    return estimate_tokens_from_bytes(len(text.encode("utf-8")))
+
+
+def format_token_n(n: int) -> str:
+    n = max(0, int(n))
+    if n < 1000:
+        return str(n)
+    if n < 1_000_000:
+        v = n / 1000.0
+        s = f"{v:.1f}".rstrip("0").rstrip(".")
+        return f"{s}k"
+    v = n / 1_000_000.0
+    s = f"{v:.1f}".rstrip("0").rstrip(".")
+    return f"{s}M"
+
+
+def parse_usage_tokens(usage: dict[str, Any] | None) -> tuple[int | None, int | None]:
+    """Normalise Chat / Anthropic / Responses usage → (prompt, completion)."""
+    if not usage or not isinstance(usage, dict):
+        return None, None
+    prompt = usage.get("prompt_tokens")
+    if prompt is None:
+        prompt = usage.get("input_tokens")
+    completion = usage.get("completion_tokens")
+    if completion is None:
+        completion = usage.get("output_tokens")
+    return (
+        int(prompt) if prompt is not None else None,
+        int(completion) if completion is not None else None,
+    )
+
+
+def _iter_usage_objects(obj: Any):
+    if not isinstance(obj, dict):
+        return
+    u = obj.get("usage")
+    if isinstance(u, dict):
+        yield u
+    msg = obj.get("message")
+    if isinstance(msg, dict):
+        mu = msg.get("usage")
+        if isinstance(mu, dict):
+            yield mu
+
+
 def feed_sse_text(acc: list[str], chunk: bytes, cap: int = ANSWER_ACCUM_CAP) -> None:
     """Append assistant text deltas from an SSE chunk into ``acc`` (joined later).
 
     Stops once joined length reaches ``cap``. Mutates ``acc`` in place.
     """
-    if sum(len(p) for p in acc) >= cap:
-        return
+    feed_sse_chunk(acc, chunk, cap=cap)
+
+
+def feed_sse_chunk(
+    acc: list[str],
+    chunk: bytes,
+    cap: int = ANSWER_ACCUM_CAP,
+) -> tuple[int | None, int | None]:
+    """Append text deltas and return the latest ``(prompt, completion)`` usage.
+
+    Either side may be ``None`` when that field was not present in this chunk.
+    """
+    prompt: int | None = None
+    completion: int | None = None
     try:
         text = chunk.decode("utf-8", errors="replace")
     except Exception:
-        return
+        return None, None
+    capped = sum(len(p) for p in acc) >= cap
     for raw in text.splitlines():
         line = raw.strip()
         if not line.startswith("data:"):
@@ -341,12 +412,21 @@ def feed_sse_text(acc: list[str], chunk: bytes, cap: int = ANSWER_ACCUM_CAP) -> 
             continue
         if not isinstance(obj, dict):
             continue
+        for u in _iter_usage_objects(obj):
+            p, c = parse_usage_tokens(u)
+            if p is not None:
+                prompt = p
+            if c is not None:
+                completion = c
+        if capped:
+            continue
         piece = _sse_delta_text(obj)
         if not piece:
             continue
         acc.append(piece)
         if sum(len(p) for p in acc) >= cap:
-            return
+            capped = True
+    return prompt, completion
 
 
 def _sse_delta_text(obj: dict[str, Any]) -> str:
@@ -409,16 +489,34 @@ def short_model(model: str, limit: int = 18) -> str:
     return model[: max(0, limit - 1)] + "…"
 
 
+def _format_tokens_line(*, prompt_tokens: int, completion_tokens: int) -> str:
+    return (
+        f"⬆ {format_token_n(prompt_tokens)} · "
+        f"⬇ {format_token_n(completion_tokens)}"
+    )
+
+
 def format_active_line(entry: ActiveRequest, *, now: float | None = None) -> str:
+    """Multi-line in-progress item for tray menus.
+
+    Line 1: phase / elapsed / short model
+    Line 2: ⬆ prompt · ⬇ completion tokens (live while generating)
+    Line 3: question preview
+    """
     now = time.time() if now is None else now
     elapsed = format_duration(now - entry.started_at)
     phase = _PHASE_ZH.get(entry.phase, entry.phase)
+    model = short_model(entry.model)
     q = entry.question_preview or "（无用户文本）"
-    return f"{phase} · {elapsed} · {short_model(entry.model)}\t{q}"
+    tokens = _format_tokens_line(
+        prompt_tokens=entry.prompt_tokens,
+        completion_tokens=entry.completion_tokens,
+    )
+    return f"{phase} · {elapsed} · {model}\n{tokens}\n问: {q}"
 
 
 def format_finished_active_line(entry: RecentRequest) -> str:
-    """Single-line title for a 进行中 slot that finished while the menu is open.
+    """Multi-line title for a 进行中 slot that finished while the menu is open.
 
     Structural add/remove is deferred until the next full rebuild, so the row
     stays visible — only the phase label flips to 已完成 / 失败.
@@ -427,15 +525,20 @@ def format_finished_active_line(entry: RecentRequest) -> str:
     model = short_model(entry.model)
     q = entry.question_preview or "（无用户文本）"
     status = "已完成" if entry.ok else "失败"
-    return f"{status} · {dur} · {model}\t{q}"
+    tokens = _format_tokens_line(
+        prompt_tokens=entry.prompt_tokens,
+        completion_tokens=entry.completion_tokens,
+    )
+    return f"{status} · {dur} · {model}\n{tokens}\n问: {q}"
 
 
 def format_recent_line(entry: RecentRequest) -> str:
     """Multi-line recent item for tray menus.
 
     Line 1: time / status / duration / short model
-    Line 2: question preview
-    Line 3: answer preview (or error)
+    Line 2: ⬆ prompt · ⬇ completion tokens
+    Line 3: question preview
+    Line 4: answer preview (or error)
     """
     hhmm = time.strftime("%H:%M", time.localtime(entry.finished_at))
     mark = "✓" if entry.ok else "✗"
@@ -443,11 +546,15 @@ def format_recent_line(entry: RecentRequest) -> str:
     model = short_model(entry.model)
     q = entry.question_preview or "（无用户文本）"
     header = f"{hhmm} {mark} {dur} · {model}"
+    tokens = _format_tokens_line(
+        prompt_tokens=entry.prompt_tokens,
+        completion_tokens=entry.completion_tokens,
+    )
     if entry.ok:
         a = entry.answer_preview or "…"
-        return f"{header}\n问: {q}\n答: {a}"
+        return f"{header}\n{tokens}\n问: {q}\n答: {a}"
     err = entry.error_preview or "失败"
-    return f"{header}\n问: {q}\n错: {err}"
+    return f"{header}\n{tokens}\n问: {q}\n错: {err}"
 
 
 def activity_file(data_dir: Path | None = None) -> Path:
@@ -468,6 +575,8 @@ class RequestActivityStore:
         self._lock = threading.Lock()
         self._active: dict[str, ActiveRequest] = {}
         self._recent: list[RecentRequest] = []
+        self._dirty = False
+        self._last_persist_mono = 0.0
         self._load_recent()
 
     def _load_recent(self) -> None:
@@ -494,6 +603,8 @@ class RequestActivityStore:
                         question_preview=str(item.get("question_preview") or ""),
                         answer_preview=str(item.get("answer_preview") or ""),
                         error_preview=str(item.get("error_preview") or ""),
+                        prompt_tokens=max(0, int(item.get("prompt_tokens") or 0)),
+                        completion_tokens=max(0, int(item.get("completion_tokens") or 0)),
                     ))
                 except Exception:
                     continue
@@ -504,6 +615,7 @@ class RequestActivityStore:
     def clear_active(self) -> None:
         with self._lock:
             self._active.clear()
+            self._dirty = False
             self._persist_unlocked()
 
     def begin(
@@ -513,6 +625,7 @@ class RequestActivityStore:
         path: str,
         question_preview: str,
         started_at: float | None = None,
+        prompt_tokens: int = 0,
     ) -> str:
         rid = uuid.uuid4().hex[:12]
         entry = ActiveRequest(
@@ -522,9 +635,12 @@ class RequestActivityStore:
             path=path,
             phase=_PHASE_WAITING,
             question_preview=truncate_preview(question_preview),
+            prompt_tokens=max(0, int(prompt_tokens)),
+            completion_tokens=0,
         )
         with self._lock:
             self._active[rid] = entry
+            self._dirty = False
             self._persist_unlocked()
         return rid
 
@@ -534,7 +650,36 @@ class RequestActivityStore:
             if entry is None or entry.phase == phase:
                 return
             entry.phase = phase
+            self._dirty = False
             self._persist_unlocked()
+
+    def update_tokens(
+        self,
+        rid: str,
+        *,
+        prompt_tokens: int | None = None,
+        completion_tokens: int | None = None,
+        force: bool = False,
+    ) -> None:
+        """Update live ⬆/⬇ token counters; disk writes are throttled."""
+        with self._lock:
+            entry = self._active.get(rid)
+            if entry is None:
+                return
+            changed = False
+            if prompt_tokens is not None:
+                p = max(0, int(prompt_tokens))
+                if p != entry.prompt_tokens:
+                    entry.prompt_tokens = p
+                    changed = True
+            if completion_tokens is not None:
+                c = max(0, int(completion_tokens))
+                if c != entry.completion_tokens:
+                    entry.completion_tokens = c
+                    changed = True
+            if changed:
+                self._dirty = True
+            self._flush_if_due_unlocked(force=force)
 
     def finish(
         self,
@@ -548,6 +693,7 @@ class RequestActivityStore:
         with self._lock:
             entry = self._active.pop(rid, None)
             if entry is None:
+                self._dirty = False
                 self._persist_unlocked()
                 return
             end = time.time() if finished_at is None else finished_at
@@ -562,9 +708,12 @@ class RequestActivityStore:
                 question_preview=entry.question_preview,
                 answer_preview=truncate_preview(answer_preview),
                 error_preview=truncate_preview(error_preview),
+                prompt_tokens=entry.prompt_tokens,
+                completion_tokens=entry.completion_tokens,
             )
             self._recent.insert(0, recent)
             del self._recent[self.recent_limit:]
+            self._dirty = False
             self._persist_unlocked()
 
     def snapshot(self, *, now: float | None = None) -> ActivitySnapshot:
@@ -577,6 +726,16 @@ class RequestActivityStore:
             active.sort(key=lambda a: a.started_at, reverse=True)
             return ActivitySnapshot(active=list(active), recent=list(self._recent))
 
+    def _flush_if_due_unlocked(self, *, force: bool = False) -> None:
+        if not self._dirty and not force:
+            return
+        now = time.monotonic()
+        if not force and (now - self._last_persist_mono) < _TOKEN_PERSIST_INTERVAL:
+            return
+        self._persist_unlocked()
+        self._dirty = False
+        self._last_persist_mono = now
+
     def _persist_unlocked(self) -> None:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -588,6 +747,7 @@ class RequestActivityStore:
             tmp = self.path.with_suffix(self.path.suffix + ".tmp")
             tmp.write_text(payload + "\n", encoding="utf-8")
             tmp.replace(self.path)
+            self._last_persist_mono = time.monotonic()
         except Exception:
             logger.debug("request_activity: persist failed", exc_info=True)
 
@@ -621,6 +781,8 @@ def load_snapshot(path: Path | None = None, *, now: float | None = None) -> Acti
                 path=str(item.get("path") or ""),
                 phase=str(item.get("phase") or _PHASE_WAITING),
                 question_preview=str(item.get("question_preview") or ""),
+                prompt_tokens=max(0, int(item.get("prompt_tokens") or 0)),
+                completion_tokens=max(0, int(item.get("completion_tokens") or 0)),
             ))
         except Exception:
             continue
@@ -642,6 +804,8 @@ def load_snapshot(path: Path | None = None, *, now: float | None = None) -> Acti
                 question_preview=str(item.get("question_preview") or ""),
                 answer_preview=str(item.get("answer_preview") or ""),
                 error_preview=str(item.get("error_preview") or ""),
+                prompt_tokens=max(0, int(item.get("prompt_tokens") or 0)),
+                completion_tokens=max(0, int(item.get("completion_tokens") or 0)),
             ))
         except Exception:
             continue
@@ -660,6 +824,11 @@ class _LiveState:
     answer_parts: list[str] = field(default_factory=list)
     json_buf: bytearray = field(default_factory=bytearray)
     phase_set: bool = False
+    response_bytes: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    usage_prompt: bool = False
+    usage_completion: bool = False
 
 
 class RequestActivityMiddleware:
@@ -700,16 +869,23 @@ class RequestActivityMiddleware:
 
         model = "unknown"
         question = ""
+        prompt_est = 0
         try:
             raw = bytes(body)
             model = extract_model(raw)
             question = extract_question_preview(raw)
+            prompt_est = estimate_tokens_from_bytes(len(raw))
         except Exception:
             logger.debug("request_activity: preview extract failed", exc_info=True)
 
         rid = ""
         try:
-            rid = self.store.begin(model=model, path=path, question_preview=question)
+            rid = self.store.begin(
+                model=model,
+                path=path,
+                question_preview=question,
+                prompt_tokens=prompt_est,
+            )
         except Exception:
             logger.debug("request_activity: begin failed", exc_info=True)
 
@@ -723,7 +899,7 @@ class RequestActivityMiddleware:
                 return msg
             return await receive()
 
-        state = _LiveState(rid=rid)
+        state = _LiveState(rid=rid, prompt_tokens=prompt_est)
 
         async def wrapped_send(message: dict) -> None:
             try:
@@ -740,6 +916,16 @@ class RequestActivityMiddleware:
         else:
             status_ok = 200 <= int(state.status or 0) < 300
             self._finalise(state, ok=bool(status_ok and state.completed))
+
+    def _sync_tokens(self, state: _LiveState, *, force: bool = False) -> None:
+        if not state.rid:
+            return
+        self.store.update_tokens(
+            state.rid,
+            prompt_tokens=state.prompt_tokens,
+            completion_tokens=state.completion_tokens,
+            force=force,
+        )
 
     def _inspect(self, message: dict, state: _LiveState) -> None:
         if not state.rid:
@@ -763,13 +949,49 @@ class RequestActivityMiddleware:
                 self.store.set_phase(state.rid, phase)
         elif mtype == "http.response.body":
             chunk = message.get("body", b"") or b""
+            if chunk:
+                state.response_bytes += len(chunk)
             if state.is_sse and chunk:
-                feed_sse_text(state.answer_parts, chunk)
+                prompt_u, completion_u = feed_sse_chunk(state.answer_parts, chunk)
+                if prompt_u is not None:
+                    state.prompt_tokens = prompt_u
+                    state.usage_prompt = True
+                if completion_u is not None:
+                    state.completion_tokens = completion_u
+                    state.usage_completion = True
+                if not state.usage_completion:
+                    # Climb with streamed text so the menu shows live ⬇ progress
+                    # before the provider emits a final usage event.
+                    est = estimate_tokens_from_text("".join(state.answer_parts))
+                    if est == 0 and state.response_bytes:
+                        est = estimate_tokens_from_bytes(state.response_bytes)
+                    state.completion_tokens = est
+                self._sync_tokens(state)
             elif state.is_json and chunk:
                 if len(state.json_buf) < ANSWER_ACCUM_CAP * 8:
                     state.json_buf.extend(chunk)
+                if not state.usage_completion:
+                    state.completion_tokens = estimate_tokens_from_bytes(
+                        state.response_bytes
+                    )
+                    self._sync_tokens(state)
             if not message.get("more_body", False):
                 state.completed = True
+                if state.is_json and state.json_buf:
+                    try:
+                        data = json.loads(bytes(state.json_buf))
+                    except Exception:
+                        data = None
+                    if isinstance(data, dict):
+                        for u in _iter_usage_objects(data):
+                            p, c = parse_usage_tokens(u)
+                            if p is not None:
+                                state.prompt_tokens = p
+                                state.usage_prompt = True
+                            if c is not None:
+                                state.completion_tokens = c
+                                state.usage_completion = True
+                self._sync_tokens(state, force=True)
 
     def _finalise(self, state: _LiveState, *, ok: bool) -> None:
         if not state.rid:
@@ -787,6 +1009,7 @@ class RequestActivityMiddleware:
                     error = extract_error_preview(raw)
             if not ok and not error and state.status:
                 error = f"HTTP {state.status}"
+            self._sync_tokens(state, force=True)
             self.store.finish(
                 state.rid,
                 ok=ok,

@@ -315,10 +315,27 @@ class TrayApp:
     @staticmethod
     def _activity_fingerprint_of(snap: ActivitySnapshot) -> str:
         active = tuple(
-            (a.id, a.phase, a.question_preview, a.model) for a in snap.active
+            (
+                a.id,
+                a.phase,
+                a.question_preview,
+                a.model,
+                a.prompt_tokens,
+                a.completion_tokens,
+            )
+            for a in snap.active
         )
         recent = tuple(
-            (r.id, r.ok, r.duration_ms, r.question_preview, r.answer_preview, r.error_preview)
+            (
+                r.id,
+                r.ok,
+                r.duration_ms,
+                r.question_preview,
+                r.answer_preview,
+                r.error_preview,
+                r.prompt_tokens,
+                r.completion_tokens,
+            )
             for r in snap.recent
         )
         return repr((active, recent))
@@ -356,7 +373,16 @@ class TrayApp:
     def _recent_fingerprint_of(snap: ActivitySnapshot) -> str:
         return repr(
             tuple(
-                (r.id, r.ok, r.duration_ms, r.question_preview, r.answer_preview, r.error_preview)
+                (
+                    r.id,
+                    r.ok,
+                    r.duration_ms,
+                    r.question_preview,
+                    r.answer_preview,
+                    r.error_preview,
+                    r.prompt_tokens,
+                    r.completion_tokens,
+                )
                 for r in snap.recent
             )
         )
@@ -505,7 +531,9 @@ class TrayApp:
         Row *count* cannot change under an already-shown submenu, so we keep the
         ID order captured when the submenu was built / first patched. Finished
         IDs flip to ``format_finished_active_line`` instead of freezing on
-        「生成中」; the next full rebuild drops them from 进行中.
+        「生成中」. When a *new* in-flight request appears, it takes over a
+        finished slot so the submenu shows the live request rather than the
+        previous 「已完成」 row. The next full rebuild drops finished-only rows.
         """
         gw = self.sup.status()["gateway"]
         if gw != "running":
@@ -514,11 +542,28 @@ class TrayApp:
         active_by_id = {a.id: a for a in snap.active}
         recent_by_id = {r.id: r for r in snap.recent}
         now = time.time()
+        active_order = [a.id for a in snap.active]
 
         ids = self._live_active_ids
         if ids is None or (not ids and snap.active):
             limit = len(snap.active) if n_slots is None else max(0, n_slots)
-            ids = tuple(a.id for a in snap.active[:limit])
+            ids = tuple(active_order[:limit])
+            self._live_active_ids = ids
+        else:
+            # Swap finished slots for newly-started active requests so the open
+            # submenu tracks what's actually in flight.
+            slot_ids = list(ids)
+            shown_active = {rid for rid in slot_ids if rid in active_by_id}
+            newcomers = [rid for rid in active_order if rid not in shown_active]
+            ni = 0
+            for i, rid in enumerate(slot_ids):
+                if rid in active_by_id:
+                    continue
+                if ni >= len(newcomers):
+                    break
+                slot_ids[i] = newcomers[ni]
+                ni += 1
+            ids = tuple(slot_ids)
             self._live_active_ids = ids
 
         if not ids:

@@ -177,10 +177,18 @@ def test_format_duration_and_menu_lines():
         path="/v1/messages",
         phase="streaming",
         question_preview="帮我改代码",
+        prompt_tokens=1200,
+        completion_tokens=56,
     )
     line = format_active_line(active, now=active.started_at + 12)
     assert "生成中" in line
     assert "帮我改代码" in line
+    assert "\n" in line
+    assert "⬆ 1.2k" in line
+    assert "⬇ 56" in line
+    assert "问: 帮我改代码" in line
+    lines = line.split("\n")
+    assert len(lines) == 3
 
     recent = ra.RecentRequest(
         id="r1",
@@ -192,19 +200,26 @@ def test_format_duration_and_menu_lines():
         duration_ms=1200,
         question_preview="问什么",
         answer_preview="答什么",
+        prompt_tokens=10,
+        completion_tokens=3,
     )
     rline = format_recent_line(recent)
     assert "✓" in rline
     assert "问: 问什么" in rline
     assert "答: 答什么" in rline
+    assert "⬆ 10" in rline
+    assert "⬇ 3" in rline
     assert "\n" in rline
     lines = rline.split("\n")
-    assert len(lines) == 3
+    assert len(lines) == 4
     assert lines[0].startswith("0") or "✓" in lines[0]  # HH:MM ✓ …
 
     finished_ok = format_finished_active_line(recent)
     assert finished_ok.startswith("已完成 ·")
     assert "问什么" in finished_ok
+    assert "⬆ 10" in finished_ok
+    assert "⬇ 3" in finished_ok
+    assert finished_ok.count("\n") == 2
     finished_fail = format_finished_active_line(ra.RecentRequest(
         id="r2",
         started_at=1,
@@ -219,6 +234,101 @@ def test_format_duration_and_menu_lines():
     ))
     assert finished_fail.startswith("失败 ·")
     assert "坏了" in finished_fail
+
+
+def test_format_token_n():
+    assert ra.format_token_n(0) == "0"
+    assert ra.format_token_n(999) == "999"
+    assert ra.format_token_n(1200) == "1.2k"
+    assert ra.format_token_n(1_500_000) == "1.5M"
+
+
+def test_feed_sse_chunk_parses_usage():
+    acc: list[str] = []
+    chunk = (
+        'data: {"type":"message_start","message":{"usage":{"input_tokens":40,"output_tokens":0}}}\n\n'
+        'data: {"type":"content_block_delta","delta":{"text":"hi"}}\n\n'
+        'data: {"type":"message_delta","usage":{"output_tokens":12}}\n\n'
+    ).encode()
+    prompt, completion = ra.feed_sse_chunk(acc, chunk)
+    assert "".join(acc) == "hi"
+    assert prompt == 40
+    assert completion == 12
+
+
+def test_middleware_updates_tokens_during_stream(tmp_path):
+    store = RequestActivityStore(tmp_path / "request_activity.json")
+    mw = RequestActivityMiddleware(None, store)
+    body = json.dumps({
+        "model": "claude-x",
+        "messages": [{"role": "user", "content": "慢不慢"}],
+    }).encode()
+    responses = [
+        {
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [(b"content-type", b"text/event-stream")],
+        },
+        {
+            "type": "http.response.body",
+            "body": (
+                'data: {"type":"message_start","message":'
+                '{"usage":{"input_tokens":100,"output_tokens":0}}}\n\n'
+            ).encode(),
+            "more_body": True,
+        },
+        {
+            "type": "http.response.body",
+            "body": (
+                'data: {"type":"content_block_delta","delta":{"text":"还行"}}\n\n'
+                'data: {"type":"message_delta","usage":{"output_tokens":7}}\n\n'
+            ).encode(),
+            "more_body": True,
+        },
+        {"type": "http.response.body", "body": b"", "more_body": False},
+    ]
+
+    # Drive until mid-stream so we can observe active tokens, then finish.
+    scope = {"type": "http", "method": "POST", "path": "/v1/messages", "headers": []}
+    frames = [
+        {"type": "http.request", "body": body, "more_body": False},
+    ]
+    idx = {"i": 0}
+    mid_snap = {"active": None}
+
+    async def receive():
+        i = idx["i"]
+        idx["i"] += 1
+        if i < len(frames):
+            return frames[i]
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(_message):
+        return None
+
+    async def inner_app(scope, recv, snd):
+        while True:
+            msg = await recv()
+            if msg["type"] == "http.request" and not msg.get("more_body", False):
+                break
+        await snd(responses[0])
+        await snd(responses[1])
+        mid_snap["active"] = store.snapshot().active
+        await snd(responses[2])
+        await snd(responses[3])
+
+    mw.app = inner_app
+    _run(mw(scope, receive, send))
+
+    assert mid_snap["active"]
+    mid = mid_snap["active"][0]
+    assert mid.prompt_tokens == 100
+    # After first usage event completion may still be 0; after second body it
+    # should land on the real usage before finish.
+    recent = store.snapshot().recent[0]
+    assert recent.prompt_tokens == 100
+    assert recent.completion_tokens == 7
+    assert "还行" in recent.answer_preview
 
 
 def test_extract_question_skips_system_reminder_noise():
