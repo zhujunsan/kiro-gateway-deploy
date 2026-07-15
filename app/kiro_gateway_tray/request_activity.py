@@ -417,6 +417,19 @@ def format_active_line(entry: ActiveRequest, *, now: float | None = None) -> str
     return f"{phase} · {elapsed} · {short_model(entry.model)}\t{q}"
 
 
+def format_finished_active_line(entry: RecentRequest) -> str:
+    """Single-line title for a 进行中 slot that finished while the menu is open.
+
+    Structural add/remove is deferred until the next full rebuild, so the row
+    stays visible — only the phase label flips to 已完成 / 失败.
+    """
+    dur = format_duration(entry.duration_ms / 1000.0)
+    model = short_model(entry.model)
+    q = entry.question_preview or "（无用户文本）"
+    status = "已完成" if entry.ok else "失败"
+    return f"{status} · {dur} · {model}\t{q}"
+
+
 def format_recent_line(entry: RecentRequest) -> str:
     """Multi-line recent item for tray menus.
 

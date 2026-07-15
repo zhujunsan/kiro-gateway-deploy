@@ -415,3 +415,141 @@ def test_is_status_menu_open_respects_session_flag(monkeypatch):
     monkeypatch.setattr(macos_menu, "_status_menu_session_open", False)
     assert macos_menu.is_status_menu_open(None) is False
 
+
+def test_inplace_patch_flips_finished_rows_to_completed(monkeypatch):
+    """Regression: finished slots must not freeze on 「生成中」 while menu is open."""
+    from kiro_gateway_tray import macos_menu
+
+    app = _make_app()
+    monkeypatch.setattr(app.sup, "status", lambda: {"gateway": "running"})
+    monkeypatch.setattr(macos_menu, "apply_menu_item_title", lambda item, title: item.setTitle_(title))
+
+    class _Item:
+        def __init__(self, title):
+            self._title = title
+
+        def title(self):
+            return self._title
+
+        def setTitle_(self, t):
+            self._title = t
+
+        def isSeparatorItem(self):
+            return False
+
+    class _Sub:
+        def __init__(self, items):
+            self._items = list(items)
+
+        def numberOfItems(self):
+            return len(self._items)
+
+        def itemAtIndex_(self, i):
+            return self._items[i]
+
+    class _Parent:
+        def __init__(self, submenu):
+            self._submenu = submenu
+
+        def submenu(self):
+            return self._submenu
+
+    t0 = time.time() - 30
+    row_a = _Item("生成中 · 30s · glm-5\told-a")
+    row_b = _Item("生成中 · 16s · glm-5\told-b")
+    parent = _Parent(_Sub([row_a, row_b]))
+    app._live_active_ids = ("a", "b")
+
+    # One finished successfully, one still streaming.
+    snap = ActivitySnapshot(
+        active=[
+            ActiveRequest(
+                id="b",
+                started_at=t0 + 14,
+                model="glm-5",
+                path="/v1/messages",
+                phase="streaming",
+                question_preview="still going",
+            ),
+        ],
+        recent=[
+            RecentRequest(
+                id="a",
+                started_at=t0,
+                finished_at=t0 + 30,
+                model="glm-5",
+                path="/v1/messages",
+                ok=True,
+                duration_ms=30_000,
+                question_preview="done q",
+                answer_preview="done a",
+            ),
+        ],
+    )
+    app._inplace_patch_active_submenu(parent, snap)
+    assert row_a._title.startswith("已完成 ·")
+    assert "done q" in row_a._title
+    assert "生成中" in row_b._title
+    assert "still going" in row_b._title
+    # Slot membership stays stable while the submenu is displayed.
+    assert app._live_active_ids == ("a", "b")
+
+    # Both finished (one failed): titles flip, count of rows unchanged.
+    snap_done = ActivitySnapshot(
+        active=[],
+        recent=[
+            RecentRequest(
+                id="b",
+                started_at=t0 + 14,
+                finished_at=t0 + 40,
+                model="glm-5",
+                path="/v1/messages",
+                ok=False,
+                duration_ms=26_000,
+                question_preview="still going",
+                answer_preview="",
+                error_preview="HTTP 500",
+            ),
+            RecentRequest(
+                id="a",
+                started_at=t0,
+                finished_at=t0 + 30,
+                model="glm-5",
+                path="/v1/messages",
+                ok=True,
+                duration_ms=30_000,
+                question_preview="done q",
+                answer_preview="done a",
+            ),
+        ],
+    )
+    app._inplace_patch_active_submenu(parent, snap_done)
+    assert row_a._title.startswith("已完成 ·")
+    assert row_b._title.startswith("失败 ·")
+    assert app._live_active_ids == ("a", "b")
+
+
+def test_live_active_row_titles_crossplatform_keeps_finished_slots(monkeypatch):
+    app = _make_app()
+    monkeypatch.setattr(app.sup, "status", lambda: {"gateway": "running"})
+    app._live_active_ids = ("x",)
+    snap = ActivitySnapshot(
+        active=[],
+        recent=[
+            RecentRequest(
+                id="x",
+                started_at=1,
+                finished_at=2,
+                model="m",
+                path="/v1/messages",
+                ok=True,
+                duration_ms=1600,
+                question_preview="q",
+                answer_preview="a",
+            ),
+        ],
+    )
+    titles = app._live_active_row_titles(snap)
+    assert len(titles) == 1
+    assert titles[0].startswith("已完成 ·")
+

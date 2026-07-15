@@ -193,9 +193,20 @@ def apply_menu_item_title(item, title: str) -> None:
             else:
                 _apply_tab_attributed_title(item, title, AppKit, Foundation)
         else:
+            # Plain titles must clear any prior attributedTitle; otherwise a
+            # leftover tab-styled attributed string keeps rendering (e.g. a
+            # finished 进行中 row stuck on 「生成中」 after switching to idle).
+            try:
+                item.setAttributedTitle_(None)
+            except Exception:
+                pass
             item.setTitle_(title)
     except Exception:
         try:
+            try:
+                item.setAttributedTitle_(None)
+            except Exception:
+                pass
             item.setTitle_(title)
         except Exception:
             pass

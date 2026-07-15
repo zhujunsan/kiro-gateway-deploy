@@ -15,6 +15,7 @@ from kiro_gateway_tray.request_activity import (
     feed_sse_text,
     format_active_line,
     format_duration,
+    format_finished_active_line,
     format_recent_line,
     load_snapshot,
     truncate_preview,
@@ -200,6 +201,24 @@ def test_format_duration_and_menu_lines():
     lines = rline.split("\n")
     assert len(lines) == 3
     assert lines[0].startswith("0") or "✓" in lines[0]  # HH:MM ✓ …
+
+    finished_ok = format_finished_active_line(recent)
+    assert finished_ok.startswith("已完成 ·")
+    assert "问什么" in finished_ok
+    finished_fail = format_finished_active_line(ra.RecentRequest(
+        id="r2",
+        started_at=1,
+        finished_at=2,
+        model="m",
+        path="/v1/messages",
+        ok=False,
+        duration_ms=3200,
+        question_preview="坏了",
+        answer_preview="",
+        error_preview="HTTP 500",
+    ))
+    assert finished_fail.startswith("失败 ·")
+    assert "坏了" in finished_fail
 
 
 def test_extract_question_skips_system_reminder_noise():

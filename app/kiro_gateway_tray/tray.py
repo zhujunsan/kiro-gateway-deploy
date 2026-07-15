@@ -497,13 +497,53 @@ class TrayApp:
         except Exception:
             logger.debug("attach submenu autorebuild failed", exc_info=True)
 
+    def _live_active_row_titles(
+        self, snap: ActivitySnapshot, *, n_slots: int | None = None
+    ) -> list[str]:
+        """Titles for currently displayed 进行中 rows (stable slots while open).
+
+        Row *count* cannot change under an already-shown submenu, so we keep the
+        ID order captured when the submenu was built / first patched. Finished
+        IDs flip to ``format_finished_active_line`` instead of freezing on
+        「生成中」; the next full rebuild drops them from 进行中.
+        """
+        gw = self.sup.status()["gateway"]
+        if gw != "running":
+            return [f"网关未运行（{_STATUS_ZH.get(gw, gw)}）"]
+
+        active_by_id = {a.id: a for a in snap.active}
+        recent_by_id = {r.id: r for r in snap.recent}
+        now = time.time()
+
+        ids = self._live_active_ids
+        if ids is None or (not ids and snap.active):
+            limit = len(snap.active) if n_slots is None else max(0, n_slots)
+            ids = tuple(a.id for a in snap.active[:limit])
+            self._live_active_ids = ids
+
+        if not ids:
+            return ["当前无进行中的请求"]
+
+        titles: list[str] = []
+        for rid in ids:
+            entry = active_by_id.get(rid)
+            if entry is not None:
+                titles.append(request_activity.format_active_line(entry, now=now))
+                continue
+            recent = recent_by_id.get(rid)
+            if recent is not None:
+                titles.append(request_activity.format_finished_active_line(recent))
+            else:
+                titles.append("已完成")
+        return titles
+
     def _inplace_patch_active_submenu(self, active_item, snap: ActivitySnapshot) -> None:
         """Refresh visible active rows in place (works while the submenu is open).
 
         Structural add/remove does not re-render an already-displayed submenu,
-        so we only ``setTitle:`` existing rows. When the request set went empty
-        we rewrite row 0 to the idle placeholder instead of leaving a stale
-        "生成中" line; ``menuNeedsUpdate:`` fixes the structure on the next expand.
+        so we only ``setTitle:`` existing rows. Finished requests keep their
+        slot and switch to 「已完成 / 失败」; ``menuNeedsUpdate:`` drops them on
+        the next expand.
         """
         submenu = active_item.submenu() if active_item is not None else None
         if submenu is None:
@@ -514,29 +554,14 @@ class TrayApp:
             return
         if n <= 0:
             return
-        gw = self.sup.status()["gateway"]
-        if gw != "running":
-            first = submenu.itemAtIndex_(0)
-            if first is not None and not first.isSeparatorItem():
-                macos_menu.apply_menu_item_title(
-                    first, f"网关未运行（{_STATUS_ZH.get(gw, gw)}）"
-                )
-            return
-        if not snap.active:
-            first = submenu.itemAtIndex_(0)
-            if first is not None and not first.isSeparatorItem():
-                macos_menu.apply_menu_item_title(first, "当前无进行中的请求")
-            return
-        now = time.time()
-        for i, entry in enumerate(snap.active):
+        titles = self._live_active_row_titles(snap, n_slots=n)
+        for i, title in enumerate(titles):
             if i >= n:
                 break
             row = submenu.itemAtIndex_(i)
             if row is None or row.isSeparatorItem():
                 continue
-            macos_menu.apply_menu_item_title(
-                row, request_activity.format_active_line(entry, now=now)
-            )
+            macos_menu.apply_menu_item_title(row, title)
 
     def _live_patch_open_menu(self, snap: ActivitySnapshot, nsmenu=None, *, force_rebuild: bool = False) -> None:
         """In-place updates for an already-open status menu (macOS).
@@ -563,11 +588,10 @@ class TrayApp:
                     self._rebuild_active_submenu(active_item, snap)
                 else:
                     # Menu is open: structural add/remove won't re-render a
-                    # displayed submenu, so only patch titles in place (this
-                    # rewrites a finished row to the idle placeholder too). The
-                    # menuNeedsUpdate: delegate rebuilds structure on next expand.
+                    # displayed submenu, so only patch titles in place (finished
+                    # rows become 已完成 / 失败). menuNeedsUpdate: rebuilds
+                    # structure on the next expand.
                     self._inplace_patch_active_submenu(active_item, snap)
-                    self._live_active_ids = tuple(a.id for a in snap.active)
 
             recent_item = macos_menu.find_menu_item_by_exact_title(
                 nsmenu, _ACTIVITY_RECENT_TITLE
@@ -637,10 +661,15 @@ class TrayApp:
         self._menu_session_open = True
         self._on_menu_open()
         self._refresh_activity_cache_quiet()
+        snap = self._activity_snapshot()
+        # Capture slot IDs before the popup is shown so live patches can flip
+        # finished rows to 已完成 / 失败 without shrinking the submenu.
+        self._live_active_ids = tuple(a.id for a in snap.active)
         tray_live.sync_rebuild_menu(self._icon)
 
     def _on_non_macos_menu_did_close(self) -> None:
         self._menu_session_open = False
+        self._live_active_ids = None
         if self._redraw_deferred:
             self._request_redraw()
 
@@ -661,16 +690,7 @@ class TrayApp:
 
     def _live_patch_open_menu_crossplatform(self, snap: ActivitySnapshot) -> None:
         """In-place Win/Linux title updates (no DestroyMenu / set_menu)."""
-        gw = self.sup.status()["gateway"]
-        if gw != "running":
-            active_rows = [f"网关未运行（{_STATUS_ZH.get(gw, gw)}）"]
-        elif not snap.active:
-            active_rows = ["当前无进行中的请求"]
-        else:
-            now = time.time()
-            active_rows = [
-                request_activity.format_active_line(a, now=now) for a in snap.active
-            ]
+        active_rows = self._live_active_row_titles(snap)
 
         if not snap.recent:
             recent_rows = ["暂无最近对话"]
