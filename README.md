@@ -26,7 +26,7 @@ Cursor 支持自定义 OpenAI 兼容的 API 地址，但有几个坑：
 
 1. **需要公网地址**：Cursor 会先把请求发回自己的服务器，再转发到你指定的目标地址——所以本地部署的服务 Cursor 根本到不了。本项目用 Cloudflare Tunnel 把本机网关暴露到公网（托盘 App 自动完成隧道创建，普通用户不用碰 Cloudflare 控制台）。
 
-2. **只能走 OpenAI 兼容协议，且 `claude-*` 模型名有特殊处理**：Cursor 只允许自定义 OpenAI 地址，不能自定义 Anthropic 地址。而且对 `claude` 开头的模型名做了特殊路由——即使你把它加到自定义模型列表里，请求仍然不走你的 OpenAI 兼容地址。所以需要给模型起别名，让 Cursor 认为这是一个未知模型，走你的自定义地址。注意别名里也不能出现 `opus`/`sonnet`/`haiku` 这类 Anthropic 特有名称（Cursor 同样会嗅探并特殊处理），因此用 `kiro-o-4.6`、`kiro-s-4.6`、`kiro-h-4.5` 这种单字母代号。另外上游 `ListModels` 里没有 opus 4.8，也顺手补上了。
+2. **只能走 OpenAI 兼容协议，且 `claude-*` / `gpt-*` 模型名有特殊处理**：Cursor 只允许自定义 OpenAI 地址，不能自定义 Anthropic 地址。而且对 `claude` / `gpt` 开头的模型名做了特殊路由——即使你把它加到自定义模型列表里，请求仍然不走你的 OpenAI 兼容地址。所以需要给模型起别名，让 Cursor 认为这是一个未知模型，走你的自定义地址。注意别名里也不能出现 `opus`/`sonnet`/`haiku`/`gpt` 这类会触发嗅探的名称，因此用 `kiro-o-4.6`、`kiro-s-5`、`kiro-5.6-sol`、`kiro-h-4.5` 这种代号。另外上游 `ListModels` 未返回的可用模型（如 `claude-sonnet-5`、GPT 5.6 系列）也已补入 FALLBACK。
 
 3. **用量查询**：用了这个以后就不直接用 Kiro 客户端了，看不到额度消耗。所以加了一个 `GET /usage` 端点，能随时查订阅用量。
 
@@ -84,8 +84,12 @@ Cursor 支持自定义 OpenAI 兼容的 API 地址，但有几个坑：
 | `kiro-o-4.8` | `claude-opus-4.8` |
 | `kiro-o-4.7` | `claude-opus-4.7` |
 | `kiro-o-4.6` | `claude-opus-4.6` |
+| `kiro-s-5` | `claude-sonnet-5` |
 | `kiro-s-4.6` | `claude-sonnet-4.6` |
 | `kiro-h-4.5` | `claude-haiku-4.5` |
+| `kiro-5.6-sol` | `gpt-5.6-sol` |
+| `kiro-5.6-terra` | `gpt-5.6-terra` |
+| `kiro-5.6-luna` | `gpt-5.6-luna` |
 | `kiro-deepseek-3.2` | `deepseek-3.2` |
 | `kiro-glm-5` | `glm-5` |
 | `kiro-minimax-m2.5` | `minimax-m2.5` |

@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.4.2 (2026-07-15)
+
+**New**
+- 新增 Claude Sonnet 5（别名 `kiro-s-5`）与 GPT-5.6 三档 Sol / Terra / Luna（别名 `kiro-5.6-sol` / `kiro-5.6-terra` / `kiro-5.6-luna`）：已写入 FALLBACK 与 `/v1/models`，并更新 README 可用模型表。Cursor 请用别名（`claude-*` / `gpt-*` 真名会被 IDE 嗅探）。
+
+**Changed**
+- 同步上游网关至 `main-582c8bb`：Codex `/v1/models` 按模型声明 `input_modalities`、context window 与 reasoning effort levels（不再对所有模型统一写死）。
+- docker-compose 镜像 pin 至 `ghcr.io/zhujunsan/kiro-gateway:main-582c8bb`。
+
+**Fixed**
+- 修复 Codex 对 Claude / GPT 模型误报不支持图片（`input_modalities` 未按模型能力分叉）的问题。
+
 ## v0.4.1 (2026-07-15)
 
 **New**
