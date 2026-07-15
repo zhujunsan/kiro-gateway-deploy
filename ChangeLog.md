@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.4.0 (2026-07-15)
+
+**New**
+- 同步上游网关至 `main-00d44a5`：完整接入 OpenAI Responses API（Codex），含 P0（合格名 namespace、SSE `arguments`/`delta` 生命周期、`tool_choice`/hosted 422 策略）、P1/P2（reasoning SSE、store/compact、models/multimodal/sampling）与 response store。
+- 兼容 Codex namespace 工具展开（忽略 `web_search` 等包装类型），并去重多 namespace展开后的本地工具名，避免 Bedrock `TOOL_DUPLICATE` / Unsupported tool type 整单失败。
+- 托盘遥测与活动采集新增 `POST /v1/responses`（与 chat/completions、messages 一并纳入 `COLLECT_PATHS`）；usage 解析兼容 Responses 的 `input_tokens`/`output_tokens`。
+- 托盘活动预览支持 Responses：解析 `input` 用户文本，识别 `output_text.delta` 流式与 `output[]` 非流式回复。
+
+**Changed**
+- 按网关实际清单更新 README 可用模型表：下线 `kiro-o-4.5` / `kiro-s-4.5` / `kiro-s-4`，新增 `kiro-deepseek-3.2` / `kiro-glm-5` / `kiro-minimax-m2.5` / `kiro-qwen3-coder-next`。
+- docker-compose 镜像 pin 至 `ghcr.io/zhujunsan/kiro-gateway:main-00d44a5`。
+
+**Fixed**
+- 修复 macOS 菜单状态文案右对齐：live-patch 改用整菜单共享 tab 停靠位，避免短状态停在行中。
+- 修复「进行中」菜单：请求结束后在弹窗期间按稳定请求 ID 原地刷新为「已完成/失败」，不再冻结在「生成中」。
+
 ## v0.3.22 (2026-07-14)
 
 **Fixed**
