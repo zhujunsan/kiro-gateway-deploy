@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.4.3 (2026-07-15)
+
+**Fixed**
+- 修复 `/v1/responses` 活动菜单与遥测漏读 `response.usage`：结束时 ⬇/⬆ 不再卡在粗估（此前常见 ⬇≈78）。
+- 进行中 / 无 usage 时的 token 粗估改为 tiktoken（cl100k × 1.15）：⬆ 从请求文本（跳过 base64 图片，按张 +100 stub）估算；⬇ 对流式答案与非流式 JSON 答案文本估算，不再用 UTF-8 字节÷4。
+- 修复 macOS「进行中 / 最近对话」同时挂 `menuNeedsUpdate` / live-click 时重复注册 ObjC 类导致的异常；菜单打开期间「最近对话」可原地刷新已完成条目。
+
 ## v0.4.2 (2026-07-15)
 
 **New**

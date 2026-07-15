@@ -529,6 +529,227 @@ def test_inplace_patch_flips_finished_rows_to_completed(monkeypatch):
     assert app._live_active_ids == ("a", "b")
 
 
+def test_inplace_patch_recent_submenu_updates_open_list(monkeypatch):
+    """Regression: finishing a request must refresh an already-open 最近对话 list."""
+    from kiro_gateway_tray import macos_menu
+
+    app = _make_app()
+    monkeypatch.setattr(app.sup, "status", lambda: {"gateway": "running"})
+    monkeypatch.setattr(macos_menu, "apply_menu_item_title", lambda item, title: item.setTitle_(title))
+
+    class _Item:
+        def __init__(self, title, enabled=True):
+            self._title = title
+            self._enabled = enabled
+
+        def title(self):
+            return self._title
+
+        def setTitle_(self, t):
+            self._title = t
+
+        def isSeparatorItem(self):
+            return False
+
+        def setEnabled_(self, enabled):
+            self._enabled = bool(enabled)
+
+        def setTarget_(self, _t):
+            pass
+
+        def setAction_(self, _a):
+            pass
+
+        def setTag_(self, _tag):
+            pass
+
+    class _Sub:
+        def __init__(self, items):
+            self._items = list(items)
+
+        def numberOfItems(self):
+            return len(self._items)
+
+        def itemAtIndex_(self, i):
+            return self._items[i]
+
+    class _Parent:
+        def __init__(self, submenu):
+            self._submenu = submenu
+
+        def submenu(self):
+            return self._submenu
+
+    placeholder = _Item("暂无最近对话", enabled=False)
+    parent = _Parent(_Sub([placeholder]))
+    app._live_recent_fp = repr(())
+
+    snap = ActivitySnapshot(
+        active=[],
+        recent=[
+            RecentRequest(
+                id="new",
+                started_at=1,
+                finished_at=2,
+                model="m",
+                path="/v1/messages",
+                ok=True,
+                duration_ms=900,
+                question_preview="just finished",
+                answer_preview="ok",
+            ),
+        ],
+    )
+    app._inplace_patch_recent_submenu(parent, snap)
+    assert "just finished" in placeholder._title
+    assert placeholder._enabled is True
+    assert app._live_recent_fp == app._recent_fingerprint_of(snap)
+
+
+def test_live_patch_open_menu_refreshes_recent_without_force_rebuild(monkeypatch):
+    """While the root menu is open, recent fingerprint changes must patch titles."""
+    from kiro_gateway_tray import macos_menu
+
+    app = _make_app()
+    monkeypatch.setattr(app.sup, "status", lambda: {"gateway": "running"})
+    monkeypatch.setattr(macos_menu, "apply_menu_item_title", lambda item, title: item.setTitle_(title))
+
+    class _Item:
+        def __init__(self, title, submenu=None):
+            self._title = title
+            self._submenu = submenu
+
+        def title(self):
+            return self._title
+
+        def setTitle_(self, t):
+            self._title = t
+
+        def isSeparatorItem(self):
+            return False
+
+        def submenu(self):
+            return self._submenu
+
+        def setEnabled_(self, _e):
+            pass
+
+        def setTarget_(self, _t):
+            pass
+
+        def setAction_(self, _a):
+            pass
+
+        def setTag_(self, _tag):
+            pass
+
+    class _Sub:
+        def __init__(self, items):
+            self._items = list(items)
+
+        def numberOfItems(self):
+            return len(self._items)
+
+        def itemAtIndex_(self, i):
+            return self._items[i]
+
+    class _Root:
+        def __init__(self, items):
+            self._items = items
+
+        def numberOfItems(self):
+            return len(self._items)
+
+        def itemAtIndex_(self, i):
+            return self._items[i]
+
+    old_row = _Item("12:00 ✓ 1.0s · m\n⬆ 1 · ⬇ 1\n问: old\n答: old")
+    recent_sub = _Sub([old_row])
+    recent = _Item("💬 最近对话", submenu=recent_sub)
+    active = _Item("📡 进行中\t空闲", submenu=_Sub([_Item("当前无进行中的请求")]))
+    root = _Root([active, recent])
+
+    monkeypatch.setattr(
+        macos_menu,
+        "find_menu_item_by_title_prefix",
+        lambda menu, prefix: next(
+            (menu.itemAtIndex_(i) for i in range(menu.numberOfItems())
+             if str(menu.itemAtIndex_(i).title()).startswith(prefix)),
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        macos_menu,
+        "find_menu_item_by_exact_title",
+        lambda menu, title: next(
+            (menu.itemAtIndex_(i) for i in range(menu.numberOfItems())
+             if str(menu.itemAtIndex_(i).title()) == title),
+            None,
+        ),
+    )
+
+    app._live_recent_fp = "stale"
+    snap = ActivitySnapshot(
+        active=[],
+        recent=[
+            RecentRequest(
+                id="r2",
+                started_at=10,
+                finished_at=11,
+                model="m",
+                path="/v1/messages",
+                ok=True,
+                duration_ms=500,
+                question_preview="brand new",
+                answer_preview="done",
+            ),
+        ],
+    )
+    app._live_patch_open_menu(snap, root, force_rebuild=False)
+    assert "brand new" in old_row._title
+    assert app._live_recent_fp == app._recent_fingerprint_of(snap)
+
+
+def test_live_click_delegate_can_be_created_twice():
+    """Regression: active + recent each need an instance; class must be cached."""
+    import sys
+
+    from kiro_gateway_tray import macos_menu
+
+    if sys.platform != "darwin":
+        assert macos_menu.make_live_click_delegate() is None
+        return
+    a = macos_menu.make_live_click_delegate()
+    b = macos_menu.make_live_click_delegate()
+    assert a is not None
+    assert b is not None
+    assert a is not b
+
+
+def test_submenu_autorebuild_can_attach_twice():
+    """Regression: both 进行中 and 最近对话 must get menuNeedsUpdate delegates."""
+    import sys
+
+    from kiro_gateway_tray import macos_menu
+
+    if sys.platform != "darwin":
+        return
+    import AppKit
+
+    calls = {"n": 0}
+
+    def _cb(_menu):
+        calls["n"] += 1
+
+    m1 = AppKit.NSMenu.alloc().init()
+    m2 = AppKit.NSMenu.alloc().init()
+    d1 = macos_menu.attach_submenu_autorebuild(m1, _cb)
+    d2 = macos_menu.attach_submenu_autorebuild(m2, _cb)
+    assert d1 is not None
+    assert d2 is not None
+    assert d1 is not d2
+
+
 def test_inplace_patch_replaces_finished_slot_with_new_active(monkeypatch):
     """Regression: open submenu must show the new in-flight request, not stale 已完成."""
     from kiro_gateway_tray import macos_menu

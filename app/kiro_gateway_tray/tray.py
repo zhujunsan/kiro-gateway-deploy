@@ -449,33 +449,85 @@ class TrayApp:
         )
         self._live_active_ids = tuple(a.id for a in snap.active)
 
+    def _recent_live_rows(
+        self, snap: ActivitySnapshot
+    ) -> list[tuple[str, bool, object | None]]:
+        """Build (title, enabled, on_click) rows for the recent-conversation submenu."""
+        if not snap.recent:
+            return [("暂无最近对话", False, None)]
+        rows: list[tuple[str, bool, object | None]] = []
+        for r in snap.recent:
+            detail = (
+                f"问: {r.question_preview or '（无）'}\n"
+                f"答: {r.answer_preview or '（无）'}"
+                if r.ok
+                else (
+                    f"问: {r.question_preview or '（无）'}\n"
+                    f"错误: {r.error_preview or '失败'}"
+                )
+            )
+            handler = self._on_copy_activity_text(detail, "最近对话")
+            rows.append((
+                request_activity.format_recent_line(r),
+                True,
+                lambda h=handler: h(self._icon, None),
+            ))
+        return rows
+
     def _rebuild_recent_submenu(self, recent_item, snap: ActivitySnapshot) -> None:
         submenu = recent_item.submenu() if recent_item is not None else None
         if submenu is None:
             return
-        if not snap.recent:
-            rows = [("暂无最近对话", False, None)]
-        else:
-            rows = []
-            for r in snap.recent:
-                detail = (
-                    f"问: {r.question_preview or '（无）'}\n"
-                    f"答: {r.answer_preview or '（无）'}"
-                    if r.ok
-                    else (
-                        f"问: {r.question_preview or '（无）'}\n"
-                        f"错误: {r.error_preview or '失败'}"
-                    )
-                )
-                handler = self._on_copy_activity_text(detail, "最近对话")
-                rows.append((
-                    request_activity.format_recent_line(r),
-                    True,
-                    lambda h=handler: h(self._icon, None),
-                ))
         macos_menu.replace_submenu_rows(
-            submenu, rows, click_delegate=self._ensure_live_click_delegate("recent")
+            submenu,
+            self._recent_live_rows(snap),
+            click_delegate=self._ensure_live_click_delegate("recent"),
         )
+        self._live_recent_fp = self._recent_fingerprint_of(snap)
+
+    def _inplace_patch_recent_submenu(self, recent_item, snap: ActivitySnapshot) -> None:
+        """Refresh visible recent rows in place (works while the submenu is open).
+
+        AppKit does not re-render structural add/remove on an already-displayed
+        submenu, so we only ``setTitle:`` / rebind clicks on existing slots from
+        the head of ``snap.recent``. New rows beyond the current slot count
+        appear on the next ``menuNeedsUpdate:`` expand or root-menu reopen.
+        """
+        submenu = recent_item.submenu() if recent_item is not None else None
+        if submenu is None:
+            return
+        try:
+            n = int(submenu.numberOfItems())
+        except Exception:
+            return
+        if n <= 0:
+            return
+        rows = self._recent_live_rows(snap)
+        click_delegate = self._ensure_live_click_delegate("recent")
+        for i, (title, enabled, on_click) in enumerate(rows):
+            if i >= n:
+                break
+            row = submenu.itemAtIndex_(i)
+            if row is None or row.isSeparatorItem():
+                continue
+            macos_menu.apply_menu_item_title(row, title)
+            try:
+                row.setEnabled_(bool(enabled))
+            except Exception:
+                pass
+            if on_click is not None and click_delegate is not None:
+                try:
+                    row.setTarget_(click_delegate)
+                    row.setAction_(b"activateLiveItem:")
+                    row.setTag_(i)
+                    click_delegate.setHandler_forTag_(on_click, i)
+                except Exception:
+                    pass
+            elif click_delegate is not None:
+                try:
+                    click_delegate.setHandler_forTag_(None, i)
+                except Exception:
+                    pass
         self._live_recent_fp = self._recent_fingerprint_of(snap)
 
     def _resolve_status_menu(self, nsmenu=None):
@@ -611,10 +663,11 @@ class TrayApp:
     def _live_patch_open_menu(self, snap: ActivitySnapshot, nsmenu=None, *, force_rebuild: bool = False) -> None:
         """In-place updates for an already-open status menu (macOS).
 
-        Patches gateway/tunnel status titles and the "进行中" header/rows without
-        setMenu:. Submenu *structure* is refreshed by the ``menuNeedsUpdate:``
-        delegates on each expand; here we only touch titles so changes render
-        while a submenu is being displayed.
+        Patches gateway/tunnel status titles, the "进行中" header/rows, and
+        "最近对话" titles without setMenu:. Submenu *structure* (new rows beyond
+        the current slot count) is refreshed by ``menuNeedsUpdate:`` on each
+        expand or by ``force_rebuild`` at root open; while open we patch titles
+        so finished conversations appear within the poll window.
         """
         nsmenu = self._resolve_status_menu(nsmenu)
         if nsmenu is None:
@@ -645,11 +698,21 @@ class TrayApp:
                 recent_fp = self._recent_fingerprint_of(snap)
                 if force_rebuild:
                     self._rebuild_recent_submenu(recent_item, snap)
-                else:
-                    # Recent rows only change when a request finishes; structure
-                    # is handled by menuNeedsUpdate: on the next expand. Track the
-                    # fingerprint so the post-close redraw stays consistent.
-                    self._live_recent_fp = recent_fp
+                elif recent_fp != self._live_recent_fp:
+                    # Conversation finished (or history changed) while the menu
+                    # is open: patch titles in place so an already-open
+                    # 「最近对话」 list updates within the ~1–3s poll window.
+                    # If the submenu was empty/short, also rebuild so new rows
+                    # exist in the model (and paint when AppKit allows).
+                    try:
+                        sub = recent_item.submenu()
+                        n_slots = int(sub.numberOfItems()) if sub is not None else 0
+                    except Exception:
+                        n_slots = 0
+                    want = max(1, len(snap.recent))
+                    self._inplace_patch_recent_submenu(recent_item, snap)
+                    if n_slots < want:
+                        self._rebuild_recent_submenu(recent_item, snap)
         except Exception:
             logger.debug("live activity title patch failed", exc_info=True)
 

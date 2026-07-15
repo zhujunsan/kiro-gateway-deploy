@@ -256,6 +256,186 @@ def test_feed_sse_chunk_parses_usage():
     assert completion == 12
 
 
+def test_feed_sse_chunk_parses_responses_nested_usage():
+    """Responses API puts usage under response.completed → response.usage."""
+    acc: list[str] = []
+    chunk = (
+        'data: {"type":"response.output_text.delta","delta":"找到了"}\n\n'
+        'data: {"type":"response.completed","response":{'
+        '"usage":{"input_tokens":121203,"output_tokens":312,"total_tokens":121515}'
+        '}}\n\n'
+    ).encode()
+    prompt, completion = ra.feed_sse_chunk(acc, chunk)
+    assert "".join(acc) == "找到了"
+    assert prompt == 121203
+    assert completion == 312
+
+
+def test_estimate_tokens_from_text_uses_tiktoken_not_bytes_div4():
+    """CJK live estimates must not use UTF-8 bytes÷4 (undercounts badly)."""
+    text = (
+        "找到了——三个文件都在废纸篓 (~/.Trash) 里：\n"
+        "- Additional_Tools_for_Xcode_27_beta_3.dmg - 62M\n"
+        "- Command_Line_Tools_27_beta_3.dmg - 499M\n"
+        "- Xcode_27_beta_3.xip - 1.8G\n"
+        "所以是被移到废纸篓了（不是我干的）。"
+    )
+    est = ra.estimate_tokens_from_text(text)
+    naive = ra.estimate_tokens_from_bytes(len(text.encode("utf-8")))
+    # Full short reply should land well above the old capped bytes÷4 ≈78 trap.
+    assert est > 100
+    assert est > naive
+    # Empty / whitespace-only
+    assert ra.estimate_tokens_from_text("") == 0
+
+
+def test_estimate_prompt_tokens_from_body_uses_text_not_raw_bytes():
+    """⬆ should tiktoken message text, not inflate on JSON/base64 padding."""
+    body = json.dumps({
+        "model": "m",
+        "messages": [
+            {"role": "system", "content": "你是助手"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "请用中文解释一下废纸篓里的三个文件"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64," + ("A" * 8000)},
+                    },
+                ],
+            },
+        ],
+    }, ensure_ascii=False).encode()
+    est = ra.estimate_prompt_tokens_from_body(body)
+    naive = ra.estimate_tokens_from_bytes(len(body))
+    # Image stub (+100) + Chinese text — far below raw body bytes÷4.
+    assert est < naive
+    assert est > 50
+    text, images = ra.extract_prompt_text_for_estimate(body)
+    assert images == 1
+    assert "废纸篓" in text
+    assert "AAAA" not in text
+
+
+def test_middleware_json_completion_uses_tiktoken_when_no_usage(tmp_path):
+    store = RequestActivityStore(tmp_path / "request_activity.json")
+    mw = RequestActivityMiddleware(None, store)
+    body = json.dumps({
+        "model": "claude-x",
+        "messages": [{"role": "user", "content": "你好"}],
+    }).encode()
+    answer = "找到了——三个文件都在废纸篓里，可以直接清空回收空间。" * 3
+    resp = json.dumps({
+        "choices": [{"message": {"role": "assistant", "content": answer}}],
+    }, ensure_ascii=False).encode()
+    responses = [
+        {
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [(b"content-type", b"application/json")],
+        },
+        {"type": "http.response.body", "body": resp, "more_body": False},
+    ]
+    scope = {"type": "http", "method": "POST", "path": "/v1/chat/completions", "headers": []}
+    frames = [{"type": "http.request", "body": body, "more_body": False}]
+    idx = {"i": 0}
+
+    async def receive():
+        i = idx["i"]
+        idx["i"] += 1
+        if i < len(frames):
+            return frames[i]
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(_m):
+        return None
+
+    async def inner_app(_scope, recv, snd):
+        while True:
+            msg = await recv()
+            if msg["type"] == "http.request" and not msg.get("more_body", False):
+                break
+        for frame in responses:
+            await snd(frame)
+
+    mw.app = inner_app
+    _run(mw(scope, receive, send))
+    recent = store.snapshot().recent[0]
+    # No usage in body → tiktoken on answer text, not response bytes÷4.
+    assert recent.completion_tokens == ra.estimate_tokens_from_text(answer)
+    assert recent.completion_tokens > ra.estimate_tokens_from_bytes(len(resp))
+    # Prompt also started from tiktoken text estimate (may stay if no usage).
+    assert recent.prompt_tokens == ra.estimate_prompt_tokens_from_body(body)
+
+
+def test_middleware_applies_responses_completed_usage(tmp_path):
+    """Streaming /v1/responses must adopt response.usage, not live estimate."""
+    store = RequestActivityStore(tmp_path / "request_activity.json")
+    mw = RequestActivityMiddleware(None, store)
+    body = json.dumps({
+        "model": "kiro-o-4.8",
+        "input": "废纸篓里有什么",
+        "stream": True,
+    }).encode()
+    long_delta = "找到了——" + ("三个文件都在废纸篓里。" * 20)
+    responses = [
+        {
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [(b"content-type", b"text/event-stream")],
+        },
+        {
+            "type": "http.response.body",
+            "body": (
+                f'data: {{"type":"response.output_text.delta","delta":{json.dumps(long_delta, ensure_ascii=False)}}}\n\n'
+            ).encode(),
+            "more_body": True,
+        },
+        {
+            "type": "http.response.body",
+            "body": (
+                'data: {"type":"response.completed","response":{'
+                '"usage":{"input_tokens":5000,"output_tokens":280,"total_tokens":5280}'
+                '}}\n\n'
+            ).encode(),
+            "more_body": True,
+        },
+        {"type": "http.response.body", "body": b"", "more_body": False},
+    ]
+
+    scope = {"type": "http", "method": "POST", "path": "/v1/responses", "headers": []}
+    frames = [{"type": "http.request", "body": body, "more_body": False}]
+    idx = {"i": 0}
+
+    async def receive():
+        i = idx["i"]
+        idx["i"] += 1
+        if i < len(frames):
+            return frames[i]
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(_message):
+        return None
+
+    async def inner_app(_scope, recv, snd):
+        while True:
+            msg = await recv()
+            if msg["type"] == "http.request" and not msg.get("more_body", False):
+                break
+        for frame in responses:
+            await snd(frame)
+
+    mw.app = inner_app
+    _run(mw(scope, receive, send))
+
+    recent = store.snapshot().recent[0]
+    assert recent.path == "/v1/responses"
+    assert recent.prompt_tokens == 5000
+    assert recent.completion_tokens == 280
+    assert "找到了" in recent.answer_preview
+
+
 def test_middleware_updates_tokens_during_stream(tmp_path):
     store = RequestActivityStore(tmp_path / "request_activity.json")
     mw = RequestActivityMiddleware(None, store)

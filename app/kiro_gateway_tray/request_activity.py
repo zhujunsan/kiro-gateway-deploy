@@ -30,7 +30,15 @@ COLLECT_PATHS = frozenset({
 
 RECENT_LIMIT = 10
 PREVIEW_CHARS = 72  # multi-line recent items can show a bit more than one tight row
-ANSWER_ACCUM_CAP = 200  # stop accumulating assistant text once we have enough
+# Accumulate enough assistant text for live tiktoken estimates before final
+# usage arrives. Preview display still truncates via truncate_preview().
+ANSWER_ACCUM_CAP = 100_000
+# Match kiro.tokenizer.CLAUDE_CORRECTION_FACTOR so live ⬇ tracks gateway usage.
+_CLAUDE_CORRECTION_FACTOR = 1.15
+# Same stub the gateway tokenizer uses for image blocks in prompt estimates.
+_IMAGE_TOKEN_ESTIMATE = 100
+# Lazy tiktoken Encoding: None=untried, False=unavailable, else Encoding.
+_tiktoken_encoding: Any = None
 # Claude Code / IDE wrappers inject these into user turns; skip for menu preview.
 _NOISE_PREFIXES = (
     "<system-reminder",
@@ -174,6 +182,145 @@ def _flatten_content(content: Any, *, skip_noise: bool = False) -> str:
     return ""
 
 
+def _collect_text_and_images(content: Any, parts: list[str], images: list[int]) -> None:
+    """Append visible text / image stubs from a message content value.
+
+    Skips base64 / URL payloads so prompt estimates are not dominated by
+    raw image bytes (gateway also stubs images at a fixed token cost).
+    """
+    if content is None:
+        return
+    if isinstance(content, str):
+        if content:
+            parts.append(content)
+        return
+    if isinstance(content, list):
+        for block in content:
+            _collect_text_and_images(block, parts, images)
+        return
+    if not isinstance(content, dict):
+        return
+    btype = content.get("type")
+    if btype in {"image_url", "image", "input_image"}:
+        images[0] += 1
+        return
+    if btype in {"text", "input_text", "output_text"} or "text" in content:
+        t = content.get("text")
+        if isinstance(t, str) and t:
+            parts.append(t)
+        return
+    # Nested content (Responses message items, tool results, …)
+    nested = content.get("content")
+    if nested is not None:
+        _collect_text_and_images(nested, parts, images)
+
+
+def _collect_messages_prompt_parts(messages: list[Any], parts: list[str], images: list[int]) -> None:
+    for msg in messages:
+        if isinstance(msg, str):
+            if msg:
+                parts.append(msg)
+            continue
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        if isinstance(role, str) and role:
+            parts.append(role)
+        _collect_text_and_images(msg.get("content"), parts, images)
+        # Assistant tool_calls / Responses function_call names+args (text only)
+        tool_calls = msg.get("tool_calls")
+        if isinstance(tool_calls, list):
+            for tc in tool_calls:
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get("function") if isinstance(tc.get("function"), dict) else tc
+                if not isinstance(fn, dict):
+                    continue
+                name = fn.get("name")
+                if isinstance(name, str) and name:
+                    parts.append(name)
+                args = fn.get("arguments")
+                if isinstance(args, str) and args:
+                    parts.append(args)
+        name = msg.get("name")
+        if isinstance(name, str) and name:
+            parts.append(name)
+        args = msg.get("arguments")
+        if isinstance(args, str) and args:
+            parts.append(args)
+        # Some Responses items put text on the item itself
+        if msg.get("type") in {"function_call", "function_call_output", "reasoning"}:
+            _collect_text_and_images(msg.get("output"), parts, images)
+            summary = msg.get("summary")
+            if isinstance(summary, list):
+                _collect_text_and_images(summary, parts, images)
+
+
+def extract_prompt_text_for_estimate(body: bytes) -> tuple[str, int]:
+    """Pull text (+ image count) from a Chat / Anthropic / Responses request body.
+
+    Returns:
+        ``(joined_text, image_count)``. Empty text when the body is not JSON.
+    """
+    if not body:
+        return "", 0
+    try:
+        data = json.loads(body)
+    except Exception:
+        return "", 0
+    if not isinstance(data, dict):
+        return "", 0
+
+    parts: list[str] = []
+    images = [0]
+
+    system = data.get("system")
+    if isinstance(system, str) and system:
+        parts.append(system)
+    elif system is not None:
+        _collect_text_and_images(system, parts, images)
+
+    instructions = data.get("instructions")
+    if isinstance(instructions, str) and instructions:
+        parts.append(instructions)
+
+    messages = data.get("messages")
+    if isinstance(messages, list):
+        _collect_messages_prompt_parts(messages, parts, images)
+
+    inp = data.get("input")
+    if isinstance(inp, str) and inp:
+        parts.append(inp)
+    elif isinstance(inp, list):
+        _collect_messages_prompt_parts(inp, parts, images)
+
+    tools = data.get("tools")
+    if isinstance(tools, list) and tools:
+        try:
+            parts.append(json.dumps(tools, ensure_ascii=False, separators=(",", ":")))
+        except (TypeError, ValueError):
+            pass
+
+    return "\n".join(parts), images[0]
+
+
+def estimate_prompt_tokens_from_body(body: bytes) -> int:
+    """tiktoken estimate of request prompt tokens (before upstream usage).
+
+    Counts extracted text + a fixed stub per image. Falls back to byte÷4 only
+    when no text/images could be recovered from the body.
+    """
+    text, image_count = extract_prompt_text_for_estimate(body)
+    n = estimate_tokens_from_text(text) if text else 0
+    if image_count:
+        n += image_count * _IMAGE_TOKEN_ESTIMATE
+    if n > 0:
+        return n
+    if body:
+        return estimate_tokens_from_bytes(len(body))
+    return 0
+
+
 def extract_model(body: bytes) -> str:
     if not body:
         return "unknown"
@@ -251,15 +398,8 @@ def extract_question_preview(body: bytes, limit: int = PREVIEW_CHARS) -> str:
     return ""
 
 
-def extract_answer_preview_from_json(buf: bytes, limit: int = PREVIEW_CHARS) -> str:
-    if not buf:
-        return ""
-    try:
-        data = json.loads(buf)
-    except Exception:
-        return ""
-    if not isinstance(data, dict):
-        return ""
+def _answer_text_from_obj(data: dict[str, Any]) -> str:
+    """Full assistant text from a parsed Chat / Anthropic / Responses JSON object."""
     # OpenAI chat completion
     choices = data.get("choices")
     if isinstance(choices, list) and choices:
@@ -268,15 +408,15 @@ def extract_answer_preview_from_json(buf: bytes, limit: int = PREVIEW_CHARS) -> 
         if isinstance(msg, dict):
             text = _flatten_content(msg.get("content"))
             if text:
-                return truncate_preview(text, limit)
+                return text
         text = _flatten_content(first.get("text")) if isinstance(first, dict) else ""
         if text:
-            return truncate_preview(text, limit)
+            return text
     # Anthropic messages API
     content = data.get("content")
     text = _flatten_content(content)
     if text:
-        return truncate_preview(text, limit)
+        return text
     # OpenAI Responses API: output[] message items with output_text parts
     output = data.get("output")
     if isinstance(output, list):
@@ -297,8 +437,29 @@ def extract_answer_preview_from_json(buf: bytes, limit: int = PREVIEW_CHARS) -> 
             if piece:
                 parts.append(piece)
         if parts:
-            return truncate_preview("".join(parts), limit)
+            return "".join(parts)
+    # Nested Responses wrapper: {"response": {...}}
+    resp = data.get("response")
+    if isinstance(resp, dict):
+        return _answer_text_from_obj(resp)
     return ""
+
+
+def extract_answer_text_from_json(buf: bytes) -> str:
+    """Full assistant text from a non-stream JSON Chat / Anthropic / Responses body."""
+    if not buf:
+        return ""
+    try:
+        data = json.loads(buf)
+    except Exception:
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    return _answer_text_from_obj(data)
+
+
+def extract_answer_preview_from_json(buf: bytes, limit: int = PREVIEW_CHARS) -> str:
+    return truncate_preview(extract_answer_text_from_json(buf), limit)
 
 
 def extract_error_preview(buf: bytes, limit: int = PREVIEW_CHARS) -> str:
@@ -322,15 +483,61 @@ def extract_error_preview(buf: bytes, limit: int = PREVIEW_CHARS) -> str:
     return ""
 
 
+def _get_tiktoken_encoding() -> Any | None:
+    """Lazy-load cl100k_base (same encoding the gateway uses for usage)."""
+    global _tiktoken_encoding
+    if _tiktoken_encoding is not None:
+        return _tiktoken_encoding if _tiktoken_encoding else None
+    try:
+        import tiktoken
+
+        _tiktoken_encoding = tiktoken.get_encoding("cl100k_base")
+    except Exception:
+        _tiktoken_encoding = False
+        return None
+    return _tiktoken_encoding
+
+
 def estimate_tokens_from_bytes(n: int) -> int:
-    """Rough token estimate from UTF-8 byte length (≈4 bytes/token)."""
+    """Last-resort estimate from opaque UTF-8 byte length (≈4 bytes/token).
+
+    Prefer :func:`estimate_tokens_from_text` whenever the text is available —
+    byte÷4 badly undercounts CJK.
+    """
     return max(0, int(n) // 4)
 
 
 def estimate_tokens_from_text(text: str) -> int:
+    """Estimate tokens for visible text (live ⬇ before final usage).
+
+    Uses tiktoken cl100k_base × Claude correction — same approach as the
+    gateway's ``usage.completion_tokens`` / ``output_tokens``. Falls back to a
+    CJK-aware character heuristic when tiktoken is unavailable.
+    """
     if not text:
         return 0
-    return estimate_tokens_from_bytes(len(text.encode("utf-8")))
+    encoding = _get_tiktoken_encoding()
+    if encoding is not None:
+        try:
+            return int(len(encoding.encode(text)) * _CLAUDE_CORRECTION_FACTOR)
+        except Exception:
+            pass
+    # Fallback: CJK ≈ 1 token/char; other scripts ≈ 4 chars/token.
+    cjk = 0
+    other = 0
+    for ch in text:
+        o = ord(ch)
+        if (
+            0x4E00 <= o <= 0x9FFF
+            or 0x3400 <= o <= 0x4DBF
+            or 0xF900 <= o <= 0xFAFF
+            or 0x3040 <= o <= 0x30FF
+            or 0xAC00 <= o <= 0xD7AF
+        ):
+            cjk += 1
+        elif not ch.isspace():
+            other += 1
+    return max(1, cjk + (other + 3) // 4)
 
 
 def format_token_n(n: int) -> str:
@@ -363,6 +570,14 @@ def parse_usage_tokens(usage: dict[str, Any] | None) -> tuple[int | None, int | 
 
 
 def _iter_usage_objects(obj: Any):
+    """Yield usage dicts from Chat / Anthropic / Responses SSE or JSON bodies.
+
+    - OpenAI Chat: top-level ``usage``
+    - Anthropic: ``message.usage`` (message_start) and top-level ``usage``
+      (message_delta)
+    - OpenAI Responses: ``response.usage`` on ``response.completed`` (and
+      top-level ``usage`` on non-stream JSON)
+    """
     if not isinstance(obj, dict):
         return
     u = obj.get("usage")
@@ -373,6 +588,11 @@ def _iter_usage_objects(obj: Any):
         mu = msg.get("usage")
         if isinstance(mu, dict):
             yield mu
+    resp = obj.get("response")
+    if isinstance(resp, dict):
+        ru = resp.get("usage")
+        if isinstance(ru, dict):
+            yield ru
 
 
 def feed_sse_text(acc: list[str], chunk: bytes, cap: int = ANSWER_ACCUM_CAP) -> None:
@@ -874,7 +1094,7 @@ class RequestActivityMiddleware:
             raw = bytes(body)
             model = extract_model(raw)
             question = extract_question_preview(raw)
-            prompt_est = estimate_tokens_from_bytes(len(raw))
+            prompt_est = estimate_prompt_tokens_from_body(raw)
         except Exception:
             logger.debug("request_activity: preview extract failed", exc_info=True)
 
@@ -971,9 +1191,14 @@ class RequestActivityMiddleware:
                 if len(state.json_buf) < ANSWER_ACCUM_CAP * 8:
                     state.json_buf.extend(chunk)
                 if not state.usage_completion:
-                    state.completion_tokens = estimate_tokens_from_bytes(
-                        state.response_bytes
-                    )
+                    answer_text = extract_answer_text_from_json(bytes(state.json_buf))
+                    if answer_text:
+                        state.completion_tokens = estimate_tokens_from_text(answer_text)
+                    else:
+                        # Incomplete JSON mid-transfer: last-resort byte estimate.
+                        state.completion_tokens = estimate_tokens_from_bytes(
+                            state.response_bytes
+                        )
                     self._sync_tokens(state)
             if not message.get("more_body", False):
                 state.completed = True
@@ -991,6 +1216,12 @@ class RequestActivityMiddleware:
                             if c is not None:
                                 state.completion_tokens = c
                                 state.usage_completion = True
+                    if not state.usage_completion:
+                        answer_text = extract_answer_text_from_json(bytes(state.json_buf))
+                        if answer_text:
+                            state.completion_tokens = estimate_tokens_from_text(
+                                answer_text
+                            )
                 self._sync_tokens(state, force=True)
 
     def _finalise(self, state: _LiveState, *, ok: bool) -> None:

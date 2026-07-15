@@ -297,6 +297,20 @@ def test_sse_usage_merges_anthropic_split():
     assert usage["output_tokens"] == 12
 
 
+def test_sse_usage_reads_responses_nested_usage():
+    """response.completed nests usage under response.usage — must not miss it."""
+    usage = telemetry._merge_usage_from_sse(
+        b'data: {"type":"response.output_text.delta","delta":"hi"}\n\n'
+        b'data: {"type":"response.completed","response":{'
+        b'"usage":{"input_tokens":99,"output_tokens":17,"total_tokens":116}'
+        b'}}\n\n'
+    )
+    assert usage is not None
+    assert usage["input_tokens"] == 99
+    assert usage["output_tokens"] == 17
+    assert usage["total_tokens"] == 116
+
+
 def test_json_usage_extraction():
     usage = telemetry._usage_from_json(
         json.dumps({"usage": {"prompt_tokens": 5, "completion_tokens": 1,

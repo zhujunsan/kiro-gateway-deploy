@@ -212,6 +212,9 @@ def apply_menu_item_title(item, title: str) -> None:
             pass
 
 
+_SubmenuAutoRebuildCls = None
+
+
 def attach_submenu_autorebuild(submenu, rebuild_cb) -> Any:
     """Attach an ``NSMenuDelegate`` that refills ``submenu`` on each expand.
 
@@ -221,7 +224,11 @@ def attach_submenu_autorebuild(submenu, rebuild_cb) -> Any:
     ``menuNeedsUpdate:`` rebuild before each expand always shows current data.
 
     Returns the delegate (kept alive by the caller) or None off macOS.
+
+    The ObjC class is registered once per process so active + recent can both
+    attach (redefining the class raises ``objc.error``).
     """
+    global _SubmenuAutoRebuildCls
     if submenu is None:
         return None
     if sys.platform != "darwin":
@@ -237,32 +244,38 @@ def attach_submenu_autorebuild(submenu, rebuild_cb) -> Any:
     except Exception:
         return None
 
-    class _SubmenuAutoRebuild(AppKit.NSObject):
-        def init(self):
-            self = objc.super(_SubmenuAutoRebuild, self).init()
-            if self is None:
-                return None
-            self._cb = None
-            return self
+    if _SubmenuAutoRebuildCls is None:
+        class _SubmenuAutoRebuild(AppKit.NSObject):
+            def init(self):
+                self = objc.super(_SubmenuAutoRebuild, self).init()
+                if self is None:
+                    return None
+                self._cb = None
+                return self
 
-        def setCallback_(self, cb):
-            self._cb = cb
+            def setCallback_(self, cb):
+                self._cb = cb
 
-        def menuNeedsUpdate_(self, menu):
-            if self._cb is None:
-                return
-            try:
-                self._cb(menu)
-            except Exception:
-                pass
+            def menuNeedsUpdate_(self, menu):
+                if self._cb is None:
+                    return
+                try:
+                    self._cb(menu)
+                except Exception:
+                    pass
+
+        _SubmenuAutoRebuildCls = _SubmenuAutoRebuild
 
     try:
-        delegate = _SubmenuAutoRebuild.alloc().init()
+        delegate = _SubmenuAutoRebuildCls.alloc().init()
         delegate.setCallback_(rebuild_cb)
         submenu.setDelegate_(delegate)
         return delegate
     except Exception:
         return None
+
+
+_LiveClickDelegateCls = None
 
 
 def make_live_click_delegate():
@@ -271,7 +284,12 @@ def make_live_click_delegate():
     pystray's callback list is frozen at ``update_menu`` time. Submenus rebuilt
     while the status menu is open must use a separate target/action pair so
     clicks (e.g. copy recent conversation) still work.
+
+    The ObjC class is registered once per process — defining it on every call
+    raises ``objc.error: overriding existing Objective-C class`` (active +
+    recent each need their own *instance*).
     """
+    global _LiveClickDelegateCls
     if sys.platform != "darwin":
         return None
     try:
@@ -280,34 +298,37 @@ def make_live_click_delegate():
     except Exception:
         return None
 
-    class _LiveClickDelegate(AppKit.NSObject):
-        def init(self):
-            self = objc.super(_LiveClickDelegate, self).init()
-            if self is None:
-                return None
-            self._handlers: dict[int, Callable[[], None]] = {}
-            return self
+    if _LiveClickDelegateCls is None:
+        class _LiveClickDelegate(AppKit.NSObject):
+            def init(self):
+                self = objc.super(_LiveClickDelegate, self).init()
+                if self is None:
+                    return None
+                self._handlers: dict[int, Callable[[], None]] = {}
+                return self
 
-        def clear(self) -> None:
-            self._handlers.clear()
+            def clear(self) -> None:
+                self._handlers.clear()
 
-        def setHandler_forTag_(self, handler, tag) -> None:
-            if handler is None:
-                self._handlers.pop(int(tag), None)
-            else:
-                self._handlers[int(tag)] = handler
+            def setHandler_forTag_(self, handler, tag) -> None:
+                if handler is None:
+                    self._handlers.pop(int(tag), None)
+                else:
+                    self._handlers[int(tag)] = handler
 
-        def activateLiveItem_(self, sender) -> None:
-            handler = self._handlers.get(int(sender.tag()))
-            if handler is None:
-                return
-            try:
-                handler()
-            except Exception:
-                pass
+            def activateLiveItem_(self, sender) -> None:
+                handler = self._handlers.get(int(sender.tag()))
+                if handler is None:
+                    return
+                try:
+                    handler()
+                except Exception:
+                    pass
+
+        _LiveClickDelegateCls = _LiveClickDelegate
 
     try:
-        return _LiveClickDelegate.alloc().init()
+        return _LiveClickDelegateCls.alloc().init()
     except Exception:
         return None
 

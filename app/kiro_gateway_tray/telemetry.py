@@ -960,9 +960,14 @@ def extract_model(body: bytes) -> str:
 
 
 def _iter_usage_objects(obj: Any) -> Iterable[dict[str, Any]]:
-    """Yield usage dicts from a parsed SSE/JSON object. Anthropic nests the
-    initial usage under ``message.usage`` (message_start) and the final under a
-    top-level ``usage`` (message_delta); OpenAI uses a top-level ``usage``."""
+    """Yield usage dicts from a parsed SSE/JSON object.
+
+    - OpenAI Chat: top-level ``usage``
+    - Anthropic: ``message.usage`` (message_start) and top-level ``usage``
+      (message_delta)
+    - OpenAI Responses: ``response.usage`` on ``response.completed`` (and
+      top-level ``usage`` on non-stream JSON)
+    """
     if not isinstance(obj, dict):
         return
     u = obj.get("usage")
@@ -973,6 +978,11 @@ def _iter_usage_objects(obj: Any) -> Iterable[dict[str, Any]]:
         mu = msg.get("usage")
         if isinstance(mu, dict):
             yield mu
+    resp = obj.get("response")
+    if isinstance(resp, dict):
+        ru = resp.get("usage")
+        if isinstance(ru, dict):
+            yield ru
 
 
 def _merge_usage_from_sse(buf: bytes) -> dict[str, Any] | None:
