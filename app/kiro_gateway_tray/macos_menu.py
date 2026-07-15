@@ -18,6 +18,9 @@ from typing import Any, Callable
 # Prefer this over button.isHighlighted() when deciding whether setMenu: is safe.
 _status_menu_session_open = False
 
+# Gap between the left label and the right-aligned gray tag (points).
+_TAG_GAP = 16.0
+
 _LiveWillOpen = Callable[[Any], None]
 _LiveDidClose = Callable[[Any], None]
 _LiveTick = Callable[[], None]
@@ -149,6 +152,9 @@ def apply_menu_item_title(item, title: str) -> None:
     Safe to call while the menu is open (unlike ``setMenu:`` / ``update_menu``).
 
     - Titles with ``\\t`` get the right-aligned gray suffix treatment.
+      When the item already belongs to an ``NSMenu``, all ``\\t`` siblings are
+      re-aligned to a *shared* trailing tab stop (same as initial menu build).
+      Per-item tab stops would leave status text mid-row after live patches.
     - Titles with ``\\n`` get a real multi-line attributed title (plain
       ``setTitle:`` collapses newlines on AppKit menus).
     """
@@ -174,7 +180,18 @@ def apply_menu_item_title(item, title: str) -> None:
         if "\n" in title:
             _apply_multiline_attributed_title(item, title, AppKit, Foundation)
         elif "\t" in title:
-            _apply_tab_attributed_title(item, title, AppKit, Foundation)
+            # Prefer menu-wide shared tab stops so live updates match the
+            # initial install_menu_gray_suffix layout (label left, tag right).
+            menu = None
+            try:
+                menu = item.menu()
+            except Exception:
+                menu = None
+            if menu is not None:
+                item.setTitle_(title)
+                realign_menu_tab_suffixes(menu)
+            else:
+                _apply_tab_attributed_title(item, title, AppKit, Foundation)
         else:
             item.setTitle_(title)
     except Exception:
@@ -333,6 +350,9 @@ def replace_submenu_rows(submenu, rows, click_delegate=None) -> None:
             submenu.addItem_(item)
         except Exception:
             continue
+    # Items are attributed before addItem_ (menu() is nil), so finish with a
+    # shared trailing tab stop across the whole submenu.
+    realign_menu_tab_suffixes(submenu)
 
 
 class _StubMenuItem:
@@ -423,22 +443,124 @@ def _apply_multiline_attributed_title(item, title: str, AppKit, Foundation) -> N
     item.setAttributedTitle_(attr)
 
 
-def _apply_tab_attributed_title(item, title: str, AppKit, Foundation) -> None:
-    left, right = title.split("\t", 1)
+def _pad_tab_right(right: str) -> str:
+    """Pad the ``复制`` badge so its background reads as a chip.
+
+    Idempotent: titles that already include the padding (e.g. after a prior
+    attributed apply) are not padded again on realign.
+    """
+    stripped = right.strip()
+    if stripped == "复制":
+        return f"   {stripped}   "
+    return right
+
+
+def shared_right_tab_pos(entries: list[tuple[float, float]], *, gap: float = _TAG_GAP) -> float:
+    """Return a shared NSRightTabStop location for ``(left_w, right_w)`` rows.
+
+    All trailing tags align to this x so short statuses like「运行中」sit at the
+    same trailing edge as wider tags like「✓ 已开启」/「已是最新」/「复制」.
+    """
+    if not entries:
+        return 0.0
+    return max(left_w + gap + right_w for left_w, right_w in entries)
+
+
+def _tab_entry_widths(
+    left: str,
+    right: str,
+    menu_font,
+    small_font,
+    AppKit,
+    Foundation,
+) -> tuple[float, float, str]:
+    padded = _pad_tab_right(right)
+    left_w = _text_width(left, menu_font, AppKit, Foundation)
+    right_w = _text_width(padded, small_font, AppKit, Foundation)
+    return left_w, right_w, padded
+
+
+def realign_menu_tab_suffixes(nsmenu) -> None:
+    """Apply one shared right-aligned tab stop to every ``\\t`` title in ``nsmenu``.
+
+    Matches the layout produced by ``install_menu_gray_suffix`` so live title
+    patches (gateway/tunnel/进行中) stay trailing-aligned instead of mid-row.
+    No-op off macOS or when AppKit is unavailable.
+    """
+    if nsmenu is None or sys.platform != "darwin":
+        return
+    try:
+        import AppKit
+        import Foundation
+    except Exception:
+        return
+
+    menu_font = AppKit.NSFont.menuFontOfSize_(0)
+    font_size = menu_font.pointSize()
+    small_font = AppKit.NSFont.menuFontOfSize_(font_size - 2)
+
+    tab_items: list[tuple[Any, str, str]] = []
+    widths: list[tuple[float, float]] = []
+    try:
+        n = int(nsmenu.numberOfItems())
+    except Exception:
+        return
+
+    for i in range(n):
+        try:
+            item = nsmenu.itemAtIndex_(i)
+        except Exception:
+            continue
+        if item is None:
+            continue
+        try:
+            if item.isSeparatorItem():
+                continue
+        except Exception:
+            pass
+        title = str(item.title() or "")
+        if "\t" not in title or "\n" in title:
+            continue
+        left, right = title.split("\t", 1)
+        left_w, right_w, _padded = _tab_entry_widths(
+            left, right, menu_font, small_font, AppKit, Foundation
+        )
+        widths.append((left_w, right_w))
+        tab_items.append((item, left, right))
+
+    if not tab_items:
+        return
+
+    tab_pos = shared_right_tab_pos(widths)
+    for item, left, right in tab_items:
+        try:
+            _apply_tab_attributed_title(
+                item, left + "\t" + right, AppKit, Foundation, tab_pos=tab_pos
+            )
+        except Exception:
+            continue
+
+
+def _apply_tab_attributed_title(
+    item, title: str, AppKit, Foundation, *, tab_pos: float | None = None
+) -> None:
+    left, raw_right = title.split("\t", 1)
     menu_font = AppKit.NSFont.menuFontOfSize_(0)
     font_size = menu_font.pointSize()
     small_font = AppKit.NSFont.menuFontOfSize_(font_size - 2)
     gray = AppKit.NSColor.secondaryLabelColor()
     bg = AppKit.NSColor.colorWithCalibratedWhite_alpha_(0.5, 0.15)
-    is_badge = right.strip() == "复制"
-    if is_badge:
-        right = f"   {right}   "
+    is_badge = raw_right.strip() == "复制"
+    left_w, right_w, right = _tab_entry_widths(
+        left, raw_right, menu_font, small_font, AppKit, Foundation
+    )
     composed = left + "\t" + right
 
-    # Match install_menu_gray_suffix: one right-aligned tab sized to this item.
-    left_w = _text_width(left, menu_font, AppKit, Foundation)
-    right_w = _text_width(right, small_font, AppKit, Foundation)
-    tab_pos = left_w + 16.0 + right_w
+    # When called without a shared tab_pos (item not yet in a menu), fall back
+    # to this row's natural width. Prefer realign_menu_tab_suffixes once the
+    # item is attached so short tags do not sit mid-row.
+    if tab_pos is None:
+        tab_pos = shared_right_tab_pos([(left_w, right_w)])
 
     para = AppKit.NSMutableParagraphStyle.alloc().init()
     tab = AppKit.NSTextTab.alloc().initWithType_location_(
@@ -497,25 +619,11 @@ def install_menu_gray_suffix() -> None:
         return
 
     _orig_create_menu = _darwin.Icon._create_menu
-    _TAG_GAP = 16.0
-
-    def _ns_len(s):
-        return Foundation.NSString.stringWithString_(s).length()
 
     def _patched_create_menu(self, descriptors, callbacks):
         nsmenu = _orig_create_menu(self, descriptors, callbacks)
         if nsmenu is None:
             return None
-
-        menu_font = AppKit.NSFont.menuFontOfSize_(0)
-        font_size = menu_font.pointSize()
-        small_font = AppKit.NSFont.menuFontOfSize_(font_size - 2)
-        gray = AppKit.NSColor.secondaryLabelColor()
-        bg = AppKit.NSColor.colorWithCalibratedWhite_alpha_(0.5, 0.15)
-
-        tab_items = []
-        multiline_items = []
-        max_total_w = 0.0
 
         for i in range(nsmenu.numberOfItems()):
             item = nsmenu.itemAtIndex_(i)
@@ -523,72 +631,12 @@ def install_menu_gray_suffix() -> None:
                 continue
             title = str(item.title() or "")
             if "\n" in title:
-                multiline_items.append((item, title))
-                continue
-            if "\t" not in title:
-                continue
-            left, right = title.split("\t", 1)
-            is_badge = right.strip() == "复制"
-            padded_right = f"   {right}   " if is_badge else right
-            left_w = _text_width(left, menu_font, AppKit, Foundation)
-            right_w = _text_width(padded_right, small_font, AppKit, Foundation)
-            total_w = left_w + _TAG_GAP + right_w
-            if total_w > max_total_w:
-                max_total_w = total_w
-            tab_items.append((item, left, right))
+                try:
+                    _apply_multiline_attributed_title(item, title, AppKit, Foundation)
+                except Exception:
+                    pass
 
-        for item, title in multiline_items:
-            try:
-                _apply_multiline_attributed_title(item, title, AppKit, Foundation)
-            except Exception:
-                pass
-
-        if not tab_items:
-            return nsmenu
-
-        tab_pos = max_total_w
-
-        for item, left, right in tab_items:
-            is_badge = right.strip() == "复制"
-            if is_badge:
-                right = f"   {right}   "
-            composed = left + "\t" + right
-
-            para = AppKit.NSMutableParagraphStyle.alloc().init()
-            tab = AppKit.NSTextTab.alloc().initWithType_location_(
-                AppKit.NSRightTabStopType, tab_pos
-            )
-            para.setTabStops_([tab])
-
-            attr = Foundation.NSMutableAttributedString.alloc().initWithString_(
-                composed
-            )
-            full_range = Foundation.NSRange(0, attr.length())
-            attr.addAttribute_value_range_(
-                AppKit.NSFontAttributeName, menu_font, full_range
-            )
-            attr.addAttribute_value_range_(
-                AppKit.NSParagraphStyleAttributeName, para, full_range
-            )
-
-            ns_left_len = _ns_len(left)
-            ns_right_len = _ns_len(right)
-            right_start = ns_left_len + 1
-            right_range = Foundation.NSRange(right_start, ns_right_len)
-
-            attr.addAttribute_value_range_(
-                AppKit.NSForegroundColorAttributeName, gray, right_range
-            )
-            attr.addAttribute_value_range_(
-                AppKit.NSFontAttributeName, small_font, right_range
-            )
-            if is_badge:
-                attr.addAttribute_value_range_(
-                    AppKit.NSBackgroundColorAttributeName, bg, right_range
-                )
-
-            item.setAttributedTitle_(attr)
-
+        realign_menu_tab_suffixes(nsmenu)
         return nsmenu
 
     _darwin.Icon._create_menu = _patched_create_menu
