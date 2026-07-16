@@ -322,6 +322,7 @@ class TrayApp:
                 a.model,
                 a.prompt_tokens,
                 a.completion_tokens,
+                a.completion_known,
             )
             for a in snap.active
         )
@@ -335,6 +336,7 @@ class TrayApp:
                 r.error_preview,
                 r.prompt_tokens,
                 r.completion_tokens,
+                r.completion_known,
             )
             for r in snap.recent
         )
@@ -382,6 +384,7 @@ class TrayApp:
                     r.error_preview,
                     r.prompt_tokens,
                     r.completion_tokens,
+                    r.completion_known,
                 )
                 for r in snap.recent
             )

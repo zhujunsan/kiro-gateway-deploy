@@ -1,10 +1,10 @@
 services:
   kiro-gateway:
     # Fork ghcr.io/zhujunsan/kiro-gateway has the four Cursor-backend changes
-    # (kiro-* aliases, GET /usage, OpenAI tool_use content blocks, keep-system
+    # (required model aliases, GET /usage, OpenAI tool_use content blocks, keep-system
     # -prompt trim) baked into the source, so no start-time patching is needed.
     # 升级：在 fork 的 main 上 rebase 上游、推送后 CI 产出新的 main-<sha> tag，改这里即可。
-    image: ghcr.io/zhujunsan/kiro-gateway:main-673ff07
+    image: ghcr.io/zhujunsan/kiro-gateway:main-4905ff6
     container_name: kiro-gateway
     ports:
       - "${KIRO_GATEWAY_PORT:-18000}:8000"
@@ -13,6 +13,8 @@ services:
     environment:
       KIRO_CREDS_FILE: /home/kiro/.aws/sso/cache/kiro-auth-token.json
       KIRO_API_REGION: ${KIRO_API_REGION:-us-east-1}
+      # 模型列表按需发现的节流窗口；聊天请求不会触发发现。
+      MODEL_DISCOVERY_CACHE_TTL_SECONDS: ${MODEL_DISCOVERY_CACHE_TTL_SECONDS:-14400}
       PROFILE_ARN: ${PROFILE_ARN}
       PROXY_API_KEY: ${PROXY_API_KEY}
       FAKE_REASONING: ${FAKE_REASONING:-false}

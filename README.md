@@ -6,14 +6,6 @@
 进程内跑网关，子进程跑 cloudflared，把本机网关经 Cloudflare 网络暴露成
 `https://kg-<你的用户名>.<域名>/v1` 供 Cursor 直接使用。
 
-> ⚠️ **重要限制：启用本方案后，Cursor 里的官方 OpenAI 模型（GPT 系列）将无法使用。**
->
-> Cursor 一旦开启自定义 OpenAI API Key + Base URL，会把**所有 OpenAI 品牌的模型（`gpt-*`、`o*` 等）**全部路由到你设的 Base URL，而不是只对手动添加的别名生效。本网关只认识 `kiro-*` 别名，不认识 `gpt-*`，所以选 GPT 系列会直接报错。这是 Cursor 的全局劫持行为，没有「部分 GPT 走 Cursor、部分走自定义地址」的分流开关。
->
-> 如果你还想在 Cursor 里用官方 GPT 模型，只能二选一：
-> 1. **来回切开关**：用 Cursor 原生 GPT（订阅额度）时关掉自定义 OpenAI Key，用 Kiro 的 Claude 时再打开。
-> 2. **让网关代理 GPT**：自行扩展网关，把 `gpt-*`/`o*` 透传到官方 `https://api.openai.com/v1`（用你自己的 OpenAI API Key，走 OpenAI 官方计费，非 Cursor 订阅额度）。
-
 > 💸 **Team 方案注意：即使 BYOK 也要收 Cursor Token 费。**
 >
 > 根据 [Cursor 模型与价格文档](https://cursor.com/cn/docs/models-and-pricing#cursor-token)，在**团队（Teams）方案**中，非 Auto 的智能体请求需支付每百万 token **$0.25** 的 Cursor Token 费率。这笔费用是在模型 API 定价之外**额外收取**的，且**适用于自带密钥（BYOK）用量**——也就是说，即使你用本网关把模型流量接到自己的 Kiro 订阅上，Cursor 仍会按通过它的 token 量收这笔费。
@@ -26,7 +18,7 @@ Cursor 支持自定义 OpenAI 兼容的 API 地址，但有几个坑：
 
 1. **需要公网地址**：Cursor 会先把请求发回自己的服务器，再转发到你指定的目标地址——所以本地部署的服务 Cursor 根本到不了。本项目用 Cloudflare Tunnel 把本机网关暴露到公网（托盘 App 自动完成隧道创建，普通用户不用碰 Cloudflare 控制台）。
 
-2. **只能走 OpenAI 兼容协议，且 `claude-*` / `gpt-*` 模型名有特殊处理**：Cursor 只允许自定义 OpenAI 地址，不能自定义 Anthropic 地址。而且对 `claude` / `gpt` 开头的模型名做了特殊路由——即使你把它加到自定义模型列表里，请求仍然不走你的 OpenAI 兼容地址。所以需要给模型起别名，让 Cursor 认为这是一个未知模型，走你的自定义地址。注意别名里也不能出现 `opus`/`sonnet`/`haiku`/`gpt` 这类会触发嗅探的名称，因此用 `kiro-o-4.6`、`kiro-s-5`、`kiro-5.6-sol`、`kiro-h-4.5` 这种代号。另外上游 `ListModels` 未返回的可用模型（如 `claude-sonnet-5`、GPT 5.6 系列）也已补入 FALLBACK。
+2. **只能走 OpenAI 兼容协议，Claude 模型需要别名**：Cursor 只允许自定义 OpenAI 地址，不能自定义 Anthropic 地址，并会特殊处理 `claude-*` 模型名。因此 Claude 使用不含 `opus`/`sonnet`/`haiku` 的 `kiro-o-*`、`kiro-s-*`、`kiro-h-*` 别名。GPT 系列直接使用 Cursor 已有的真实模型名，无需 alias，也无需手动增加 model name。`auto` 同样直接使用原生名称。上游列表缺失但可用的模型仍会按真实 ID 补入 FALLBACK。
 
 3. **用量查询**：用了这个以后就不直接用 Kiro 客户端了，看不到额度消耗。所以加了一个 `GET /usage` 端点，能随时查订阅用量。
 
@@ -71,25 +63,25 @@ Cursor 支持自定义 OpenAI 兼容的 API 地址，但有几个坑：
    - **API Key**：托盘「复制 Gateway 密码」（自动生成的 `proxy_api_key`）
    - **Base URL**：托盘「复制 Tunnel URL」（即 `https://kg-<你的用户名>.<域名>/v1`）
 
-4. 在 Cursor 模型列表里添加想用的别名（见下方[可用模型](#可用模型)），以后每次开机启动 App 即可，无需再输激活码。
+4. Claude 和其他需要避开名称嗅探的模型，在 Cursor 模型列表里添加下方别名；GPT 系列与 `auto` 直接选择 Cursor 已有模型，无需新增 model name。以后每次开机启动 App 即可，无需再输激活码。
 
 > 完整的 App 使用说明、开发者构建步骤、`config.toml` 配置项见 **[`app/README.md`](app/README.md)**。
 > 管理员部署签发服务（Worker）见 **[`docs/cloudflare-setup.md`](docs/cloudflare-setup.md)**。
 
 ## 可用模型
 
+直接使用真实模型名（无需 alias，也无需在 Cursor 手动增加 model name）：`auto`、`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`。
+
+需要手动添加的别名：
+
 | 别名 | 实际模型 |
 |---|---|
-| `auto-kiro` | `auto` |
 | `kiro-o-4.8` | `claude-opus-4.8` |
 | `kiro-o-4.7` | `claude-opus-4.7` |
 | `kiro-o-4.6` | `claude-opus-4.6` |
 | `kiro-s-5` | `claude-sonnet-5` |
 | `kiro-s-4.6` | `claude-sonnet-4.6` |
 | `kiro-h-4.5` | `claude-haiku-4.5` |
-| `kiro-5.6-sol` | `gpt-5.6-sol` |
-| `kiro-5.6-terra` | `gpt-5.6-terra` |
-| `kiro-5.6-luna` | `gpt-5.6-luna` |
 | `kiro-deepseek-3.2` | `deepseek-3.2` |
 | `kiro-glm-5` | `glm-5` |
 | `kiro-minimax-m2.5` | `minimax-m2.5` |

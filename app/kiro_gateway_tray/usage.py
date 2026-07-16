@@ -78,8 +78,8 @@ def fetch_models(timeout: float = 10.0) -> list[str]:
     return sorted(m["id"] for m in data if "id" in m)
 
 
-# Shown only as the real id in the tray menu — no Cursor alias row.
-_MENU_NO_ALIAS = frozenset({"auto"})
+# Native models pinned before alias-backed and other canonical model rows.
+_MENU_PINNED_MODELS = frozenset({"auto"})
 
 
 def split_models_for_menu(
@@ -89,20 +89,20 @@ def split_models_for_menu(
     """Split model IDs into (canonical, aliases) with matching order.
 
     The gateway list mixes real IDs (``claude-haiku-4.5``) with Cursor-safe
-    aliases (``kiro-h-4.5``, ``auto-kiro``). The tray menu shows two blocks;
+    aliases (for example, ``kiro-h-4.5``). The tray menu shows two blocks;
     paired rows must stay 1:1 so the N-th alias lines up with the N-th
     canonical model above the separator.
 
-    - Canonical entries use the *real* id (``auto``, not ``auto-kiro``).
-    - ``auto`` has no alias row and is pinned first in the canonical block.
+    - Canonical entries use the real model ID.
+    - Native ``auto`` has no alias and is pinned first in the canonical block.
     - Alias entries follow the same order as their paired canonical rows.
     - Other models with no menu alias appear at the end of the canonical list.
     """
     if aliases is None:
         try:
             from kiro.config import MODEL_ALIASES as aliases  # type: ignore
-        except Exception:
-            aliases = {"auto-kiro": "auto"}
+        except (ImportError, AttributeError):
+            aliases = {}
 
     alias_to_real = dict(aliases or {})
     real_to_alias = {real: alias for alias, real in alias_to_real.items()}
@@ -127,8 +127,8 @@ def split_models_for_menu(
         real_present = real in id_set
         if not real_present and not alias_present:
             continue
-        # auto: real name only, pinned first; hide auto-kiro from alias block.
-        if real in _MENU_NO_ALIAS:
+        # Native models use their real IDs and stay at the front of the menu.
+        if real in _MENU_PINNED_MODELS:
             pinned.append(real)
             continue
         if alias_present:

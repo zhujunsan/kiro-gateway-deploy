@@ -53,6 +53,11 @@ class Supervisor:
         self.on_status_change: Callable[[], None] | None = None
         self._health_thread: threading.Thread | None = None
         self._health_stop = threading.Event()
+        # Coordinates stop/join/start without holding this lock while joining.
+        # A timed-out old loop blocks replacement instead of being silently
+        # revived by clearing its shared Event during an immediate restart.
+        self._health_lifecycle_lock = threading.Lock()
+        self._health_stopping = False
         # Guards the cached status fields (_gw_health, _tunnel_connected,
         # counters) so status() reads never tear against a probe's write.
         self._state_lock = threading.Lock()
@@ -89,7 +94,7 @@ class Supervisor:
         Call once on final teardown (app quit), not on stop(): stop() may be
         followed by start() again (restart), which reuses the client.
         """
-        self._health_stop.set()
+        self._stop_health_loop()
         try:
             self._client.close()
         except Exception:
@@ -145,6 +150,38 @@ class Supervisor:
         if telemetry_secret:
             cfg.telemetry.secret = telemetry_secret
         appconfig.save(cfg)
+
+    def _sync_telemetry_secret(self, cfg: AppCfg) -> AppCfg:
+        """Best-effort parent-side telemetry secret refresh before child launch.
+
+        The child may still refresh after a 401, but it only changes its runtime
+        uploader. Persisting here makes the tray parent the sole config writer
+        for rotations and keeps startup non-blocking on Worker failures.
+        """
+        provision_url = cfg.cloudflare.provision_url
+        shared_secret = self._cached_secret or cfg.cloudflare.shared_secret
+        if not provision_url or not shared_secret:
+            return cfg
+        try:
+            from . import provision
+            username = provision._get_username(cfg)
+            secret = provision.refresh_telemetry_secret(
+                provision_url, shared_secret, username
+            )
+        except Exception:
+            logger.debug("telemetry secret startup sync failed", exc_info=True)
+            return cfg
+        if not secret or secret == cfg.telemetry.secret:
+            return cfg
+        try:
+            cfg = appconfig.update(
+                lambda latest: setattr(latest.telemetry, "secret", secret)
+            )
+            self._cfg = cfg
+            logger.info("synchronized telemetry secret before gateway launch")
+        except Exception:
+            logger.debug("telemetry secret startup save failed", exc_info=True)
+        return cfg
 
     def _sync_port_if_changed(self, cfg: AppCfg) -> None:
         """If local port differs from the one registered with Worker, update it."""
@@ -203,6 +240,7 @@ class Supervisor:
         cfg = self._load()
         self._ensure_provisioned(cfg)
         self._sync_port_if_changed(cfg)
+        cfg = self._sync_telemetry_secret(cfg)
         with self._state_lock:
             self._gw_health = "starting"
         self.gateway.start(cfg)
@@ -216,7 +254,7 @@ class Supervisor:
         return healthy
 
     def stop(self) -> None:
-        self._health_stop.set()
+        self._stop_health_loop()
         self.tunnel.stop()
         self.gateway.stop()
         with self._state_lock:
@@ -251,31 +289,57 @@ class Supervisor:
         with self._state_lock:
             self._gw_health = "starting"
 
-    def _start_health_loop(self) -> None:
-        """Start a background thread that probes gateway /health.
+    def _stop_health_loop(self, *, timeout: float = 5.0) -> bool:
+        """Signal the health loop, join it outside the lifecycle lock, and clear it.
 
-        Probes every ``_PROBE_INTERVAL_ACTIVE`` seconds while settling; once the
-        gateway has been answering steadily it backs off to
-        ``_PROBE_INTERVAL_STEADY`` to avoid needless wakeups. While the process
-        is alive but not yet answering, the state is "starting"; after
-        ``_UNHEALTHY_THRESHOLD`` consecutive failed probes it flips to "error"
-        so a wedged gateway (bad port, bad profile_arn) is visible instead of
-        spinning on "starting" forever."""
-        if self._health_thread and self._health_thread.is_alive():
-            return
-        self._health_stop.clear()
+        Returns ``False`` when a probe is wedged beyond ``timeout``. In that
+        case the live thread remains recorded and a later start refuses to clear
+        its stop Event, preventing an old loop from being accidentally revived.
+        """
+        with self._health_lifecycle_lock:
+            self._health_stopping = True
+            self._health_stop.set()
+            thread = self._health_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=timeout)
+        if thread is not None and thread.is_alive():
+            logger.warning(
+                "supervisor health loop did not exit within {}s; refusing replacement",
+                timeout,
+            )
+            return False
+        with self._health_lifecycle_lock:
+            if self._health_thread is thread:
+                self._health_thread = None
+            self._health_stopping = False
+        return True
 
-        def _loop():
-            while not self._health_stop.is_set():
-                relaxed = self._run_probe_cycle()
-                interval = (
-                    self._PROBE_INTERVAL_STEADY if relaxed
-                    else self._PROBE_INTERVAL_ACTIVE
-                )
-                self._health_stop.wait(interval)
+    def _start_health_loop(self) -> bool:
+        """Start the health loop unless a prior loop is still shutting down."""
+        with self._health_lifecycle_lock:
+            thread = self._health_thread
+            if thread is not None and thread.is_alive():
+                if self._health_stopping or self._health_stop.is_set():
+                    logger.warning("health loop is still stopping; not starting a replacement")
+                    return False
+                return True
+            self._health_thread = None
+            self._health_stopping = False
+            self._health_stop.clear()
 
-        self._health_thread = threading.Thread(target=_loop, daemon=True)
-        self._health_thread.start()
+            def _loop() -> None:
+                while not self._health_stop.is_set():
+                    relaxed = self._run_probe_cycle()
+                    interval = (
+                        self._PROBE_INTERVAL_STEADY if relaxed
+                        else self._PROBE_INTERVAL_ACTIVE
+                    )
+                    self._health_stop.wait(interval)
+
+            thread = threading.Thread(target=_loop, name="supervisor-health", daemon=True)
+            self._health_thread = thread
+            thread.start()
+            return True
 
     def probe_now(self) -> bool:
         """Run one gateway+tunnel health probe immediately, off the loop cadence.

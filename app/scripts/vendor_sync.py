@@ -1,7 +1,7 @@
 # app/scripts/vendor_sync.py
 """Clone the (already-patched) upstream fork at the pinned SHA and copy the
-files the app embeds. The fork bakes in kiro-* aliases + /usage, so there is
-no build-time patching step."""
+files the app embeds. The fork bakes in the required model aliases and /usage,
+so there is no build-time patching step."""
 from __future__ import annotations
 
 import shutil

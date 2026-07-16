@@ -236,6 +236,35 @@ def test_format_duration_and_menu_lines():
     assert "坏了" in finished_fail
 
 
+def test_format_unknown_completion_as_dash_but_preserve_real_zero():
+    active = ra.ActiveRequest(
+        id="unknown",
+        started_at=0,
+        model="m",
+        path="/v1/chat/completions",
+        phase="streaming",
+        question_preview="q",
+        completion_tokens=0,
+        completion_known=False,
+    )
+    assert "⬇ —" in format_active_line(active, now=1)
+
+    complete = ra.RecentRequest(
+        id="zero",
+        started_at=0,
+        finished_at=1,
+        model="m",
+        path="/v1/chat/completions",
+        ok=True,
+        duration_ms=1,
+        question_preview="q",
+        answer_preview="",
+        completion_tokens=0,
+        completion_known=True,
+    )
+    assert "⬇ 0" in format_recent_line(complete)
+
+
 def test_format_token_n():
     assert ra.format_token_n(0) == "0"
     assert ra.format_token_n(999) == "999"
@@ -254,6 +283,36 @@ def test_feed_sse_chunk_parses_usage():
     assert "".join(acc) == "hi"
     assert prompt == 40
     assert completion == 12
+
+
+def test_feed_sse_chunk_keeps_estimating_after_initial_anthropic_zero_usage():
+    """Anthropic message_start's output zero must not freeze live ⬇ at zero."""
+    acc: list[str] = []
+    start = (
+        'data: {"type":"message_start","message":'
+        '{"usage":{"input_tokens":40,"output_tokens":0}}}\n\n'
+    ).encode()
+    prompt, completion = ra.feed_sse_chunk(acc, start)
+    assert prompt == 40
+    assert completion is None
+
+    reasoning = (
+        'data: {"choices":[{"delta":{"reasoning_content":"先分析一下"}}]}\n\n'
+    ).encode()
+    prompt, completion = ra.feed_sse_chunk(acc, reasoning)
+    assert prompt is None
+    assert completion is None
+    assert "".join(acc) == "先分析一下"
+
+
+def test_feed_sse_chunk_counts_anthropic_thinking_delta():
+    acc: list[str] = []
+    chunk = (
+        'data: {"type":"content_block_delta","delta":'
+        '{"type":"thinking_delta","thinking":"推理过程"}}\n\n'
+    ).encode()
+    ra.feed_sse_chunk(acc, chunk)
+    assert "".join(acc) == "推理过程"
 
 
 def test_feed_sse_chunk_parses_responses_nested_usage():
@@ -434,6 +493,80 @@ def test_middleware_applies_responses_completed_usage(tmp_path):
     assert recent.prompt_tokens == 5000
     assert recent.completion_tokens == 280
     assert "找到了" in recent.answer_preview
+
+
+def test_middleware_recovers_split_reasoning_and_final_usage(tmp_path):
+    """ASGI body boundaries must not drop split SSE JSON events."""
+    store = RequestActivityStore(tmp_path / "request_activity.json")
+    mw = RequestActivityMiddleware(None, store)
+    body = json.dumps({
+        "model": "gpt-5.6-sol",
+        "messages": [{"role": "user", "content": "分析一下"}],
+        "stream": True,
+    }).encode()
+    responses = [
+        {
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [(b"content-type", b"text/event-stream")],
+        },
+        {
+            "type": "http.response.body",
+            "body": b'data: {"choices":[{"delta":{"reasoning_content":"\xe6\x8e\xa8',
+            "more_body": True,
+        },
+        {
+            "type": "http.response.body",
+            "body": b'\xe7\x90\x86"}}]}\n\n',
+            "more_body": True,
+        },
+        {
+            "type": "http.response.body",
+            "body": b'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":',
+            "more_body": True,
+        },
+        {
+            "type": "http.response.body",
+            "body": b'123}}\n\n',
+            "more_body": True,
+        },
+        {"type": "http.response.body", "body": b"", "more_body": False},
+    ]
+    input_sent = False
+    mid_completion = {"value": 0}
+
+    async def receive():
+        nonlocal input_sent
+        if not input_sent:
+            input_sent = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(_message):
+        return None
+
+    async def inner_app(_scope, recv, snd):
+        while True:
+            message = await recv()
+            if message["type"] == "http.request" and not message.get("more_body", False):
+                break
+        await snd(responses[0])
+        await snd(responses[1])
+        await snd(responses[2])
+        mid_completion["value"] = store.snapshot().active[0].completion_tokens
+        await snd(responses[3])
+        await snd(responses[4])
+
+    mw.app = inner_app
+    _run(mw(
+        {"type": "http", "method": "POST", "path": "/v1/chat/completions", "headers": []},
+        receive,
+        send,
+    ))
+    recent = store.snapshot().recent[0]
+    assert mid_completion["value"] > 0
+    assert recent.completion_tokens == 123
+    assert "推理" in recent.answer_preview
 
 
 def test_middleware_updates_tokens_during_stream(tmp_path):
@@ -721,3 +854,159 @@ def test_stale_active_filtered_on_load(tmp_path):
     }), encoding="utf-8")
     snap = load_snapshot(path)
     assert snap.active == []
+
+
+
+def test_store_throttled_update_eventually_persists(tmp_path, monkeypatch):
+    """A lone update inside the throttle window must reach disk later."""
+    monkeypatch.setattr(ra, "_TOKEN_PERSIST_INTERVAL", 0.03)
+    path = tmp_path / "request_activity.json"
+    store = RequestActivityStore(path)
+    rid = store.begin(model="m", path="/v1/messages", question_preview="q")
+
+    store.update_tokens(rid, completion_tokens=17, completion_known=True)
+    assert load_snapshot(path).active[0].completion_tokens == 0
+
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        loaded = load_snapshot(path)
+        if loaded.active and loaded.active[0].completion_tokens == 17:
+            break
+        time.sleep(0.01)
+    assert loaded.active[0].completion_tokens == 17
+    assert loaded.active[0].completion_known is True
+
+
+def test_store_finish_cancels_stale_delayed_flush(tmp_path, monkeypatch):
+    """A pre-finish timer cannot overwrite the newer recent-only snapshot."""
+    monkeypatch.setattr(ra, "_TOKEN_PERSIST_INTERVAL", 0.04)
+    path = tmp_path / "request_activity.json"
+    store = RequestActivityStore(path)
+    rid = store.begin(model="m", path="/v1/messages", question_preview="q")
+    store.update_tokens(rid, completion_tokens=23, completion_known=True)
+    store.finish(rid, ok=True, answer_preview="done")
+
+    time.sleep(0.09)
+    loaded = load_snapshot(path)
+    assert loaded.active == []
+    assert loaded.recent[0].completion_tokens == 23
+    assert loaded.recent[0].completion_known is True
+
+
+def test_completion_known_round_trip_and_legacy_compatibility(tmp_path):
+    """Explicit booleans survive disk, while an old missing field stays unknown."""
+    path = tmp_path / "request_activity.json"
+    now = time.time()
+    path.write_text(json.dumps({
+        "active": [{
+            "id": "false", "started_at": now, "model": "m", "path": "/v1/messages",
+            "phase": "streaming", "question_preview": "q", "completion_known": False,
+        }],
+        "recent": [
+            {
+                "id": "true", "started_at": 1, "finished_at": 2, "model": "m",
+                "path": "/v1/messages", "ok": True, "duration_ms": 1,
+                "question_preview": "q", "answer_preview": "", "completion_known": True,
+            },
+            {
+                "id": "legacy", "started_at": 1, "finished_at": 2, "model": "m",
+                "path": "/v1/messages", "ok": True, "duration_ms": 1,
+                "question_preview": "q", "answer_preview": "",
+            },
+        ],
+    }), encoding="utf-8")
+
+    snap = load_snapshot(path, now=now)
+    assert snap.active[0].completion_known is False
+    assert snap.recent[0].completion_known is True
+    assert snap.recent[1].completion_known is None
+    assert "⬇ 0" in format_recent_line(snap.recent[0])
+    assert "⬇ —" in format_recent_line(snap.recent[1])
+
+
+def test_feed_sse_tool_output_is_counted_without_polluting_preview():
+    """All streaming protocols feed a separate tool-only token accumulator."""
+    cases = [
+        (
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":'
+            '{"name":"lookup","arguments":"{\\"id\\":1}"}}]}}]}\n\n',
+            "lookup", '{"id":1}',
+        ),
+        (
+            'data: {"type":"content_block_start","index":0,"content_block":'
+            '{"type":"tool_use","id":"toolu_1","name":"lookup","input":{}}}\n\n'
+            'data: {"type":"content_block_delta","index":0,"delta":'
+            '{"type":"input_json_delta","partial_json":"{\\"id\\":1}"}}\n\n',
+            "lookup", '{"id":1}',
+        ),
+        (
+            'data: {"type":"response.output_item.added","item":'
+            '{"id":"fc_1","type":"function_call","name":"lookup","arguments":""}}\n\n'
+            'data: {"type":"response.function_call_arguments.delta","item_id":"fc_1",'
+            '"delta":"{\\"id\\":1}"}\n\n'
+            'data: {"type":"response.function_call_arguments.done","item_id":"fc_1",'
+            '"name":"lookup","arguments":"{\\"id\\":1}"}\n\n',
+            "lookup", '{"id":1}',
+        ),
+    ]
+    for payload, name, arguments in cases:
+        preview: list[str] = []
+        output: list[str] = []
+        ra.feed_sse_chunk(preview, payload.encode(), output_acc=output, tool_state={})
+        joined = "".join(output)
+        assert preview == []
+        assert joined.count(name) == 1
+        assert joined.count(arguments) == 1
+        assert ra.estimate_tokens_from_text(joined) > 0
+
+
+def test_sse_tail_is_bounded_without_newline():
+    """An oversized malformed SSE line cannot grow retained memory forever."""
+    _, _, tail = ra.feed_sse_buffered_chunk([], b"x" * (ra._SSE_TAIL_CAP + 50), b"")
+    assert len(tail) == ra._SSE_TAIL_CAP
+
+
+def test_middleware_openai_tool_estimate_is_overridden_by_final_usage(tmp_path):
+    """Tool-only live estimation yields to authoritative terminal usage."""
+    store = RequestActivityStore(tmp_path / "request_activity.json")
+    mw = RequestActivityMiddleware(None, store)
+    body = json.dumps({
+        "model": "m", "messages": [{"role": "user", "content": "use tool"}], "stream": True,
+    }).encode()
+    frames = [
+        {"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"text/event-stream")]},
+        {"type": "http.response.body", "body": (
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":'
+            '{"name":"lookup","arguments":"{\\"id\\":1}"}}]},"finish_reason":null}]}\n\n'
+        ).encode(), "more_body": True},
+        {"type": "http.response.body", "body": (
+            'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}],'
+            '"usage":{"prompt_tokens":9,"completion_tokens":31}}\n\n'
+        ).encode(), "more_body": True},
+        {"type": "http.response.body", "body": b"", "more_body": False},
+    ]
+    live = {"tokens": 0, "preview": ""}
+
+    async def receive():
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    async def send(_message):
+        return None
+
+    async def app(_scope, recv, snd):
+        await recv()
+        await snd(frames[0])
+        await snd(frames[1])
+        active = store.snapshot().active[0]
+        live["tokens"] = active.completion_tokens
+        live["preview"] = active.question_preview
+        await snd(frames[2])
+        await snd(frames[3])
+
+    mw.app = app
+    _run(mw({"type": "http", "method": "POST", "path": "/v1/chat/completions", "headers": []}, receive, send))
+    recent = store.snapshot().recent[0]
+    assert live["tokens"] > 0
+    assert recent.answer_preview == ""
+    assert recent.completion_tokens == 31
+    assert recent.completion_known is True

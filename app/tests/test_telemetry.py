@@ -411,6 +411,60 @@ def test_tick_failure_spools(tmp_path):
     assert loaded[0]["model"] == "m"
 
 
+def test_upload_zeroes_credit_when_bucket_has_no_tokens(tmp_path):
+    """Account-wide Credit changes must not be attributed to a zero-token bucket."""
+    rep, up, pend = _reporter(tmp_path)
+    rep.aggregator.record(RequestSample(model="m", success=False), now=1200)
+    rep.aggregator.record_credit_estimate("m", credits=42.5, now=1200)
+
+    rep.tick(now=1800)
+
+    assert len(up.batches) == 1
+    row = up.batches[0][0]
+    assert row["total_tokens_sum"] == 0
+    assert row["estimated_credits"] == 0.0
+    assert row["credit_estimate_segments"] == 1
+    assert pend.load_all() == []
+
+
+def test_upload_keeps_credit_when_bucket_has_tokens(tmp_path):
+    """Credit estimates remain intact when gateway traffic produced tokens."""
+    rep, up, _ = _reporter(tmp_path)
+    rep.aggregator.record(
+        RequestSample(model="m", success=True, total_tokens=100), now=1200
+    )
+    rep.aggregator.record_credit_estimate("m", credits=12.5, now=1200)
+
+    rep.tick(now=1800)
+
+    row = up.batches[0][0]
+    assert row["total_tokens_sum"] == 100
+    assert row["estimated_credits"] == 12.5
+
+
+def test_pending_retry_zeroes_legacy_credit_without_tokens(tmp_path):
+    """Previously spooled dirty rows are sanitized before retry upload."""
+    rep, up, pend = _reporter(tmp_path)
+    pend.append([{
+        "bucket_start": 1200,
+        "bucket_seconds": 600,
+        "username": "u",
+        "model": "m",
+        "app_version": "v",
+        "requests": 0,
+        "total_tokens_sum": 0,
+        "estimated_credits": 99.0,
+        "credit_estimate_segments": 1,
+        "credit_estimate_missing_segments": 0,
+    }])
+
+    rep._retry_pending(now=2000, force=True)
+
+    assert len(up.batches) == 1
+    assert up.batches[0][0]["estimated_credits"] == 0.0
+    assert pend.load_all() == []
+
+
 def test_pending_retry_idempotent_dedup(tmp_path):
     rep, up, pend = _reporter(tmp_path, ok=True)
     # Two spooled copies of the SAME bucket key (e.g. report-but-lost-response).
@@ -953,3 +1007,27 @@ def test_reporter_tick_checkpoints_before_close(tmp_path):
     assert row["estimated_credits"] == 12.0
     assert row["credit_estimate_segments"] == 1
     assert row["total_tokens_sum"] == 100
+
+
+def test_child_refresh_updates_runtime_secret_without_config_write(tmp_path, monkeypatch):
+    """A gateway-child 401 refresh must stay in memory, never save config.toml."""
+    from kiro_gateway_tray import appconfig
+
+    monkeypatch.setattr(telemetry, "_RUNTIME_SECRET", None)
+    config = TelemetryConfig(
+        endpoint_url="https://worker/telemetry", secret="old", username="user",
+        app_version="v", provision_url="https://provision", shared_secret="activation",
+    )
+    monkeypatch.setattr(
+        "kiro_gateway_tray.provision.refresh_telemetry_secret",
+        lambda *_args: "rotated",
+    )
+    monkeypatch.setattr(
+        appconfig, "save",
+        lambda _cfg: (_ for _ in ()).throw(AssertionError("child wrote config")),
+    )
+    reporter = telemetry.build_reporter(config, tmp_path)
+
+    assert reporter._try_refresh_secret() is True
+    assert reporter.uploader.secret == "rotated"
+    assert telemetry.runtime_secret().get() == "rotated"

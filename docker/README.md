@@ -87,6 +87,7 @@ docker compose ps                    # 查看健康状态
 | `CLOUDFLARED_TOKEN` | 是 | — | Cloudflare Tunnel token |
 | `KIRO_GATEWAY_PORT` | 否 | `18000` | 宿主机暴露端口 |
 | `KIRO_API_REGION` | 否 | `us-east-1` | Kiro / CodeWhisperer 区域 |
+| `MODEL_DISCOVERY_CACHE_TTL_SECONDS` | 否 | `14400` | 模型列表按需发现节流窗口（每账号 4 小时） |
 | `TUNNEL_TRANSPORT_PROTOCOL` | 否 | `http2` | Cloudflare 隧道传输协议 |
 | `FAKE_REASONING` | 否 | `false` | 是否注入伪造思考标签 |
 | `AUTO_TRIM_PAYLOAD` | 否 | `true` | 超限时自动裁剪请求体 |
@@ -95,6 +96,8 @@ docker compose ps                    # 查看健康状态
 | `WEB_SEARCH_ENABLED` | 否 | `false` | 是否自动注入 web_search 工具 |
 | `FIRST_TOKEN_TIMEOUT` | 否 | `30` | 等待首个 token 的超时秒数 |
 | `STREAMING_READ_TIMEOUT` | 否 | `300` | 流式分块间的读超时秒数 |
+
+模型发现只由 `GET /v1/models` 或 `GET /v1/responses/models` 触发；生成请求继续走 runtime endpoint。首次发现失败会缓存 fallback，动态刷新失败会保留 stale，两种失败都在随后 4 小时内不再请求上游。
 
 ## 升级镜像
 
@@ -121,5 +124,5 @@ docker compose logs --tail=200 cloudflared
 - `.env` 永远不要提交到 git，模板见 `.env.example`
 - `PROXY_API_KEY` 建议用 `openssl rand -hex 32` 生成强随机串
 - `/usage` 和聊天接口共用 `PROXY_API_KEY`，也会经隧道暴露到公网
-- 启用本方案后，Cursor 里的官方 OpenAI 模型（GPT 系列）将无法使用，详见
-  [根目录 README 的「重要限制」](../README.md)
+- GPT 系列使用真实模型名并由网关 fallback 暴露，无需配置 alias 或手动增加 model name；
+  Claude 模型仍使用根目录 README 列出的 `kiro-*` 别名。

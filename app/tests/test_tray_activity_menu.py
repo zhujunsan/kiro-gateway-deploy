@@ -854,3 +854,33 @@ def test_live_active_row_titles_crossplatform_keeps_finished_slots(monkeypatch):
     assert len(titles) == 1
     assert titles[0].startswith("已完成 ·")
 
+
+
+
+def test_activity_fingerprints_include_completion_known():
+    """Unknown-to-real-zero transitions must invalidate both menu fingerprints."""
+    app = _make_app()
+    unknown = ActivitySnapshot(
+        active=[ActiveRequest(
+            id="a", started_at=1, model="m", path="/v1/messages", phase="streaming",
+            question_preview="q", completion_tokens=0, completion_known=False,
+        )],
+        recent=[RecentRequest(
+            id="r", started_at=1, finished_at=2, model="m", path="/v1/messages",
+            ok=True, duration_ms=1, question_preview="q", answer_preview="",
+            completion_tokens=0, completion_known=None,
+        )],
+    )
+    known = ActivitySnapshot(
+        active=[ActiveRequest(
+            id="a", started_at=1, model="m", path="/v1/messages", phase="streaming",
+            question_preview="q", completion_tokens=0, completion_known=True,
+        )],
+        recent=[RecentRequest(
+            id="r", started_at=1, finished_at=2, model="m", path="/v1/messages",
+            ok=True, duration_ms=1, question_preview="q", answer_preview="",
+            completion_tokens=0, completion_known=True,
+        )],
+    )
+    assert app._activity_fingerprint_of(unknown) != app._activity_fingerprint_of(known)
+    assert app._recent_fingerprint_of(unknown) != app._recent_fingerprint_of(known)

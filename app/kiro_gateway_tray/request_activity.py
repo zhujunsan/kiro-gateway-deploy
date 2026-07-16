@@ -70,6 +70,9 @@ _REQ_BODY_CAP = 4_000_000
 _STALE_ACTIVE_SECONDS = 600  # drop orphaned in-flight rows after 10 minutes
 _ACTIVITY_FILENAME = "request_activity.json"
 _TOKEN_PERSIST_INTERVAL = 0.45  # throttle disk writes while tokens climb
+# Bound an incomplete SSE line. Normal gateway events are far smaller; an
+# oversized unterminated line is degraded instead of growing memory forever.
+_SSE_TAIL_CAP = 1_000_000
 
 _PHASE_WAITING = "waiting"
 _PHASE_STREAMING = "streaming"
@@ -94,6 +97,8 @@ class ActiveRequest:
     question_preview: str
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    # False=the stream has not yielded countable output; None=legacy snapshot.
+    completion_known: bool | None = None
 
 
 @dataclass
@@ -110,6 +115,8 @@ class RecentRequest:
     error_preview: str = ""
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    # False=the response ended without countable output; None=legacy snapshot.
+    completion_known: bool | None = None
 
 
 @dataclass
@@ -458,6 +465,15 @@ def extract_answer_text_from_json(buf: bytes) -> str:
     return _answer_text_from_obj(data)
 
 
+def _generated_output_text_from_obj_bytes(buf: bytes) -> str:
+    """Parse a JSON body and return countable text/tool output."""
+    try:
+        data = json.loads(buf)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return ""
+    return _generated_output_text_from_obj(data) if isinstance(data, dict) else ""
+
+
 def extract_answer_preview_from_json(buf: bytes, limit: int = PREVIEW_CHARS) -> str:
     return truncate_preview(extract_answer_text_from_json(buf), limit)
 
@@ -603,14 +619,38 @@ def feed_sse_text(acc: list[str], chunk: bytes, cap: int = ANSWER_ACCUM_CAP) -> 
     feed_sse_chunk(acc, chunk, cap=cap)
 
 
+def _is_final_sse_usage_event(obj: dict[str, Any]) -> bool:
+    """Return whether an SSE object carries terminal completion usage.
+
+    Anthropic's ``message_start`` deliberately sends ``output_tokens: 0`` as
+    an initial placeholder. That value must not disable the live estimate.
+    """
+    event_type = obj.get("type")
+    if event_type in {"message_delta", "response.completed", "response.failed"}:
+        return True
+    choices = obj.get("choices")
+    return bool(
+        isinstance(choices, list)
+        and choices
+        and isinstance(choices[0], dict)
+        and choices[0].get("finish_reason") is not None
+    )
+
+
 def feed_sse_chunk(
     acc: list[str],
     chunk: bytes,
     cap: int = ANSWER_ACCUM_CAP,
+    *,
+    output_acc: list[str] | None = None,
+    tool_state: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[int | None, int | None]:
-    """Append text deltas and return the latest ``(prompt, completion)`` usage.
+    """Append visible and reasoning deltas and return latest usable token usage.
 
-    Either side may be ``None`` when that field was not present in this chunk.
+    The initial Anthropic ``output_tokens: 0`` is an API placeholder, rather
+    than final usage. It is ignored until a terminal event so live ``⬇`` keeps
+    increasing while the model is generating. Tool names and argument deltas
+    are accumulated separately in ``output_acc`` and never enter previews.
     """
     prompt: int | None = None
     completion: int | None = None
@@ -619,6 +659,8 @@ def feed_sse_chunk(
     except Exception:
         return None, None
     capped = sum(len(p) for p in acc) >= cap
+    output_capped = output_acc is not None and sum(len(p) for p in output_acc) >= cap
+    tool_state = {} if tool_state is None else tool_state
     for raw in text.splitlines():
         line = raw.strip()
         if not line.startswith("data:"):
@@ -632,61 +674,224 @@ def feed_sse_chunk(
             continue
         if not isinstance(obj, dict):
             continue
+        is_final_usage = _is_final_sse_usage_event(obj)
         for u in _iter_usage_objects(obj):
             p, c = parse_usage_tokens(u)
             if p is not None:
                 prompt = p
-            if c is not None:
+            if c is not None and (c > 0 or is_final_usage):
                 completion = c
-        if capped:
-            continue
         piece = _sse_delta_text(obj)
-        if not piece:
-            continue
-        acc.append(piece)
-        if sum(len(p) for p in acc) >= cap:
-            capped = True
+        if piece and not capped:
+            acc.append(piece)
+            if output_acc is not None and not output_capped:
+                output_acc.append(piece)
+                output_capped = sum(len(p) for p in output_acc) >= cap
+            if sum(len(p) for p in acc) >= cap:
+                capped = True
+        if output_acc is not None and not output_capped:
+            _append_sse_tool_output(obj, output_acc, tool_state)
+            output_capped = sum(len(p) for p in output_acc) >= cap
     return prompt, completion
 
 
+def feed_sse_buffered_chunk(
+    acc: list[str],
+    chunk: bytes,
+    tail: bytes,
+    cap: int = ANSWER_ACCUM_CAP,
+    *,
+    output_acc: list[str] | None = None,
+    tool_state: dict[str, dict[str, Any]] | None = None,
+) -> tuple[int | None, int | None, bytes]:
+    """Parse complete SSE lines and retain an incomplete line for the next body.
+
+    ASGI may split one ``data: {json}`` event between arbitrary response-body
+    messages. Parsing such a fragment immediately discards it because it is
+    not valid JSON, which previously lost both reasoning deltas and final usage.
+    """
+    combined = tail + chunk
+    boundary = combined.rfind(b"\n")
+    if boundary < 0:
+        return None, None, combined[-_SSE_TAIL_CAP:]
+    prompt, completion = feed_sse_chunk(
+        acc,
+        combined[: boundary + 1],
+        cap,
+        output_acc=output_acc,
+        tool_state=tool_state,
+    )
+    return prompt, completion, combined[boundary + 1 :]
+
+
+def _append_json_value(parts: list[str], value: Any) -> None:
+    """Append a generated string or canonical JSON value to token input."""
+    if isinstance(value, str):
+        if value:
+            parts.append(value)
+    elif isinstance(value, (dict, list)) and value:
+        try:
+            parts.append(json.dumps(value, ensure_ascii=False))
+        except (TypeError, ValueError):
+            return
+
+
+def _append_sse_tool_output(
+    obj: dict[str, Any],
+    parts: list[str],
+    tool_state: dict[str, dict[str, Any]],
+) -> None:
+    """Accumulate generated tool names/arguments from supported SSE protocols."""
+    choices = obj.get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        delta = choices[0].get("delta")
+        calls = delta.get("tool_calls") if isinstance(delta, dict) else None
+        if isinstance(calls, list):
+            for call in calls:
+                if not isinstance(call, dict):
+                    continue
+                function = call.get("function")
+                if isinstance(function, dict):
+                    _append_json_value(parts, function.get("name"))
+                    _append_json_value(parts, function.get("arguments"))
+
+    event_type = obj.get("type")
+    if event_type == "content_block_start":
+        block = obj.get("content_block")
+        if isinstance(block, dict) and block.get("type") in {"tool_use", "server_tool_use"}:
+            _append_json_value(parts, block.get("name"))
+            _append_json_value(parts, block.get("input"))
+    elif event_type == "content_block_delta":
+        delta = obj.get("delta")
+        if isinstance(delta, dict) and delta.get("type") == "input_json_delta":
+            _append_json_value(parts, delta.get("partial_json"))
+
+    item = obj.get("item")
+    if event_type in {"response.output_item.added", "response.output_item.done"} and isinstance(item, dict):
+        if item.get("type") == "function_call":
+            item_id = str(item.get("id") or item.get("call_id") or "")
+            state = tool_state.setdefault(item_id, {"name": False, "arguments": ""})
+            name = item.get("name")
+            if isinstance(name, str) and name and not state["name"]:
+                parts.append(name)
+                state["name"] = True
+            arguments = item.get("arguments")
+            if isinstance(arguments, str) and arguments:
+                parts.append(arguments)
+                state["arguments"] += arguments
+    elif event_type == "response.function_call_arguments.delta":
+        item_id = str(obj.get("item_id") or "")
+        state = tool_state.setdefault(item_id, {"name": False, "arguments": ""})
+        delta = obj.get("delta")
+        if isinstance(delta, str) and delta:
+            parts.append(delta)
+            state["arguments"] += delta
+    elif event_type == "response.function_call_arguments.done":
+        item_id = str(obj.get("item_id") or "")
+        state = tool_state.setdefault(item_id, {"name": False, "arguments": ""})
+        name = obj.get("name")
+        if isinstance(name, str) and name and not state["name"]:
+            parts.append(name)
+            state["name"] = True
+        arguments = obj.get("arguments")
+        if isinstance(arguments, str) and arguments and not state["arguments"]:
+            parts.append(arguments)
+            state["arguments"] = arguments
+
+
+def _generated_output_text_from_obj(data: dict[str, Any]) -> str:
+    """Return countable generated text and tool data from a JSON response."""
+    parts: list[str] = []
+    answer = _answer_text_from_obj(data)
+    if answer:
+        parts.append(answer)
+
+    choices = data.get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        message = choices[0].get("message")
+        calls = message.get("tool_calls") if isinstance(message, dict) else None
+        if isinstance(calls, list):
+            for call in calls:
+                if not isinstance(call, dict):
+                    continue
+                function = call.get("function")
+                if isinstance(function, dict):
+                    _append_json_value(parts, function.get("name"))
+                    _append_json_value(parts, function.get("arguments"))
+
+    content = data.get("content")
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                _append_json_value(parts, block.get("name"))
+                _append_json_value(parts, block.get("input"))
+
+    output = data.get("output")
+    if isinstance(output, list):
+        for item in output:
+            if isinstance(item, dict) and item.get("type") == "function_call":
+                _append_json_value(parts, item.get("name"))
+                _append_json_value(parts, item.get("arguments"))
+    return "".join(parts)
+
+
 def _sse_delta_text(obj: dict[str, Any]) -> str:
-    # OpenAI: choices[0].delta.content
+    """Extract answer or visible reasoning text from one parsed SSE event."""
+    # OpenAI Chat: choices[0].delta.content / reasoning_content.
     choices = obj.get("choices")
     if isinstance(choices, list) and choices:
         first = choices[0]
         if isinstance(first, dict):
             delta = first.get("delta")
             if isinstance(delta, dict):
-                c = delta.get("content")
-                if isinstance(c, str):
-                    return c
-            # some non-stream finals put message on the chunk
+                for key in ("content", "reasoning_content", "reasoning"):
+                    value = delta.get(key)
+                    if isinstance(value, str):
+                        return value
+                    if key == "content":
+                        flattened = _flatten_content(value)
+                        if flattened:
+                            return flattened
+            # Some non-stream finals put message on the chunk.
             msg = first.get("message")
             if isinstance(msg, dict):
                 return _flatten_content(msg.get("content"))
-    # Anthropic streaming
-    otype = obj.get("type")
-    if otype == "content_block_delta":
+
+    event_type = obj.get("type")
+    # Anthropic text and thinking deltas.
+    if event_type == "content_block_delta":
         delta = obj.get("delta")
         if isinstance(delta, dict):
-            t = delta.get("text")
-            if isinstance(t, str):
-                return t
-    if otype == "content_block_start":
+            for key in ("text", "thinking"):
+                value = delta.get(key)
+                if isinstance(value, str):
+                    return value
+    if event_type == "content_block_start":
         block = obj.get("content_block")
-        if isinstance(block, dict) and block.get("type") == "text":
-            t = block.get("text")
-            if isinstance(t, str):
-                return t
-    # OpenAI Responses API streaming: top-level string delta
-    # e.g. {"type":"response.output_text.delta","delta":"你好"}
+        if isinstance(block, dict):
+            for key in ("text", "thinking"):
+                value = block.get(key)
+                if isinstance(value, str):
+                    return value
+
+    # OpenAI Responses API streaming, including reasoning deltas, uses top-level
+    # string ``delta`` (for example ``response.output_text.delta``).
     delta = obj.get("delta")
-    if isinstance(delta, str):
+    if isinstance(delta, str) and event_type in {
+        "response.output_text.delta",
+        "response.reasoning_summary_text.delta",
+        "response.reasoning_text.delta",
+    }:
         return delta
     if isinstance(delta, dict):
-        t = delta.get("text") or delta.get("content")
-        if isinstance(t, str):
-            return t
+        for key in ("text", "content", "thinking", "reasoning"):
+            value = delta.get(key)
+            if isinstance(value, str):
+                return value
+            if key == "content":
+                flattened = _flatten_content(value)
+                if flattened:
+                    return flattened
     return ""
 
 
@@ -709,11 +914,19 @@ def short_model(model: str, limit: int = 18) -> str:
     return model[: max(0, limit - 1)] + "…"
 
 
-def _format_tokens_line(*, prompt_tokens: int, completion_tokens: int) -> str:
-    return (
-        f"⬆ {format_token_n(prompt_tokens)} · "
-        f"⬇ {format_token_n(completion_tokens)}"
+def _format_tokens_line(
+    *,
+    prompt_tokens: int,
+    completion_tokens: int,
+    completion_known: bool | None,
+) -> str:
+    """Format input and output tokens without confusing unknown with zero."""
+    completion = (
+        format_token_n(completion_tokens)
+        if completion_known is True or (completion_known is None and completion_tokens > 0)
+        else "—"
     )
+    return f"⬆ {format_token_n(prompt_tokens)} · ⬇ {completion}"
 
 
 def format_active_line(entry: ActiveRequest, *, now: float | None = None) -> str:
@@ -731,6 +944,7 @@ def format_active_line(entry: ActiveRequest, *, now: float | None = None) -> str
     tokens = _format_tokens_line(
         prompt_tokens=entry.prompt_tokens,
         completion_tokens=entry.completion_tokens,
+        completion_known=entry.completion_known,
     )
     return f"{phase} · {elapsed} · {model}\n{tokens}\n问: {q}"
 
@@ -748,6 +962,7 @@ def format_finished_active_line(entry: RecentRequest) -> str:
     tokens = _format_tokens_line(
         prompt_tokens=entry.prompt_tokens,
         completion_tokens=entry.completion_tokens,
+        completion_known=entry.completion_known,
     )
     return f"{status} · {dur} · {model}\n{tokens}\n问: {q}"
 
@@ -769,6 +984,7 @@ def format_recent_line(entry: RecentRequest) -> str:
     tokens = _format_tokens_line(
         prompt_tokens=entry.prompt_tokens,
         completion_tokens=entry.completion_tokens,
+        completion_known=entry.completion_known,
     )
     if entry.ok:
         a = entry.answer_preview or "…"
@@ -797,6 +1013,8 @@ class RequestActivityStore:
         self._recent: list[RecentRequest] = []
         self._dirty = False
         self._last_persist_mono = 0.0
+        self._flush_timer: threading.Timer | None = None
+        self._flush_generation = 0
         self._load_recent()
 
     def _load_recent(self) -> None:
@@ -825,6 +1043,11 @@ class RequestActivityStore:
                         error_preview=str(item.get("error_preview") or ""),
                         prompt_tokens=max(0, int(item.get("prompt_tokens") or 0)),
                         completion_tokens=max(0, int(item.get("completion_tokens") or 0)),
+                        completion_known=(
+                            item.get("completion_known")
+                            if isinstance(item.get("completion_known"), bool)
+                            else None
+                        ),
                     ))
                 except Exception:
                     continue
@@ -834,6 +1057,7 @@ class RequestActivityStore:
 
     def clear_active(self) -> None:
         with self._lock:
+            self._cancel_flush_unlocked()
             self._active.clear()
             self._dirty = False
             self._persist_unlocked()
@@ -857,8 +1081,10 @@ class RequestActivityStore:
             question_preview=truncate_preview(question_preview),
             prompt_tokens=max(0, int(prompt_tokens)),
             completion_tokens=0,
+            completion_known=False,
         )
         with self._lock:
+            self._cancel_flush_unlocked()
             self._active[rid] = entry
             self._dirty = False
             self._persist_unlocked()
@@ -870,6 +1096,7 @@ class RequestActivityStore:
             if entry is None or entry.phase == phase:
                 return
             entry.phase = phase
+            self._cancel_flush_unlocked()
             self._dirty = False
             self._persist_unlocked()
 
@@ -879,6 +1106,7 @@ class RequestActivityStore:
         *,
         prompt_tokens: int | None = None,
         completion_tokens: int | None = None,
+        completion_known: bool | None = None,
         force: bool = False,
     ) -> None:
         """Update live ⬆/⬇ token counters; disk writes are throttled."""
@@ -897,6 +1125,9 @@ class RequestActivityStore:
                 if c != entry.completion_tokens:
                     entry.completion_tokens = c
                     changed = True
+            if completion_known is not None and completion_known != entry.completion_known:
+                entry.completion_known = completion_known
+                changed = True
             if changed:
                 self._dirty = True
             self._flush_if_due_unlocked(force=force)
@@ -911,6 +1142,7 @@ class RequestActivityStore:
         finished_at: float | None = None,
     ) -> None:
         with self._lock:
+            self._cancel_flush_unlocked()
             entry = self._active.pop(rid, None)
             if entry is None:
                 self._dirty = False
@@ -930,6 +1162,7 @@ class RequestActivityStore:
                 error_preview=truncate_preview(error_preview),
                 prompt_tokens=entry.prompt_tokens,
                 completion_tokens=entry.completion_tokens,
+                completion_known=entry.completion_known,
             )
             self._recent.insert(0, recent)
             del self._recent[self.recent_limit:]
@@ -950,13 +1183,42 @@ class RequestActivityStore:
         if not self._dirty and not force:
             return
         now = time.monotonic()
-        if not force and (now - self._last_persist_mono) < _TOKEN_PERSIST_INTERVAL:
+        remaining = _TOKEN_PERSIST_INTERVAL - (now - self._last_persist_mono)
+        if not force and remaining > 0:
+            self._schedule_flush_unlocked(remaining)
             return
-        self._persist_unlocked()
-        self._dirty = False
-        self._last_persist_mono = now
+        self._cancel_flush_unlocked()
+        if self._persist_unlocked():
+            self._dirty = False
 
-    def _persist_unlocked(self) -> None:
+    def _schedule_flush_unlocked(self, delay: float) -> None:
+        """Coalesce throttled updates into one cancellable delayed write."""
+        if self._flush_timer is not None:
+            return
+        generation = self._flush_generation
+
+        def flush() -> None:
+            with self._lock:
+                if generation != self._flush_generation:
+                    return
+                self._flush_timer = None
+                if self._dirty and self._persist_unlocked():
+                    self._dirty = False
+
+        timer = threading.Timer(max(0.0, delay), flush)
+        timer.daemon = True
+        self._flush_timer = timer
+        timer.start()
+
+    def _cancel_flush_unlocked(self) -> None:
+        """Invalidate any delayed writer before an immediate state transition."""
+        self._flush_generation += 1
+        timer = self._flush_timer
+        self._flush_timer = None
+        if timer is not None:
+            timer.cancel()
+
+    def _persist_unlocked(self) -> bool:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             snap = ActivitySnapshot(
@@ -968,8 +1230,10 @@ class RequestActivityStore:
             tmp.write_text(payload + "\n", encoding="utf-8")
             tmp.replace(self.path)
             self._last_persist_mono = time.monotonic()
+            return True
         except Exception:
             logger.debug("request_activity: persist failed", exc_info=True)
+            return False
 
 
 def load_snapshot(path: Path | None = None, *, now: float | None = None) -> ActivitySnapshot:
@@ -1003,6 +1267,11 @@ def load_snapshot(path: Path | None = None, *, now: float | None = None) -> Acti
                 question_preview=str(item.get("question_preview") or ""),
                 prompt_tokens=max(0, int(item.get("prompt_tokens") or 0)),
                 completion_tokens=max(0, int(item.get("completion_tokens") or 0)),
+                completion_known=(
+                    item.get("completion_known")
+                    if isinstance(item.get("completion_known"), bool)
+                    else None
+                ),
             ))
         except Exception:
             continue
@@ -1026,6 +1295,11 @@ def load_snapshot(path: Path | None = None, *, now: float | None = None) -> Acti
                 error_preview=str(item.get("error_preview") or ""),
                 prompt_tokens=max(0, int(item.get("prompt_tokens") or 0)),
                 completion_tokens=max(0, int(item.get("completion_tokens") or 0)),
+                completion_known=(
+                    item.get("completion_known")
+                    if isinstance(item.get("completion_known"), bool)
+                    else None
+                ),
             ))
         except Exception:
             continue
@@ -1042,6 +1316,9 @@ class _LiveState:
     is_json: bool = False
     completed: bool = False
     answer_parts: list[str] = field(default_factory=list)
+    output_parts: list[str] = field(default_factory=list)
+    tool_output_state: dict[str, dict[str, Any]] = field(default_factory=dict)
+    sse_tail: bytes = b""
     json_buf: bytearray = field(default_factory=bytearray)
     phase_set: bool = False
     response_bytes: int = 0
@@ -1049,6 +1326,7 @@ class _LiveState:
     completion_tokens: int = 0
     usage_prompt: bool = False
     usage_completion: bool = False
+    completion_known: bool = False
 
 
 class RequestActivityMiddleware:
@@ -1144,6 +1422,7 @@ class RequestActivityMiddleware:
             state.rid,
             prompt_tokens=state.prompt_tokens,
             completion_tokens=state.completion_tokens,
+            completion_known=state.completion_known,
             force=force,
         )
 
@@ -1172,36 +1451,59 @@ class RequestActivityMiddleware:
             if chunk:
                 state.response_bytes += len(chunk)
             if state.is_sse and chunk:
-                prompt_u, completion_u = feed_sse_chunk(state.answer_parts, chunk)
+                prior_parts = len(state.answer_parts)
+                prompt_u, completion_u, state.sse_tail = feed_sse_buffered_chunk(
+                    state.answer_parts,
+                    chunk,
+                    state.sse_tail,
+                    output_acc=state.output_parts,
+                    tool_state=state.tool_output_state,
+                )
                 if prompt_u is not None:
                     state.prompt_tokens = prompt_u
                     state.usage_prompt = True
                 if completion_u is not None:
                     state.completion_tokens = completion_u
                     state.usage_completion = True
-                if not state.usage_completion:
-                    # Climb with streamed text so the menu shows live ⬇ progress
-                    # before the provider emits a final usage event.
-                    est = estimate_tokens_from_text("".join(state.answer_parts))
-                    if est == 0 and state.response_bytes:
-                        est = estimate_tokens_from_bytes(state.response_bytes)
-                    state.completion_tokens = est
+                    state.completion_known = True
+                elif (
+                    (len(state.answer_parts) > prior_parts or state.output_parts)
+                    and not state.usage_completion
+                ):
+                    # Climb with visible/reasoning text while the provider is still
+                    # streaming. Header-only and metadata-only SSE frames remain
+                    # unknown instead of being misreported as zero output tokens.
+                    state.completion_tokens = estimate_tokens_from_text(
+                        "".join(state.output_parts)
+                    )
+                    state.completion_known = True
                 self._sync_tokens(state)
             elif state.is_json and chunk:
                 if len(state.json_buf) < ANSWER_ACCUM_CAP * 8:
                     state.json_buf.extend(chunk)
                 if not state.usage_completion:
-                    answer_text = extract_answer_text_from_json(bytes(state.json_buf))
-                    if answer_text:
-                        state.completion_tokens = estimate_tokens_from_text(answer_text)
-                    else:
-                        # Incomplete JSON mid-transfer: last-resort byte estimate.
-                        state.completion_tokens = estimate_tokens_from_bytes(
-                            state.response_bytes
-                        )
+                    output_text = _generated_output_text_from_obj_bytes(bytes(state.json_buf))
+                    if output_text:
+                        state.completion_tokens = estimate_tokens_from_text(output_text)
+                        state.completion_known = True
                     self._sync_tokens(state)
             if not message.get("more_body", False):
                 state.completed = True
+                if state.is_sse and state.sse_tail:
+                    prompt_u, completion_u = feed_sse_chunk(
+                        state.answer_parts,
+                        state.sse_tail,
+                        output_acc=state.output_parts,
+                        tool_state=state.tool_output_state,
+                    )
+                    state.sse_tail = b""
+                    if prompt_u is not None:
+                        state.prompt_tokens = prompt_u
+                        state.usage_prompt = True
+                    if completion_u is not None:
+                        state.completion_tokens = completion_u
+                        state.usage_completion = True
+                        state.completion_known = True
                 if state.is_json and state.json_buf:
                     try:
                         data = json.loads(bytes(state.json_buf))
@@ -1216,12 +1518,16 @@ class RequestActivityMiddleware:
                             if c is not None:
                                 state.completion_tokens = c
                                 state.usage_completion = True
+                                state.completion_known = True
                     if not state.usage_completion:
-                        answer_text = extract_answer_text_from_json(bytes(state.json_buf))
-                        if answer_text:
+                        output_text = _generated_output_text_from_obj_bytes(
+                            bytes(state.json_buf)
+                        )
+                        if output_text:
                             state.completion_tokens = estimate_tokens_from_text(
-                                answer_text
+                                output_text
                             )
+                            state.completion_known = True
                 self._sync_tokens(state, force=True)
 
     def _finalise(self, state: _LiveState, *, ok: bool) -> None:

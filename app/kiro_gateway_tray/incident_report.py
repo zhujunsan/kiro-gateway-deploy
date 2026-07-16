@@ -378,12 +378,14 @@ class IncidentReporter:
         pending: PendingErrorStore,
         refresher: Any = None,
         on_secret_refresh: Any = None,
+        runtime_secret_store: Any = None,
     ) -> None:
         self.config = config
         self.uploader = uploader
         self.pending = pending
         self.refresher = refresher
         self.on_secret_refresh = on_secret_refresh
+        self.runtime_secret_store = runtime_secret_store
         self._queue: list[dict[str, Any]] = []
         self._lock = threading.Lock()
         self._wake = threading.Event()
@@ -471,6 +473,8 @@ class IncidentReporter:
             time.sleep(min_gap - gap)
 
     def _upload_one(self, record: dict[str, Any], *, now: float) -> None:
+        if self.runtime_secret_store is not None:
+            self.uploader.secret = self.runtime_secret_store.get()
         self._rate_limit(now)
         result = self.uploader.upload_record(record)
         self._last_upload = time.time()
@@ -482,6 +486,8 @@ class IncidentReporter:
             if new_secret:
                 self.uploader.secret = new_secret
                 self.config.secret = new_secret
+                if self.runtime_secret_store is not None:
+                    self.runtime_secret_store.set(new_secret)
                 if self.on_secret_refresh:
                     try:
                         self.on_secret_refresh(new_secret)
@@ -513,6 +519,8 @@ class IncidentReporter:
         remaining: list[dict[str, Any]] = []
         for row in rows:
             clean = {k: v for k, v in row.items() if not k.startswith("_")}
+            if self.runtime_secret_store is not None:
+                self.uploader.secret = self.runtime_secret_store.get()
             self._rate_limit(now)
             result = self.uploader.upload_record(clean)
             self._last_upload = time.time()
@@ -549,6 +557,7 @@ def build_reporter(config: IncidentConfig, data_dir: Path) -> IncidentReporter:
     uploader = IncidentUploader(config.endpoint_url, config.secret)
     pending = PendingErrorStore(Path(data_dir) / "incidents" / "pending-errors.jsonl")
     refresher = None
+    secret_store = tel.runtime_secret(config.secret)
     on_secret_refresh = None
     if config.can_refresh:
         def _do_refresh() -> str:
@@ -557,11 +566,11 @@ def build_reporter(config: IncidentConfig, data_dir: Path) -> IncidentReporter:
                 config.provision_url, config.shared_secret, config.username
             )
         refresher = tel.SecretRefresher(_do_refresh)
-        on_secret_refresh = tel._persist_refreshed_secret
     return IncidentReporter(
         config, uploader, pending,
         refresher=refresher,
         on_secret_refresh=on_secret_refresh,
+        runtime_secret_store=secret_store,
     )
 
 

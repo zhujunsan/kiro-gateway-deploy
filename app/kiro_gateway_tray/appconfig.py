@@ -2,8 +2,12 @@
 from __future__ import annotations
 
 import os
+import tempfile
+import threading
 import tomllib
 from dataclasses import dataclass, asdict, field
+from pathlib import Path
+from typing import Callable, TypeVar
 
 import tomli_w
 
@@ -74,6 +78,8 @@ def path():
 
 
 _CACHE: AppCfg | None = None
+_CONFIG_LOCK = threading.RLock()
+_T = TypeVar("_T")
 
 
 def load(*, use_cache: bool = False) -> AppCfg:
@@ -82,12 +88,13 @@ def load(*, use_cache: bool = False) -> AppCfg:
     read-hot paths like tray menu rendering, which would otherwise re-read and
     re-parse the TOML on every redraw."""
     global _CACHE
-    if use_cache and _CACHE is not None:
-        return _CACHE
-    cfg = _load_from_disk()
-    if use_cache:
-        _CACHE = cfg
-    return cfg
+    with _CONFIG_LOCK:
+        if use_cache and _CACHE is not None:
+            return _CACHE
+        cfg = _load_from_disk()
+        if use_cache:
+            _CACHE = cfg
+        return cfg
 
 
 def _load_from_disk() -> AppCfg:
@@ -121,22 +128,77 @@ def _load_from_disk() -> AppCfg:
 
 
 def save(cfg: AppCfg) -> None:
+    """Atomically persist ``cfg`` and refresh the process-local cache.
+
+    The temporary file lives beside config.toml so ``os.replace`` remains an
+    atomic rename on the same filesystem. A failed write never truncates or
+    replaces the last known-good configuration.
+    """
+    with _CONFIG_LOCK:
+        _save_unlocked(cfg)
+
+
+def update(mutator: Callable[[AppCfg], _T]) -> AppCfg:
+    """Load the latest config, apply one focused change, and atomically save it.
+
+    Background work must use this instead of mutating a previously loaded
+    object: it prevents a stale snapshot from overwriting unrelated parent
+    process changes.
+    """
+    with _CONFIG_LOCK:
+        cfg = _load_from_disk()
+        mutator(cfg)
+        _save_unlocked(cfg)
+        return cfg
+
+
+def _save_unlocked(cfg: AppCfg) -> None:
+    """Write config while ``_CONFIG_LOCK`` is held."""
     global _CACHE
     paths.ensure_dirs()
-    p = path()
-    p.write_text(tomli_w.dumps(asdict(cfg)), encoding="utf-8")
-    # Config holds secrets (proxy_api_key, run_token); restrict to owner on POSIX.
-    if os.name == "posix":
-        try:
-            p.chmod(0o600)
-        except OSError:
-            pass
-    _CACHE = cfg
+    target = path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload = tomli_w.dumps(asdict(cfg)).encode("utf-8")
+    temp_name: str | None = None
+    committed = False
+    try:
+        fd, temp_name = tempfile.mkstemp(
+            prefix=f".{target.name}.", suffix=".tmp", dir=target.parent
+        )
+        with os.fdopen(fd, "wb") as handle:
+            if os.name == "posix":
+                os.fchmod(handle.fileno(), 0o600)
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, target)
+        temp_name = None
+        # os.replace preserves the temp mode on POSIX. Keep this best-effort
+        # chmod for platforms/filesystems that do not support fchmod.
+        if os.name == "posix":
+            try:
+                target.chmod(0o600)
+            except OSError:
+                pass
+        _CACHE = cfg
+        committed = True
+    finally:
+        if not committed:
+            # Callers often mutate a cached config before save(). If committing
+            # that mutation fails, discard the mutable snapshot so future cached
+            # reads reload the last known-good TOML instead of returning it.
+            _CACHE = None
+        if temp_name is not None:
+            try:
+                os.unlink(temp_name)
+            except FileNotFoundError:
+                pass
 
 
 def invalidate_cache() -> None:
     global _CACHE
-    _CACHE = None
+    with _CONFIG_LOCK:
+        _CACHE = None
 
 
 def gateway_origin(cfg: AppCfg) -> str:

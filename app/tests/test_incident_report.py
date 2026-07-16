@@ -275,3 +275,20 @@ def test_appconfig_injects_incident_url(monkeypatch, tmp_path):
     assert env["INCIDENT_URL"] == "https://prov.example/telemetry/errors"
     assert env["GATEWAY_UPSTREAM_SHA"]
     assert env["TELEMETRY_USERNAME"] == "abc123def456"
+
+
+def test_incident_and_usage_reporters_share_child_runtime_secret(tmp_path, monkeypatch):
+    """A refreshed usage secret is immediately used by incident uploads too."""
+    from kiro_gateway_tray import telemetry
+
+    monkeypatch.setattr(telemetry, "_RUNTIME_SECRET", None)
+    usage = telemetry.build_reporter(
+        telemetry.TelemetryConfig(endpoint_url="https://w/telemetry", secret="old"),
+        tmp_path,
+    )
+    config = ir.IncidentConfig(endpoint_url="https://w/telemetry/errors", secret="old")
+    incident = ir.build_reporter(config, tmp_path)
+    usage.runtime_secret_store.set("rotated")
+
+    assert incident.runtime_secret_store is usage.runtime_secret_store
+    assert incident.runtime_secret_store.get() == "rotated"

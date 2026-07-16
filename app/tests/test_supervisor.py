@@ -389,3 +389,71 @@ def test_run_probe_cycle_auto_restarts_tunnel_when_dead_on_timeout(monkeypatch, 
     assert "start" in restarted
     assert s._tunnel_disconnected_since is None
 
+
+
+def test_health_loop_immediate_restart_replaces_exited_thread(monkeypatch, tmp_path):
+    """stop → start must create a live new loop, never revive the old one."""
+    s = _make_sup(monkeypatch, tmp_path)
+    s.start()
+    first = s._health_thread
+    assert first is not None and first.is_alive()
+
+    s.stop()
+    assert not first.is_alive()
+    assert s._health_thread is None
+
+    s.start()
+    second = s._health_thread
+    assert second is not None and second is not first and second.is_alive()
+    s.close()
+    assert not second.is_alive()
+
+
+def test_stop_health_loop_is_idempotent(monkeypatch, tmp_path):
+    s = _make_sup(monkeypatch, tmp_path)
+    s.start()
+    s.stop()
+    s.stop()
+    assert s._health_thread is None
+    s.close()
+
+
+def test_startup_sync_persists_changed_telemetry_secret(monkeypatch, tmp_path):
+    monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
+    cfg = appconfig.load()
+    cfg.cloudflare.hostname = "kg-test.example.com"
+    cfg.cloudflare.run_token = "token"
+    cfg.cloudflare.registered_port = cfg.gateway.port
+    cfg.cloudflare.provision_url = "https://provision.example"
+    cfg.cloudflare.shared_secret = "activation"
+    cfg.telemetry.secret = "old"
+    appconfig.save(cfg)
+    s = supervisor.Supervisor(gateway=_FakeGateway(), tunnel=_FakeTunnel())
+    monkeypatch.setattr(s, "_wait_healthy", lambda timeout=30: True)
+    import kiro_gateway_tray.provision as provision
+    monkeypatch.setattr(provision, "_get_username", lambda _cfg: "user")
+    monkeypatch.setattr(
+        provision, "refresh_telemetry_secret", lambda *_args: "rotated"
+    )
+
+    s.start()
+    assert appconfig.load().telemetry.secret == "rotated"
+    s.close()
+
+
+def test_startup_sync_failure_does_not_block_gateway(monkeypatch, tmp_path):
+    s = _make_sup(monkeypatch, tmp_path)
+    cfg = appconfig.load()
+    cfg.cloudflare.registered_port = cfg.gateway.port
+    cfg.cloudflare.provision_url = "https://provision.example"
+    cfg.cloudflare.shared_secret = "activation"
+    appconfig.save(cfg)
+    import kiro_gateway_tray.provision as provision
+    monkeypatch.setattr(
+        provision, "refresh_telemetry_secret",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("offline")),
+    )
+
+    assert s.start() is True
+    assert s.gateway.is_alive() is True
+    s.close()

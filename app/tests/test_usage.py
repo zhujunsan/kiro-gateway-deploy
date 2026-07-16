@@ -49,29 +49,27 @@ def test_format_menu_line_empty():
     assert usage.format_menu_line({"breakdowns": []}) == "无数据"
 
 
-def test_split_models_for_menu_pairs_and_shows_auto():
+def test_split_models_for_menu_pairs_aliases_and_keeps_native_models():
     ids = sorted([
-        "auto-kiro",
+        "auto",
         "claude-haiku-4.5",
         "claude-opus-4.6",
         "claude-sonnet-4.6",
         "deepseek-3.2",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
         "kiro-deepseek-3.2",
         "kiro-h-4.5",
         "kiro-o-4.6",
         "kiro-s-4.6",
     ])
     aliases = {
-        "auto-kiro": "auto",
         "kiro-h-4.5": "claude-haiku-4.5",
         "kiro-o-4.6": "claude-opus-4.6",
         "kiro-s-4.6": "claude-sonnet-4.6",
         "kiro-deepseek-3.2": "deepseek-3.2",
     }
     canonical, alias_list = usage.split_models_for_menu(ids, aliases=aliases)
-    assert "auto-kiro" not in canonical
-    assert "auto-kiro" not in alias_list
-    # auto: real name only, no alias row; other models stay 1:1
     assert alias_list == [
         "kiro-h-4.5",
         "kiro-o-4.6",
@@ -84,6 +82,8 @@ def test_split_models_for_menu_pairs_and_shows_auto():
         "claude-opus-4.6",
         "claude-sonnet-4.6",
         "deepseek-3.2",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
     ]
 
 

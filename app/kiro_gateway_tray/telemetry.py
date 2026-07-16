@@ -79,6 +79,37 @@ def bucket_start_for(ts: float, bucket_seconds: int) -> int:
 
 # --- config ------------------------------------------------------------------
 
+class RuntimeSecret:
+    """Thread-safe telemetry secret shared by child-side reporters only."""
+
+    def __init__(self, value: str = "") -> None:
+        self._value = value
+        self._lock = threading.Lock()
+
+    def get(self) -> str:
+        """Return the current in-memory secret."""
+        with self._lock:
+            return self._value
+
+    def set(self, value: str) -> None:
+        """Replace the runtime secret when a 401 refresh succeeds."""
+        with self._lock:
+            self._value = value
+
+
+_RUNTIME_SECRET: RuntimeSecret | None = None
+_RUNTIME_SECRET_LOCK = threading.Lock()
+
+
+def runtime_secret(initial: str = "") -> RuntimeSecret:
+    """Return the one child-process secret holder, seeding it once."""
+    global _RUNTIME_SECRET
+    with _RUNTIME_SECRET_LOCK:
+        if _RUNTIME_SECRET is None:
+            _RUNTIME_SECRET = RuntimeSecret(initial)
+        return _RUNTIME_SECRET
+
+
 @dataclass
 class TelemetryConfig:
     """Resolved telemetry settings for the gateway child process."""
@@ -595,6 +626,37 @@ def _row_key(row: dict[str, Any]) -> tuple:
     return tuple(row.get(d) for d in _DIMENSIONS)
 
 
+def _sanitize_credit_for_upload(row: dict[str, Any]) -> dict[str, Any]:
+    """Return an upload-safe copy with unrelated Credit usage removed.
+
+    ``GET /usage`` reports account-wide consumption, so a positive Credit delta
+    can come from another Kiro client. When this gateway bucket produced no
+    tokens, the delta cannot be attributed to gateway traffic and is reported as
+    measured zero instead.
+
+    Args:
+        row: Aggregated telemetry row ready for upload.
+
+    Returns:
+        A shallow copy whose Credit estimate is zero when the row explicitly
+        reports zero generated tokens; otherwise an unchanged shallow copy.
+    """
+    sanitized = dict(row)
+    raw_tokens = sanitized.get("total_tokens_sum")
+    try:
+        has_zero_tokens = raw_tokens is not None and int(raw_tokens) <= 0
+    except (TypeError, ValueError):
+        has_zero_tokens = False
+    if has_zero_tokens and sanitized.get("estimated_credits") is not None:
+        sanitized["estimated_credits"] = 0.0
+    return sanitized
+
+
+def _sanitize_credit_rows(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Sanitize Credit attribution for every row crossing the upload boundary."""
+    return [_sanitize_credit_for_upload(row) for row in rows]
+
+
 class PendingStore:
     """Append-only JSON-lines spool for buckets that failed to upload.
 
@@ -771,6 +833,7 @@ class Reporter:
         pending: PendingStore,
         refresher: "SecretRefresher | None" = None,
         on_secret_refresh: Any = None,
+        runtime_secret_store: RuntimeSecret | None = None,
         credit_tracker: "CreditTracker | None" = None,
     ) -> None:
         self.config = config
@@ -778,9 +841,10 @@ class Reporter:
         self.uploader = uploader
         self.pending = pending
         self.refresher = refresher
-        # Optional callback(new_secret) to persist a refreshed secret back to
-        # config so it survives the next restart. Failures are swallowed.
+        # Optional child-local callback used to notify sibling reporters. It
+        # must never persist config.toml: the tray parent is the sole writer.
         self.on_secret_refresh = on_secret_refresh
+        self.runtime_secret_store = runtime_secret_store or RuntimeSecret(config.secret)
         self.credit_tracker = credit_tracker
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -863,6 +927,8 @@ class Reporter:
     def _upload_or_spool(self, rows: list[dict[str, Any]]) -> None:
         if not rows:
             return
+        rows = _sanitize_credit_rows(rows)
+        self.uploader.secret = self.runtime_secret_store.get()
         result = self.uploader.upload(rows)
         if result == UPLOAD_OK:
             return
@@ -885,11 +951,13 @@ class Reporter:
         if new_secret == self.uploader.secret:
             return False
         self.uploader.secret = new_secret
+        self.config.secret = new_secret
+        self.runtime_secret_store.set(new_secret)
         if self.on_secret_refresh is not None:
             try:
                 self.on_secret_refresh(new_secret)
             except Exception:
-                logger.debug("telemetry: persist refreshed secret failed", exc_info=True)
+                logger.debug("telemetry: runtime secret callback failed", exc_info=True)
         logger.info("telemetry: refreshed telemetry secret after 401")
         return True
 
@@ -898,9 +966,13 @@ class Reporter:
         if not force and ts < self._next_pending_retry:
             return
         rows = self.pending.load_all()
+        self.uploader.secret = self.runtime_secret_store.get()
         if not rows:
             self._backoff = _BACKOFF_BASE
             return
+        # Sanitize legacy pending rows too, so previously captured account-wide
+        # Credit deltas cannot leak into a later retry upload.
+        rows = _sanitize_credit_rows(rows)
         # Dedupe by aggregation key (idempotent terminal values) and order
         # newest-first for LIFO retry (design 十.3).
         by_key: dict[tuple, dict[str, Any]] = {}
@@ -1250,9 +1322,10 @@ class TelemetryMiddleware:
 def build_reporter(config: TelemetryConfig, data_dir: Path) -> Reporter:
     """Wire an aggregator, uploader and spool into a Reporter.
 
-    When refresh inputs are present (provision_url + activation code), also wire
-    a SecretRefresher that calls /telemetry-secret on 401 and a callback that
-    persists the new secret back to config so it survives the next restart."""
+    When refresh inputs are present (provision_url + activation code), wire a
+    SecretRefresher that calls /telemetry-secret on 401. A successful refresh
+    updates only the child process's shared runtime secret; the parent performs
+    the best-effort persisted synchronization before its next child launch."""
     aggregator = Aggregator(config.username, config.app_version, config.bucket_seconds)
     uploader = Uploader(config.endpoint_url, config.secret)
     pending = PendingStore(
@@ -1260,6 +1333,7 @@ def build_reporter(config: TelemetryConfig, data_dir: Path) -> Reporter:
         max_retention_days=config.max_retention_days,
     )
     refresher: SecretRefresher | None = None
+    secret_store = runtime_secret(config.secret)
     on_secret_refresh = None
     if config.can_refresh:
         def _do_refresh() -> str:
@@ -1268,7 +1342,6 @@ def build_reporter(config: TelemetryConfig, data_dir: Path) -> Reporter:
                 config.provision_url, config.shared_secret, config.username
             )
         refresher = SecretRefresher(_do_refresh)
-        on_secret_refresh = _persist_refreshed_secret
     credit_tracker: CreditTracker | None = None
     if config.can_sample_credits:
         port = config.gateway_port
@@ -1285,24 +1358,8 @@ def build_reporter(config: TelemetryConfig, data_dir: Path) -> Reporter:
     return Reporter(
         config, aggregator, uploader, pending,
         refresher=refresher, on_secret_refresh=on_secret_refresh,
-        credit_tracker=credit_tracker,
+        runtime_secret_store=secret_store, credit_tracker=credit_tracker,
     )
-
-
-def _persist_refreshed_secret(new_secret: str) -> None:
-    """Write a refreshed telemetry secret back to config.toml.
-
-    Runs in the gateway child process. The parent re-reads config on the next
-    start, so persisting here means the rotated key survives restarts instead of
-    re-fetching on every launch. Best-effort: never raises."""
-    try:
-        from . import appconfig
-        cfg = appconfig.load()
-        if cfg.telemetry.secret != new_secret:
-            cfg.telemetry.secret = new_secret
-            appconfig.save(cfg)
-    except Exception:
-        logger.debug("telemetry: failed to persist refreshed secret to config", exc_info=True)
 
 
 def wrap_app(app: Any, *, env: dict[str, str] | None = None, data_dir: Path | None = None) -> Any:

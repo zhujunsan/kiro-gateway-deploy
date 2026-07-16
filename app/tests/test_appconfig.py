@@ -1,3 +1,7 @@
+import os
+import threading
+import tomllib
+
 from kiro_gateway_tray import appconfig
 
 
@@ -193,3 +197,49 @@ def test_telemetry_not_injected_when_both_empty(tmp_path, monkeypatch):
     assert cfg.cloudflare.provision_url == ""
     env = appconfig.to_gateway_env(cfg)
     assert "TELEMETRY_URL" not in env
+
+
+def test_save_failure_preserves_previous_toml_and_cleans_temp(tmp_path, monkeypatch):
+    monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
+    cfg = appconfig.load()
+    cfg.gateway.port = 64006
+    appconfig.save(cfg)
+    original = appconfig.path().read_bytes()
+    cfg.gateway.port = 64007
+
+    monkeypatch.setattr(
+        appconfig.os, "replace",
+        lambda *_args: (_ for _ in ()).throw(OSError("replace failed")),
+    )
+    try:
+        appconfig.save(cfg)
+        assert False, "expected atomic replacement failure"
+    except OSError:
+        pass
+
+    assert appconfig.path().read_bytes() == original
+    assert tomllib.loads(original.decode("utf-8"))["gateway"]["port"] == 64006
+    assert appconfig.load(use_cache=True).gateway.port == 64006
+    assert list(appconfig.path().parent.glob(f".{appconfig.path().name}.*.tmp")) == []
+
+
+def test_update_serializes_latest_config_and_keeps_valid_toml(tmp_path, monkeypatch):
+    monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
+    appconfig.invalidate_cache()
+    appconfig.load()
+
+    def increment_port() -> None:
+        appconfig.update(lambda cfg: setattr(cfg.gateway, "port", cfg.gateway.port + 1))
+
+    workers = [threading.Thread(target=increment_port) for _ in range(16)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join()
+
+    expected = 64005 + len(workers)
+    assert appconfig.load().gateway.port == expected
+    assert appconfig.load(use_cache=True).gateway.port == expected
+    assert tomllib.loads(appconfig.path().read_text(encoding="utf-8"))["gateway"]["port"] == expected
+    if os.name == "posix":
+        assert appconfig.path().stat().st_mode & 0o777 == 0o600
