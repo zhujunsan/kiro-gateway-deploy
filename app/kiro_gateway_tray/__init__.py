@@ -5,7 +5,7 @@ __version__ = "0.4.4"
 # Upstream gateway this app vendors. We use a fork that already has the
 # kiro-* model aliases and the /usage endpoint baked into source, so no
 # build-time patching is needed. Pinned to a commit for reproducible builds.
-UPSTREAM_SHA = "a5e04c8"
+UPSTREAM_SHA = "673ff07"
 UPSTREAM_REPO = "https://github.com/zhujunsan/kiro-gateway.git"
 
 # This app's own repo, used by the update checker (Task 13) to query the

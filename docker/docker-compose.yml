@@ -4,7 +4,7 @@ services:
     # (kiro-* aliases, GET /usage, OpenAI tool_use content blocks, keep-system
     # -prompt trim) baked into the source, so no start-time patching is needed.
     # 升级：在 fork 的 main 上 rebase 上游、推送后 CI 产出新的 main-<sha> tag，改这里即可。
-    image: ghcr.io/zhujunsan/kiro-gateway:main-a5e04c8
+    image: ghcr.io/zhujunsan/kiro-gateway:main-673ff07
     container_name: kiro-gateway
     ports:
       - "${KIRO_GATEWAY_PORT:-18000}:8000"
