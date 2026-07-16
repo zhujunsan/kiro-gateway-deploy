@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.4.8 (2026-07-16)
+
+**Fixed**
+- 修复 v0.4.7 发布测试错误地在 Linux、Windows 上断言 macOS AppKit 主线程调度，恢复三平台构建与安装包发布。
+
 ## v0.4.7 (2026-07-16)
 
 **Changed**

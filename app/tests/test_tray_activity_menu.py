@@ -402,10 +402,11 @@ def test_supervisor_status_change_live_patches_while_menu_open(monkeypatch):
     assert redraws["n"] == 1
 
 
-def test_activity_update_while_menu_open_defers_and_patches(monkeypatch):
-    from kiro_gateway_tray import macos_menu
+def test_activity_update_while_menu_open_defers_and_patches_on_macos(monkeypatch):
+    from kiro_gateway_tray import macos_menu, tray as tray_mod
 
     app = _make_app()
+    monkeypatch.setattr(tray_mod.sys, "platform", "darwin")
     monkeypatch.setattr(app.sup, "status", lambda: {"gateway": "running", "tunnel": "running"})
     app._menu_session_open = True
     redraws = {"n": 0}
@@ -444,6 +445,32 @@ def test_activity_update_while_menu_open_defers_and_patches(monkeypatch):
     assert patches["n"] == 1
     assert app._redraw_deferred is True
     assert len(marshaled) == 1
+
+
+def test_activity_update_while_menu_open_patches_directly_off_macos(monkeypatch):
+    from kiro_gateway_tray import macos_menu, tray as tray_mod
+
+    app = _make_app()
+    app._menu_session_open = True
+    monkeypatch.setattr(tray_mod.sys, "platform", "linux")
+    monkeypatch.setattr(
+        macos_menu,
+        "run_on_main_thread",
+        lambda _fn: pytest.fail("non-macOS update must not use AppKit dispatch"),
+    )
+    patches = []
+    monkeypatch.setattr(
+        app,
+        "_live_patch_open_menu_crossplatform",
+        lambda snap: patches.append(snap),
+    )
+    snap = ActivitySnapshot()
+    monkeypatch.setattr(app._activity_cache, "get", lambda: snap)
+
+    app._on_activity_update()
+
+    assert patches == [snap]
+    assert app._redraw_deferred is True
 
 
 def test_is_status_menu_open_respects_session_flag(monkeypatch):
