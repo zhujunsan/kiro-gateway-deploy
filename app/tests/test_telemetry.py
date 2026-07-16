@@ -331,6 +331,14 @@ def test_extract_model_fallback_unknown():
     assert extract_model(b'') == "unknown"
 
 
+def test_extract_model_from_truncated_json():
+    """Mid-JSON capture truncations must still recover model near the front."""
+    head = b'{"model":"claude-opus-4.8","messages":[{"role":"user","content":"'
+    truncated = head + (b"x" * 1000)  # no closing quote/braces
+    assert extract_model(truncated) == "claude-opus-4.8"
+    assert extract_model(b'{"model":"kiro-o-4.6","messages":') == "kiro-o-4.6"
+
+
 # --- pending spool ----------------------------------------------------------
 
 def test_pending_append_and_load(tmp_path):

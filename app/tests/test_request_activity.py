@@ -663,6 +663,107 @@ def test_extract_question_skips_system_reminder_noise():
     assert "system-reminder" not in preview
 
 
+def test_extract_model_from_truncated_json():
+    """Oversized captures truncate mid-JSON; model must still resolve."""
+    truncated = (
+        b'{"model":"claude-opus-4.8","messages":[{"role":"user","content":"'
+        + ("上下文" * 200).encode()  # incomplete string / object
+    )
+    assert ra.extract_model(truncated) == "claude-opus-4.8"
+    assert ra.extract_model(b"") == "unknown"
+    assert ra.extract_model(b'{"messages":[]}') == "unknown"
+
+
+def test_extract_question_from_truncated_user_query():
+    """Rolling-tail style fragment still surfaces Cursor <user_query> text."""
+    fragment = (
+        b'...injected noise...",{"role":"user","content":"'
+        + "<user_query>请检查网关是否卡住</user_query>".encode()
+    )
+    preview = extract_question_preview(fragment)
+    assert "检查网关" in preview
+
+    # Incomplete closing tag at end of capture.
+    open_only = "prefix <user_query>只看到半截提问".encode()
+    assert "半截提问" in extract_question_preview(open_only)
+
+
+def test_request_body_buffer_keeps_head_model_and_tail_query():
+    """Head+tail budget retains model prefix and trailing user_query."""
+    # Shrink caps so the test stays small/fast.
+    old_head, old_tail = ra._REQ_BODY_HEAD_CAP, ra._REQ_BODY_TAIL_CAP
+    try:
+        ra._REQ_BODY_HEAD_CAP = 200
+        ra._REQ_BODY_TAIL_CAP = 120
+        buf = ra._RequestBodyBuffer()
+        head = b'{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"'
+        middle = b"M" * 800
+        tail = ("<user_query>尾部真实问题</user_query>" + '"}]}').encode()
+        buf.extend(head)
+        buf.extend(middle)
+        buf.extend(tail)
+        assert buf.truncated is True
+        assert buf.total == len(head) + len(middle) + len(tail)
+        preview = buf.preview_bytes()
+        assert ra.extract_model(preview) == "gpt-5.6-sol"
+        assert "尾部真实问题" in extract_question_preview(preview)
+        # Token fallback uses full on-wire size, not just the retained window.
+        est = ra.estimate_prompt_tokens_from_body(
+            preview, total_bytes=buf.total,
+        )
+        assert est == ra.estimate_tokens_from_bytes(buf.total)
+        assert est > ra.estimate_tokens_from_bytes(len(preview))
+    finally:
+        ra._REQ_BODY_HEAD_CAP = old_head
+        ra._REQ_BODY_TAIL_CAP = old_tail
+
+
+def test_middleware_recovers_model_from_oversized_body(tmp_path):
+    """Activity menu must not show unknown when the body exceeds the cap."""
+    path = tmp_path / "request_activity.json"
+    store = RequestActivityStore(path)
+    middleware = RequestActivityMiddleware(None, store)
+
+    old_head, old_tail = ra._REQ_BODY_HEAD_CAP, ra._REQ_BODY_TAIL_CAP
+    try:
+        ra._REQ_BODY_HEAD_CAP = 180
+        ra._REQ_BODY_TAIL_CAP = 100
+        # Build a body larger than head+tail with model at front and query at end.
+        prefix = b'{"model":"claude-opus-4.8","stream":true,"messages":[{"role":"user","content":"'
+        suffix = ("<user_query>超大上下文里的真实提问</user_query>" + '"}]}').encode()
+        filler = b"Z" * 500
+        body = prefix + filler + suffix
+
+        _run(_drive_http(
+            middleware,
+            method="POST",
+            path="/v1/chat/completions",
+            body=body,
+            response_messages=[
+                {
+                    "type": "http.response.start",
+                    "status": 200,
+                    "headers": [(b"content-type", b"text/event-stream")],
+                },
+                {
+                    "type": "http.response.body",
+                    "body": b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n',
+                    "more_body": True,
+                },
+                {"type": "http.response.body", "body": b"", "more_body": False},
+            ],
+        ))
+        active_or_recent = store.snapshot().active or store.snapshot().recent
+        assert active_or_recent
+        entry = active_or_recent[0]
+        assert entry.model == "claude-opus-4.8"
+        assert "真实提问" in entry.question_preview
+        assert entry.prompt_tokens == ra.estimate_tokens_from_bytes(len(body))
+    finally:
+        ra._REQ_BODY_HEAD_CAP = old_head
+        ra._REQ_BODY_TAIL_CAP = old_tail
+
+
 # --- store -------------------------------------------------------------------
 
 def test_store_begin_finish_ring_and_persist(tmp_path):

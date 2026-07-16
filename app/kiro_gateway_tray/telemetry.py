@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -1015,19 +1016,43 @@ class Reporter:
 
 # --- usage / model extraction helpers ----------------------------------------
 
+_MODEL_FIELD_RE = re.compile(rb'"model"\s*:\s*"((?:\\.|[^"\\]){1,256})"')
+
+
+def _decode_json_string_fragment(raw: bytes) -> str:
+    """Decode a JSON string fragment, including common escape sequences."""
+    try:
+        value = json.loads(b'"' + raw + b'"')
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError, TypeError):
+        try:
+            return raw.decode("utf-8", errors="replace")
+        except Exception:
+            return ""
+    return value if isinstance(value, str) else ""
+
+
 def extract_model(body: bytes) -> str:
     """Pull ``model`` from a request body, falling back to ``"unknown"`` so the
-    aggregation key is never null (design 五.4)."""
+    aggregation key is never null (design 五.4).
+
+    When the capture is truncated mid-JSON, ``json.loads`` fails but the
+    ``model`` field is still present near the start — recover it via regex.
+    """
     if not body:
         return "unknown"
     try:
         data = json.loads(body)
-    except Exception:
-        return "unknown"
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError, TypeError):
+        data = None
     if isinstance(data, dict):
         m = data.get("model")
         if isinstance(m, str) and m:
             return m
+    match = _MODEL_FIELD_RE.search(body[:65_536])
+    if match:
+        decoded = _decode_json_string_fragment(match.group(1)).strip()
+        if decoded:
+            return decoded
     return "unknown"
 
 

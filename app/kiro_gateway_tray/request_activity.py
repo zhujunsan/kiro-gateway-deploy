@@ -66,13 +66,23 @@ _NOISE_BLOCK_RE = re.compile(
     r"<(" + "|".join(_NOISE_BLOCK_TAGS) + r")\b[^>]*>.*?</\1>",
     re.DOTALL | re.IGNORECASE,
 )
-_REQ_BODY_CAP = 4_000_000
+# Buffer budget for activity previews (~4 MB total). Keep a large head (model
+# is near the front) and a rolling tail (Cursor ``<user_query>`` is near the end).
+_REQ_BODY_HEAD_CAP = 3_750_000
+_REQ_BODY_TAIL_CAP = 250_000
+_REQ_BODY_CAP = _REQ_BODY_HEAD_CAP + _REQ_BODY_TAIL_CAP  # backward-compat alias
 _STALE_ACTIVE_SECONDS = 600  # drop orphaned in-flight rows after 10 minutes
 _ACTIVITY_FILENAME = "request_activity.json"
 _TOKEN_PERSIST_INTERVAL = 0.45  # throttle disk writes while tokens climb
 # Bound an incomplete SSE line. Normal gateway events are far smaller; an
 # oversized unterminated line is degraded instead of growing memory forever.
 _SSE_TAIL_CAP = 1_000_000
+# Truncated / non-JSON bodies: ``"model": "…"`` is almost always near the start.
+_MODEL_FIELD_RE = re.compile(rb'"model"\s*:\s*"((?:\\.|[^"\\]){1,256})"')
+# Incomplete ``<user_query>`` at the end of a truncated capture (no close tag).
+_USER_QUERY_OPEN_RE = re.compile(
+    r"<user_query>\s*(.*)\Z", re.DOTALL | re.IGNORECASE
+)
 
 _PHASE_WAITING = "waiting"
 _PHASE_STREAMING = "streaming"
@@ -129,6 +139,49 @@ class ActivitySnapshot:
             "active": [asdict(a) for a in self.active],
             "recent": [asdict(r) for r in self.recent],
         }
+
+
+@dataclass
+class _RequestBodyBuffer:
+    """Capture request bytes with a fixed head + rolling tail budget.
+
+    Large Cursor payloads exceed the old single 4 MB cap mid-JSON. Keeping only
+    the prefix made ``json.loads`` fail (model → unknown) and dropped the
+    trailing ``<user_query>``. Head retains ``model``; tail retains the query.
+    """
+
+    head: bytearray = field(default_factory=bytearray)
+    tail: bytearray = field(default_factory=bytearray)
+    total: int = 0
+    truncated: bool = False
+
+    def extend(self, chunk: bytes) -> None:
+        if not chunk:
+            return
+        self.total += len(chunk)
+        if not self.truncated:
+            self.head.extend(chunk)
+            budget = _REQ_BODY_HEAD_CAP + _REQ_BODY_TAIL_CAP
+            if len(self.head) <= budget:
+                return
+            spill = bytes(self.head[_REQ_BODY_HEAD_CAP:])
+            del self.head[_REQ_BODY_HEAD_CAP:]
+            self.truncated = True
+            self._extend_tail(spill)
+            return
+        self._extend_tail(chunk)
+
+    def _extend_tail(self, chunk: bytes) -> None:
+        self.tail.extend(chunk)
+        overflow = len(self.tail) - _REQ_BODY_TAIL_CAP
+        if overflow > 0:
+            del self.tail[:overflow]
+
+    def preview_bytes(self) -> bytes:
+        """Bytes for model / question / token preview extraction."""
+        if not self.truncated:
+            return bytes(self.head)
+        return bytes(self.head) + bytes(self.tail)
 
 
 # --- text helpers ------------------------------------------------------------
@@ -311,16 +364,28 @@ def extract_prompt_text_for_estimate(body: bytes) -> tuple[str, int]:
     return "\n".join(parts), images[0]
 
 
-def estimate_prompt_tokens_from_body(body: bytes) -> int:
+def estimate_prompt_tokens_from_body(
+    body: bytes,
+    *,
+    total_bytes: int | None = None,
+) -> int:
     """tiktoken estimate of request prompt tokens (before upstream usage).
 
     Counts extracted text + a fixed stub per image. Falls back to byte÷4 only
     when no text/images could be recovered from the body.
+
+    Args:
+        body: Captured request bytes (may be head+tail after truncation).
+        total_bytes: Full on-wire size when ``body`` was capped. Spliced
+            head+tail can accidentally form valid JSON that undercounts the
+            dropped middle; in that case prefer the wire-size estimate.
     """
     text, image_count = extract_prompt_text_for_estimate(body)
     n = estimate_tokens_from_text(text) if text else 0
     if image_count:
         n += image_count * _IMAGE_TOKEN_ESTIMATE
+    if total_bytes is not None and total_bytes > len(body):
+        return max(n, estimate_tokens_from_bytes(total_bytes))
     if n > 0:
         return n
     if body:
@@ -328,17 +393,40 @@ def estimate_prompt_tokens_from_body(body: bytes) -> int:
     return 0
 
 
+def _decode_json_string_fragment(raw: bytes) -> str:
+    """Decode a JSON string fragment, including common escape sequences."""
+    try:
+        value = json.loads(b'"' + raw + b'"')
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError, TypeError):
+        try:
+            return raw.decode("utf-8", errors="replace")
+        except Exception:
+            return ""
+    return value if isinstance(value, str) else ""
+
+
 def extract_model(body: bytes) -> str:
+    """Pull ``model`` from a request body, including truncated JSON.
+
+    Full JSON parse is preferred. On failure (or a missing field), scan the
+    leading bytes for ``"model": "…"`` — that field is near the front of
+    OpenAI / Anthropic / Responses payloads, so a head-only capture still works.
+    """
     if not body:
         return "unknown"
     try:
         data = json.loads(body)
-    except Exception:
-        return "unknown"
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError, TypeError):
+        data = None
     if isinstance(data, dict):
         m = data.get("model")
         if isinstance(m, str) and m:
             return m
+    match = _MODEL_FIELD_RE.search(body[:65_536])
+    if match:
+        decoded = _decode_json_string_fragment(match.group(1)).strip()
+        if decoded:
+            return decoded
     return "unknown"
 
 
@@ -383,16 +471,44 @@ def _question_from_responses_input(inp: Any) -> str:
     return ""
 
 
+def _question_from_partial_body(body: bytes, limit: int = PREVIEW_CHARS) -> str:
+    """Best-effort question preview from truncated / non-JSON request bytes.
+
+    Cursor / Claude Code embed the real prompt in ``<user_query>`` near the
+    end of a large body; a rolling tail capture still contains that tag even
+    when the middle of the JSON was dropped.
+    """
+    if not body:
+        return ""
+    try:
+        text = body.decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+    matches = list(_USER_QUERY_RE.finditer(text))
+    if matches:
+        return truncate_preview(matches[-1].group(1).strip(), limit)
+    open_match = _USER_QUERY_OPEN_RE.search(text)
+    if open_match:
+        piece = open_match.group(1).strip()
+        if piece:
+            return truncate_preview(piece, limit)
+    return ""
+
+
 def extract_question_preview(body: bytes, limit: int = PREVIEW_CHARS) -> str:
-    """Last user text from ``messages`` or Responses ``input``."""
+    """Last user text from ``messages`` or Responses ``input``.
+
+    Falls back to scanning for ``<user_query>`` when the body is truncated
+    mid-JSON (common for multi-MB Cursor agent requests).
+    """
     if not body:
         return ""
     try:
         data = json.loads(body)
-    except Exception:
-        return ""
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError, TypeError):
+        return _question_from_partial_body(body, limit)
     if not isinstance(data, dict):
-        return ""
+        return _question_from_partial_body(body, limit)
     messages = data.get("messages")
     if isinstance(messages, list):
         text = _last_user_text_from_messages(messages)
@@ -402,7 +518,7 @@ def extract_question_preview(body: bytes, limit: int = PREVIEW_CHARS) -> str:
     text = _question_from_responses_input(data.get("input"))
     if text:
         return truncate_preview(text, limit)
-    return ""
+    return _question_from_partial_body(body, limit)
 
 
 def _answer_text_from_obj(data: dict[str, Any]) -> str:
@@ -1349,15 +1465,14 @@ class RequestActivityMiddleware:
 
     async def _handle(self, scope: dict, receive: Any, send: Any, path: str) -> None:
         captured: list[dict] = []
-        body = bytearray()
+        body_buf = _RequestBodyBuffer()
         try:
             while True:
                 message = await receive()
                 captured.append(message)
                 if message.get("type") == "http.request":
                     chunk = message.get("body", b"") or b""
-                    if len(body) < _REQ_BODY_CAP:
-                        body.extend(chunk)
+                    body_buf.extend(chunk)
                     if not message.get("more_body", False):
                         break
                 elif message.get("type") == "http.disconnect":
@@ -1369,10 +1484,13 @@ class RequestActivityMiddleware:
         question = ""
         prompt_est = 0
         try:
-            raw = bytes(body)
+            raw = body_buf.preview_bytes()
             model = extract_model(raw)
             question = extract_question_preview(raw)
-            prompt_est = estimate_prompt_tokens_from_body(raw)
+            prompt_est = estimate_prompt_tokens_from_body(
+                raw,
+                total_bytes=body_buf.total if body_buf.truncated else None,
+            )
         except Exception:
             logger.debug("request_activity: preview extract failed", exc_info=True)
 
