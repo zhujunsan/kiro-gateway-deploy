@@ -155,3 +155,110 @@ def test_source_has_no_bare_update_menu_outside_request_redraw():
         if ".update_menu()" in line:
             bare.append(line)
     assert bare == ["                ic.update_menu()"], bare
+
+
+def test_run_after_menu_tracking_waits_for_default_run_loop(monkeypatch):
+    """A deferred rebuild must not fire inside NSEventTrackingRunLoopMode."""
+    from kiro_gateway_tray import macos_menu
+
+    scheduled = {}
+
+    class _Timer:
+        @staticmethod
+        def timerWithTimeInterval_repeats_block_(interval, repeats, block):
+            scheduled["interval"] = interval
+            scheduled["repeats"] = repeats
+            scheduled["block"] = block
+            return "timer"
+
+    class _RunLoop:
+        def addTimer_forMode_(self, timer, mode):
+            scheduled["timer"] = timer
+            scheduled["mode"] = mode
+
+    foundation = types.ModuleType("Foundation")
+    foundation.NSTimer = _Timer
+    foundation.NSRunLoop = types.SimpleNamespace(
+        mainRunLoop=lambda: _RunLoop()
+    )
+    foundation.NSDefaultRunLoopMode = "default-mode"
+    monkeypatch.setitem(sys.modules, "Foundation", foundation)
+    monkeypatch.setattr(macos_menu.sys, "platform", "darwin")
+    monkeypatch.setattr(macos_menu, "run_on_main_thread", lambda fn: fn())
+
+    calls = []
+    macos_menu.run_after_menu_tracking(lambda: calls.append("rebuilt"))
+
+    assert calls == []
+    assert scheduled["interval"] == 0.0
+    assert scheduled["repeats"] is False
+    assert scheduled["mode"] == "default-mode"
+    scheduled["block"](scheduled["timer"])
+    assert calls == ["rebuilt"]
+
+
+def test_darwin_backend_rejects_update_menu_during_tracking(monkeypatch):
+    """Defense in depth blocks setMenu: even when a caller bypasses TrayApp."""
+    from kiro_gateway_tray import macos_menu
+
+    class _NSObject:
+        pass
+
+    class _Menu:
+        def __init__(self):
+            self.delegate = None
+
+        def setDelegate_(self, delegate):
+            self.delegate = delegate
+
+    class _Button:
+        def __init__(self):
+            self.highlighted = True
+
+        def isHighlighted(self):
+            return self.highlighted
+
+    class _StatusItem:
+        def __init__(self, button):
+            self._button = button
+
+        def button(self):
+            return self._button
+
+    calls = []
+
+    class _Icon:
+        def _update_menu(self):
+            calls.append("original")
+
+    fake_appkit = types.ModuleType("AppKit")
+    fake_appkit.NSObject = _NSObject
+    fake_foundation = types.ModuleType("Foundation")
+    fake_objc = types.ModuleType("objc")
+    fake_darwin = types.ModuleType("pystray._darwin")
+    fake_darwin.Icon = _Icon
+    fake_pystray = types.ModuleType("pystray")
+    fake_pystray._darwin = fake_darwin
+
+    monkeypatch.setitem(sys.modules, "AppKit", fake_appkit)
+    monkeypatch.setitem(sys.modules, "Foundation", fake_foundation)
+    monkeypatch.setitem(sys.modules, "objc", fake_objc)
+    monkeypatch.setitem(sys.modules, "pystray", fake_pystray)
+    monkeypatch.setitem(sys.modules, "pystray._darwin", fake_darwin)
+    monkeypatch.setattr(macos_menu.sys, "platform", "darwin")
+    monkeypatch.setattr(macos_menu, "_status_menu_session_open", False)
+
+    macos_menu.install_live_status_menu()
+
+    button = _Button()
+    icon = _Icon()
+    icon._status_item = _StatusItem(button)
+    icon._menu_handle = (_Menu(),)
+    icon._kg_live_menu_delegate = object()
+
+    icon._update_menu()
+    assert calls == []
+
+    button.highlighted = False
+    icon._update_menu()
+    assert calls == ["original"]

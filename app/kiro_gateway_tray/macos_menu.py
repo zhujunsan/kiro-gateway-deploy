@@ -50,6 +50,40 @@ def run_on_main_thread(fn) -> None:
     NSOperationQueue.mainQueue().addOperationWithBlock_(fn)
 
 
+def run_after_menu_tracking(fn) -> None:
+    """Run ``fn`` on the first default-mode turn after menu tracking ends.
+
+    ``menuDidClose:`` is delivered while AppKit is still unwinding its modal
+    tracking loop. A zero-delay timer registered only in
+    ``NSDefaultRunLoopMode`` cannot fire in ``NSEventTrackingRunLoopMode``, so
+    structural menu updates are guaranteed to wait until tracking has exited.
+    Off macOS, or without PyObjC, run inline.
+    """
+    if sys.platform != "darwin":
+        fn()
+        return
+    try:
+        import Foundation
+    except Exception:
+        run_on_main_thread(fn)
+        return
+
+    def _schedule() -> None:
+        try:
+            timer = Foundation.NSTimer.timerWithTimeInterval_repeats_block_(
+                0.0, False, lambda _timer: fn()
+            )
+            Foundation.NSRunLoop.mainRunLoop().addTimer_forMode_(
+                timer, Foundation.NSDefaultRunLoopMode
+            )
+        except Exception:
+            # Still preserve main-thread affinity if an older bridge lacks the
+            # block-based timer constructor.
+            run_on_main_thread(fn)
+
+    run_on_main_thread(_schedule)
+
+
 def install_reopen_handler(icon, on_reopen: Callable[[], None]) -> None:
     """Handle Finder/LaunchServices attempts to open an already-running app.
 
@@ -725,13 +759,16 @@ def install_live_status_menu(
         def menuDidClose_(self, menu):
             global _status_menu_session_open
             self._stop_timer()
-            _status_menu_session_open = False
             cb = _live_hooks.get("did_close")
-            if cb is not None:
-                try:
+            try:
+                if cb is not None:
                     cb(menu)
-                except Exception:
-                    pass
+            except Exception:
+                pass
+            finally:
+                # Keep the hard guard active for the whole callback. AppKit is
+                # still inside its tracking teardown at this point.
+                _status_menu_session_open = False
 
         def liveTick_(self, _timer):
             cb = _live_hooks.get("tick")
@@ -764,6 +801,10 @@ def install_live_status_menu(
     _orig_update_menu = _darwin.Icon._update_menu
 
     def _patched_update_menu(self):
+        # Defense in depth: no caller may replace an NSStatusItem menu during
+        # tracking, even if it bypasses TrayApp._request_redraw.
+        if is_status_menu_open(self):
+            return
         _orig_update_menu(self)
         handle = getattr(self, "_menu_handle", None)
         if not handle:

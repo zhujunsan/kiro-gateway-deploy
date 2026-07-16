@@ -138,12 +138,16 @@ curl -H "Authorization: Bearer $PROXY_API_KEY" https://kg-<你的用户名>.<域
 
 ## 技术细节
 
-本项目基于 [`ghcr.io/zhujunsan/kiro-gateway`](https://github.com/zhujunsan/kiro-gateway) —— 这是上游 [`jwadow/kiro-gateway`](https://github.com/jwadow/kiro-gateway) 的 fork，把针对 Cursor 后端的四处改动直接写进了源码：
+本项目基于 [`ghcr.io/zhujunsan/kiro-gateway`](https://github.com/zhujunsan/kiro-gateway) —— 这是上游 [`jwadow/kiro-gateway`](https://github.com/jwadow/kiro-gateway) 的 fork。除最初针对 Cursor 后端的适配外，fork 还持续合入了以下能力与兼容性修复（当前固定到 `4905ff6`）：
 
-1. `kiro/config.py` + `kiro/model_resolver.py` — 注册 `kiro-*` 模型别名，并让 `get_model_id_for_kiro()`（转换器热路径）识别别名
-2. `main.py` — 新增 `GET /usage` 端点（走 Amazon Q `getUsageLimits`）
-3. `kiro/converters_openai.py` — OpenAI 适配器回退解析 Anthropic 风格的 `tool_use` content block，避免工具调用历史被降级成纯文本
-4. `kiro/payload_guards.py` — 裁剪超大 payload 时固定 `history[0]`，避免折叠进去的 system prompt 被裁掉
+1. **模型与额度** — 注册 `kiro-*` / `kiro-o/s/h` 模型别名，新增 `GET /usage`；补充 Opus 4.8、Sonnet 5、GPT-5.6 Sol/Terra/Luna，移除已不可用模型，并支持按需发现模型及更明确的可用性错误。
+2. **请求兼容** — OpenAI 适配器可回退解析 Anthropic `tool_use`；接受 Anthropic `messages[].role=system` 和 `output_config.effort`；对话以 assistant 结尾时自动生成合法的非空 `currentMessage`。
+3. **上下文保护** — 裁剪超大 payload 时固定保留含 system prompt 的首条历史；移除 Claude Code billing attribution；将上下文溢出统一映射为客户端可识别的 `context_length_exceeded`。
+4. **工具调用可靠性** — 截断超长工具名与工具 ID、清洗 ID 中的换行符、将历史里未声明的工具调用安全降级为文本，并正确合并对象类型的 `tool_input` 分片。
+5. **流式输出** — 过滤空内容事件，以零宽字符兼容必须非空的首 chunk；工具调用由完整块改为符合 OpenAI 规范、并跟随上游事件实时下发的增量流；统一补全生成内容和 function call 的输出 token 计数。
+6. **OpenAI Responses API / Codex** — 新增 `/v1/responses`，支持 namespace 工具、工具去重与合格名展开、完整 SSE 生命周期、`tool_choice` / parallel 约束、reasoning 回显、thinking summary、response store 与 compact，并按模型声明 input modalities、上下文和 reasoning effort。
+7. **网络与重试** — 本地缓存 `tiktoken` 编码并为下载失败增加重试；将 `socks://` 规范化为可解析 DNS 的 `socks5h://`；对间歇性 `INVALID_MODEL_ID` 在同账号内执行线性退避重试。
+8. **诊断能力** — 增加请求级 `DebugSession` 与错误快照回调，方便托盘 App 收集失败请求而不影响正常流量。
 
 fork 的 CI（`.github/workflows/docker.yml`）在 push 到 main 时自动构建并推送多架构镜像，tag 为 `main-<sha>` 与 `latest`。托盘 App 内打包的是同一份网关源码。
 

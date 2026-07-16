@@ -127,9 +127,12 @@ def test_activity_refresh_loop_ticks_while_running(monkeypatch):
 
 
 def test_activity_fingerprint_skips_idle_noop_redraw(monkeypatch):
+    from kiro_gateway_tray import macos_menu
+
     app = _make_app()
     redraws = {"n": 0}
     monkeypatch.setattr(app, "_request_redraw", lambda: redraws.__setitem__("n", redraws["n"] + 1))
+    monkeypatch.setattr(macos_menu, "run_on_main_thread", lambda fn: fn())
 
     snap = ActivitySnapshot(active=[], recent=[
         RecentRequest(
@@ -152,9 +155,12 @@ def test_activity_fingerprint_skips_idle_noop_redraw(monkeypatch):
 
 def test_activity_fingerprint_skips_redraw_while_active_unchanged(monkeypatch):
     """Regression: redrawing every few seconds while active froze macOS input."""
+    from kiro_gateway_tray import macos_menu
+
     app = _make_app()
     redraws = {"n": 0}
     monkeypatch.setattr(app, "_request_redraw", lambda: redraws.__setitem__("n", redraws["n"] + 1))
+    monkeypatch.setattr(macos_menu, "run_on_main_thread", lambda fn: fn())
 
     snap = ActivitySnapshot(active=[
         ActiveRequest(
@@ -223,9 +229,21 @@ def test_status_menu_will_open_patches_without_update_menu(monkeypatch, tmp_path
     )
 
     orig_load = ra.load_snapshot
+    snap = orig_load(path)
+    app._set_activity_cache_value(snap)
+    refreshes = []
+    monkeypatch.setattr(
+        app._activity_cache,
+        "refresh",
+        lambda **kwargs: refreshes.append(kwargs),
+    )
     monkeypatch.setattr(
         "kiro_gateway_tray.tray.request_activity.load_snapshot",
-        lambda: orig_load(path),
+        lambda: pytest.fail("menuWillOpen must not read activity data synchronously"),
+    )
+    delayed = []
+    monkeypatch.setattr(
+        macos_menu, "run_after_menu_tracking", lambda fn: delayed.append(fn)
     )
 
     class _Item:
@@ -290,7 +308,7 @@ def test_status_menu_will_open_patches_without_update_menu(monkeypatch, tmp_path
         def itemAtIndex_(self, i):
             return self._items[i]
 
-    active_sub = _Sub([_Item("当前无进行中的请求")])
+    active_sub = _Sub([_Item("暂无进行中的对话") for _ in range(10)])
     recent_sub = _Sub([_Item("暂无最近对话")])
     gateway = _Item("🖥 网关: 本地 Kiro Gateway\t启动中")
     tunnel = _Item("🌐 隧道: Cloudflare Tunnel\t已停止")
@@ -341,10 +359,14 @@ def test_status_menu_will_open_patches_without_update_menu(monkeypatch, tmp_path
     assert "old q" in recent_title
     assert "old a" in recent_title
     assert redraws["n"] == 0
+    assert refreshes == [{"force": True}]
 
     app._redraw_deferred = True
     app._on_status_menu_did_close(root)
     assert app._menu_session_open is False
+    assert redraws["n"] == 0
+    assert len(delayed) == 1
+    delayed[0]()
     assert redraws["n"] == 1
 
 
@@ -381,6 +403,8 @@ def test_supervisor_status_change_live_patches_while_menu_open(monkeypatch):
 
 
 def test_activity_update_while_menu_open_defers_and_patches(monkeypatch):
+    from kiro_gateway_tray import macos_menu
+
     app = _make_app()
     monkeypatch.setattr(app.sup, "status", lambda: {"gateway": "running", "tunnel": "running"})
     app._menu_session_open = True
@@ -390,12 +414,18 @@ def test_activity_update_while_menu_open_defers_and_patches(monkeypatch):
     monkeypatch.setattr(
         app,
         "_live_patch_open_menu",
-        lambda snap, nsmenu=None, force_rebuild=False: patches.__setitem__("n", patches["n"] + 1),
+        lambda snap, nsmenu=None: patches.__setitem__("n", patches["n"] + 1),
     )
     monkeypatch.setattr(
         app,
         "_live_patch_open_menu_crossplatform",
         lambda snap: patches.__setitem__("n", patches["n"] + 1),
+    )
+    marshaled = []
+    monkeypatch.setattr(
+        macos_menu,
+        "run_on_main_thread",
+        lambda fn: (marshaled.append(fn), fn()),
     )
 
     snap = ActivitySnapshot(active=[
@@ -413,6 +443,7 @@ def test_activity_update_while_menu_open_defers_and_patches(monkeypatch):
     assert redraws["n"] == 0
     assert patches["n"] == 1
     assert app._redraw_deferred is True
+    assert len(marshaled) == 1
 
 
 def test_is_status_menu_open_respects_session_flag(monkeypatch):
@@ -587,7 +618,8 @@ def test_inplace_patch_recent_submenu_updates_open_list(monkeypatch):
             return self._submenu
 
     placeholder = _Item("暂无最近对话", enabled=False)
-    parent = _Parent(_Sub([placeholder]))
+    stale = _Item("stale finished conversation")
+    parent = _Parent(_Sub([placeholder, stale]))
     app._live_recent_fp = repr(())
 
     snap = ActivitySnapshot(
@@ -609,10 +641,12 @@ def test_inplace_patch_recent_submenu_updates_open_list(monkeypatch):
     app._inplace_patch_recent_submenu(parent, snap)
     assert "just finished" in placeholder._title
     assert placeholder._enabled is True
+    assert stale._title == "暂无最近对话"
+    assert stale._enabled is False
     assert app._live_recent_fp == app._recent_fingerprint_of(snap)
 
 
-def test_live_patch_open_menu_refreshes_recent_without_force_rebuild(monkeypatch):
+def test_live_patch_open_menu_refreshes_recent_in_place(monkeypatch):
     """While the root menu is open, recent fingerprint changes must patch titles."""
     from kiro_gateway_tray import macos_menu
 
@@ -711,9 +745,139 @@ def test_live_patch_open_menu_refreshes_recent_without_force_rebuild(monkeypatch
             ),
         ],
     )
-    app._live_patch_open_menu(snap, root, force_rebuild=False)
+    app._live_patch_open_menu(snap, root)
     assert "brand new" in old_row._title
     assert app._live_recent_fp == app._recent_fingerprint_of(snap)
+
+
+def test_live_patch_open_menu_defers_recent_structural_growth(monkeypatch):
+    """An open AppKit menu may patch rows, but must not add/remove them."""
+    from kiro_gateway_tray import macos_menu
+
+    app = _make_app()
+    monkeypatch.setattr(app.sup, "status", lambda: {"gateway": "running"})
+    monkeypatch.setattr(
+        macos_menu,
+        "find_menu_item_by_title_prefix",
+        lambda _menu, _prefix: None,
+    )
+
+    class _Row:
+        def __init__(self):
+            self._title = "暂无最近对话"
+
+        def isSeparatorItem(self):
+            return False
+
+        def setEnabled_(self, _enabled):
+            pass
+
+        def setTarget_(self, _target):
+            pass
+
+        def setAction_(self, _action):
+            pass
+
+        def setTag_(self, _tag):
+            pass
+
+    class _Sub:
+        def __init__(self):
+            self.rows = [_Row()]
+            self.remove_calls = 0
+            self.add_calls = 0
+
+        def numberOfItems(self):
+            return len(self.rows)
+
+        def itemAtIndex_(self, i):
+            return self.rows[i]
+
+        def removeAllItems(self):
+            self.remove_calls += 1
+            self.rows.clear()
+
+        def addItem_(self, item):
+            self.add_calls += 1
+            self.rows.append(item)
+
+    class _Parent:
+        def __init__(self, submenu):
+            self._submenu = submenu
+
+        def submenu(self):
+            return self._submenu
+
+    class _Root:
+        pass
+
+    sub = _Sub()
+    parent = _Parent(sub)
+    monkeypatch.setattr(
+        macos_menu,
+        "find_menu_item_by_exact_title",
+        lambda _menu, _title: parent,
+    )
+    monkeypatch.setattr(
+        macos_menu,
+        "apply_menu_item_title",
+        lambda item, title: setattr(item, "_title", title),
+    )
+
+    snap = ActivitySnapshot(
+        recent=[
+            RecentRequest(
+                id=f"r{i}",
+                started_at=i,
+                finished_at=i + 1,
+                model="m",
+                path="/v1/messages",
+                ok=True,
+                duration_ms=100,
+                question_preview=f"q{i}",
+                answer_preview=f"a{i}",
+            )
+            for i in range(2)
+        ]
+    )
+
+    app._live_recent_fp = "stale"
+    app._live_patch_open_menu(snap, _Root())
+
+    assert sub.numberOfItems() == 1
+    assert sub.remove_calls == 0
+    assert sub.add_calls == 0
+    assert app._redraw_deferred is True
+
+
+def test_status_menu_tick_uses_cached_snapshot_without_sync_io(monkeypatch):
+    """The AppKit tracking timer must never read or parse the activity file."""
+    app = _make_app()
+    app._menu_session_open = True
+    snap = ActivitySnapshot()
+    app._set_activity_cache_value(snap)
+    refreshes = []
+    patches = []
+
+    monkeypatch.setattr(
+        app._activity_cache,
+        "refresh",
+        lambda **kwargs: refreshes.append(kwargs),
+    )
+    monkeypatch.setattr(
+        "kiro_gateway_tray.tray.request_activity.load_snapshot",
+        lambda: pytest.fail("status-menu tick must not perform synchronous I/O"),
+    )
+    monkeypatch.setattr(
+        app,
+        "_live_patch_open_menu",
+        lambda value, nsmenu=None: patches.append(value),
+    )
+
+    app._on_status_menu_tick()
+
+    assert refreshes == [{"force": True}]
+    assert patches == [snap]
 
 
 def test_live_click_delegate_can_be_created_twice():
