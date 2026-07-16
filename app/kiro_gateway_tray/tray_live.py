@@ -111,7 +111,8 @@ def apply_live_titles(
     Safe during Win32 ``TrackPopupMenuEx`` / GTK menu grab — does not destroy
     or replace the menu. Only existing rows are updated (by index); structural
     add/remove is deferred to the next full rebuild after close. Submenu rows
-    may be ``title`` or ``(title, enabled)`` for stable dynamic slots.
+    may be ``title``, ``(title, enabled)``, or ``(title, enabled, visible)``
+    for stable dynamic slots (blank spare slots stay hidden).
     """
     if icon is None:
         return
@@ -135,6 +136,19 @@ def apply_live_titles(
             )
     except Exception:
         pass
+
+
+def _parse_live_row(row: str | tuple) -> tuple[str, bool | None, bool | None]:
+    """Normalize a live submenu row to ``(title, enabled, visible)``."""
+    if isinstance(row, tuple):
+        if len(row) >= 3:
+            return str(row[0]), bool(row[1]), bool(row[2])
+        if len(row) == 2:
+            title, enabled = str(row[0]), bool(row[1])
+            return title, enabled, bool(enabled) or bool(title)
+        return str(row[0]) if row else "", None, None
+    title = str(row)
+    return title, None, bool(title)
 
 
 # --- open/close/tick firing -------------------------------------------------
@@ -300,6 +314,8 @@ def _apply_live_titles_win32(
         MFS_ENABLED = win32_util.MFS_ENABLED
     except Exception:
         return
+    # Not always exported by older pystray builds.
+    MFS_HIDDEN = getattr(win32_util, "MFS_HIDDEN", 0x00000008)
 
     def _read(hmenu_local, index: int) -> tuple[str | None, Any]:
         info = MENUITEMINFO()
@@ -328,7 +344,7 @@ def _apply_live_titles_win32(
         SetMenuItemInfoW(hmenu_local, index, True, ctypes.byref(info))
 
     def _patch_rows(
-        hsubmenu, rows: list[str | tuple[str, bool]]
+        hsubmenu, rows: list
     ) -> None:
         if not hsubmenu or not rows:
             return
@@ -339,14 +355,22 @@ def _apply_live_titles_win32(
             text, _sub = _read(hsubmenu, i)
             if text is None:
                 continue
-            title, enabled = row if isinstance(row, tuple) else (row, None)
+            title, enabled, visible = _parse_live_row(row)
             _write(hsubmenu, i, title)
-            if enabled is not None:
-                info = MENUITEMINFO()
-                info.cbSize = ctypes.sizeof(MENUITEMINFO)
-                info.fMask = MIIM_STATE
-                info.fState = MFS_ENABLED if enabled else MFS_DISABLED
-                SetMenuItemInfoW(hsubmenu, i, True, ctypes.byref(info))
+            if enabled is None and visible is not False:
+                continue
+            info = MENUITEMINFO()
+            info.cbSize = ctypes.sizeof(MENUITEMINFO)
+            info.fMask = MIIM_STATE
+            state = 0
+            if enabled is False:
+                state |= MFS_DISABLED
+            elif enabled is True:
+                state |= MFS_ENABLED
+            if visible is False:
+                state |= MFS_HIDDEN
+            info.fState = state
+            SetMenuItemInfoW(hsubmenu, i, True, ctypes.byref(info))
 
     count = int(GetMenuItemCount(hmenu))
     for i in range(count):
@@ -497,7 +521,7 @@ def _apply_live_titles_gtk(
             pass
 
     def _patch_submenu(
-        parent_item, rows: list[str | tuple[str, bool]]
+        parent_item, rows: list
     ) -> None:
         if not rows:
             return
@@ -521,13 +545,24 @@ def _apply_live_titles_gtk(
                     continue
             except Exception:
                 pass
-            title, enabled = row if isinstance(row, tuple) else (row, None)
+            title, enabled, visible = _parse_live_row(row)
             _set_label(child, title)
             if enabled is not None:
                 try:
                     child.set_sensitive(bool(enabled))
                 except Exception:
                     pass
+            if visible is not None:
+                try:
+                    child.set_visible(bool(visible))
+                except Exception:
+                    try:
+                        if visible:
+                            child.show()
+                        else:
+                            child.hide()
+                    except Exception:
+                        pass
 
     for item in children:
         text = _label_of(item)

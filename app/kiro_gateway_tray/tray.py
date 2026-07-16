@@ -48,6 +48,9 @@ _ACTIVITY_ACTIVE_PREFIX = "📡 进行中"
 _ACTIVITY_RECENT_TITLE = "💬 最近对话"
 _ACTIVITY_ACTIVE_SLOTS = 10
 _ACTIVITY_EMPTY_SLOT_TITLE = "暂无进行中的对话"
+# Blank title for reserved capacity slots (kept in the NSMenu for live growth,
+# but hidden so an idle submenu is not a wall of empty placeholders).
+_ACTIVITY_SPARE_SLOT_TITLE = ""
 _GATEWAY_PREFIX = "🖥 网关:"
 _TUNNEL_PREFIX = "🌐 隧道:"
 
@@ -436,9 +439,30 @@ class TrayApp:
             logger.debug("live status title patch failed", exc_info=True)
 
     @staticmethod
-    def _empty_active_rows(count: int) -> list[tuple[str, bool, object | None]]:
-        """Return disabled placeholders used to keep submenu structure stable."""
-        return [(_ACTIVITY_EMPTY_SLOT_TITLE, False, None) for _ in range(max(0, count))]
+    def _active_slot_visible(title: str, enabled: bool) -> bool:
+        """Whether an active-slot row should remain visible in the submenu.
+
+        Occupied rows and the single idle placeholder keep a non-empty title.
+        Reserved capacity slots use a blank title and stay hidden until filled.
+        """
+        return bool(enabled) or bool(title)
+
+    @staticmethod
+    def _empty_active_rows(
+        count: int, *, show_placeholder: bool = True
+    ) -> list[tuple[str, bool, object | None]]:
+        """Return disabled placeholders used to keep submenu structure stable.
+
+        At most one row shows ``暂无进行中的对话``; remaining slots stay blank
+        so live patches can ``setHidden:`` them without a long empty list.
+        """
+        rows: list[tuple[str, bool, object | None]] = []
+        for i in range(max(0, count)):
+            if show_placeholder and i == 0:
+                rows.append((_ACTIVITY_EMPTY_SLOT_TITLE, False, None))
+            else:
+                rows.append((_ACTIVITY_SPARE_SLOT_TITLE, False, None))
+        return rows
 
     def _active_row(
         self, entry: ActiveRequest, *, now: float | None = None
@@ -549,7 +573,7 @@ class TrayApp:
                 return []
             self._live_active_ids = tuple("" for _ in range(n_slots))
             rows = [(f"网关未运行（{_STATUS_ZH.get(gw, gw)}）", False, None)]
-            rows.extend(self._empty_active_rows(n_slots - 1))
+            rows.extend(self._empty_active_rows(n_slots - 1, show_placeholder=False))
             return rows
 
         active_by_id = {a.id: a for a in snap.active}
@@ -569,13 +593,19 @@ class TrayApp:
 
         self._live_active_ids = tuple(slot_ids)
         now = time.time()
+        occupied = any(rid in active_by_id for rid in slot_ids if rid)
+        placeholder_used = False
         rows: list[tuple[str, bool, object | None]] = []
         for rid in slot_ids:
-            active = active_by_id.get(rid)
+            active = active_by_id.get(rid) if rid else None
             if active is not None:
                 rows.append(self._active_row(active, now=now))
                 continue
-            rows.append((_ACTIVITY_EMPTY_SLOT_TITLE, False, None))
+            if not occupied and not placeholder_used:
+                rows.append((_ACTIVITY_EMPTY_SLOT_TITLE, False, None))
+                placeholder_used = True
+            else:
+                rows.append((_ACTIVITY_SPARE_SLOT_TITLE, False, None))
         return rows
 
     def _live_active_row_titles(
@@ -606,6 +636,9 @@ class TrayApp:
             if row is None or row.isSeparatorItem():
                 continue
             macos_menu.apply_menu_item_title(row, title)
+            macos_menu.apply_menu_item_hidden(
+                row, not self._active_slot_visible(title, enabled)
+            )
             try:
                 row.setEnabled_(bool(enabled))
             except Exception:
@@ -754,7 +787,7 @@ class TrayApp:
     def _live_patch_open_menu_crossplatform(self, snap: ActivitySnapshot) -> None:
         """In-place Win/Linux title updates (no DestroyMenu / set_menu)."""
         active_rows = [
-            (title, enabled)
+            (title, enabled, self._active_slot_visible(title, enabled))
             for title, enabled, _handler in self._live_active_rows(snap)
         ]
 
@@ -1002,14 +1035,18 @@ class TrayApp:
         return self._activity_active_title()
 
     def _activity_active_submenu(self):
-        """Build ten slots so an open native submenu never needs structural edits."""
+        """Build ten slots so an open native submenu never needs structural edits.
+
+        Only one idle placeholder is labeled; remaining capacity slots stay
+        blank so live patches can hide them (avoid a long empty list).
+        """
         pystray = self._pystray
         gw = self.sup.status()["gateway"]
         if gw != "running":
             label = _STATUS_ZH.get(gw, gw)
             rows = [(f"网关未运行（{label}）", False)]
             rows.extend(
-                (_ACTIVITY_EMPTY_SLOT_TITLE, False)
+                (_ACTIVITY_SPARE_SLOT_TITLE, False)
                 for _ in range(_ACTIVITY_ACTIVE_SLOTS - 1)
             )
             self._live_active_ids = tuple("" for _ in range(_ACTIVITY_ACTIVE_SLOTS))
@@ -1022,10 +1059,14 @@ class TrayApp:
                 (request_activity.format_active_line(a, now=now), True)
                 for a in active
             ]
-            rows.extend(
-                (_ACTIVITY_EMPTY_SLOT_TITLE, False)
-                for _ in range(_ACTIVITY_ACTIVE_SLOTS - len(rows))
-            )
+            remaining = _ACTIVITY_ACTIVE_SLOTS - len(rows)
+            if remaining > 0:
+                if not rows:
+                    rows.append((_ACTIVITY_EMPTY_SLOT_TITLE, False))
+                    remaining -= 1
+                rows.extend(
+                    (_ACTIVITY_SPARE_SLOT_TITLE, False) for _ in range(remaining)
+                )
             ids = [a.id for a in active]
             ids.extend([""] * (_ACTIVITY_ACTIVE_SLOTS - len(ids)))
             self._live_active_ids = tuple(ids)

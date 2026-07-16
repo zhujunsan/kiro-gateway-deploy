@@ -103,12 +103,18 @@ def test_activity_submenus_render_rows(monkeypatch):
     assert len(active_items) == 10
     assert "等待响应" in active_items[0].text
     assert active_items[0].kwargs["enabled"] is True
-    assert all(item.text == "暂无进行中的对话" for item in active_items[1:])
+    assert all(item.text == "" for item in active_items[1:])
     assert all(item.kwargs["enabled"] is False for item in active_items[1:])
 
     recent_items = app._activity_recent_submenu()
     assert len(recent_items) == 1
     assert "✓" in recent_items[0].text
+
+    idle = ActivitySnapshot(active=[], recent=[])
+    monkeypatch.setattr(app._activity_cache, "get", lambda: idle)
+    idle_items = app._activity_active_submenu()
+    assert idle_items[0].text == "暂无进行中的对话"
+    assert all(item.text == "" for item in idle_items[1:])
 
 
 def test_activity_refresh_loop_ticks_while_running(monkeypatch):
@@ -251,6 +257,7 @@ def test_status_menu_will_open_patches_without_update_menu(monkeypatch, tmp_path
             self._title = title
             self._submenu = submenu
             self._enabled = True
+            self._hidden = False
 
         def title(self):
             return self._title
@@ -272,6 +279,12 @@ def test_status_menu_will_open_patches_without_update_menu(monkeypatch, tmp_path
 
         def isEnabled(self):
             return self._enabled
+
+        def setHidden_(self, hidden):
+            self._hidden = bool(hidden)
+
+        def isHidden(self):
+            return self._hidden
 
         def setTarget_(self, _t):
             pass
@@ -307,7 +320,6 @@ def test_status_menu_will_open_patches_without_update_menu(monkeypatch, tmp_path
 
         def itemAtIndex_(self, i):
             return self._items[i]
-
     active_sub = _Sub([_Item("暂无进行中的对话") for _ in range(10)])
     recent_sub = _Sub([_Item("暂无最近对话")])
     gateway = _Item("🖥 网关: 本地 Kiro Gateway\t启动中")
@@ -321,6 +333,7 @@ def test_status_menu_will_open_patches_without_update_menu(monkeypatch, tmp_path
 
     # Bypass AppKit attributed path in tests
     monkeypatch.setattr(macos_menu, "apply_menu_item_title", lambda item, title: item.setTitle_(title))
+    monkeypatch.setattr(macos_menu, "apply_menu_item_hidden", lambda item, hidden: item.setHidden_(hidden))
     monkeypatch.setattr(macos_menu, "make_live_click_delegate", lambda: None)
     monkeypatch.setattr(
         macos_menu,
@@ -349,10 +362,9 @@ def test_status_menu_will_open_patches_without_update_menu(monkeypatch, tmp_path
     assert "最长" in active._title
     assert active_sub.numberOfItems() == 10
     assert "生成中" in active_sub.itemAtIndex_(0).title()
-    assert all(
-        active_sub.itemAtIndex_(i).title() == "暂无进行中的对话"
-        for i in range(1, 10)
-    )
+    assert not active_sub.itemAtIndex_(0).isHidden()
+    assert all(active_sub.itemAtIndex_(i).title() == "" for i in range(1, 10))
+    assert all(active_sub.itemAtIndex_(i).isHidden() for i in range(1, 10))
     assert all(not active_sub.itemAtIndex_(i).isEnabled() for i in range(1, 10))
     assert recent_sub.numberOfItems() == 1
     recent_title = recent_sub.itemAtIndex_(0).title()
@@ -483,16 +495,19 @@ def test_is_status_menu_open_respects_session_flag(monkeypatch):
 
 
 def test_inplace_patch_releases_finished_rows_to_empty_slots(monkeypatch):
-    """Finished requests immediately restore their fixed slot to gray/empty."""
+    """Finished requests free their slot; only one idle placeholder stays visible."""
     from kiro_gateway_tray import macos_menu
 
     app = _make_app()
     monkeypatch.setattr(app.sup, "status", lambda: {"gateway": "running"})
     monkeypatch.setattr(macos_menu, "apply_menu_item_title", lambda item, title: item.setTitle_(title))
+    monkeypatch.setattr(macos_menu, "apply_menu_item_hidden", lambda item, hidden: item.setHidden_(hidden))
 
     class _Item:
         def __init__(self, title):
             self._title = title
+            self._enabled = True
+            self._hidden = False
 
         def title(self):
             return self._title
@@ -502,6 +517,21 @@ def test_inplace_patch_releases_finished_rows_to_empty_slots(monkeypatch):
 
         def isSeparatorItem(self):
             return False
+
+        def setEnabled_(self, enabled):
+            self._enabled = bool(enabled)
+
+        def setHidden_(self, hidden):
+            self._hidden = bool(hidden)
+
+        def setTarget_(self, _t):
+            pass
+
+        def setAction_(self, _a):
+            pass
+
+        def setTag_(self, _tag):
+            pass
 
     class _Sub:
         def __init__(self, items):
@@ -553,12 +583,15 @@ def test_inplace_patch_releases_finished_rows_to_empty_slots(monkeypatch):
         ],
     )
     app._inplace_patch_active_submenu(parent, snap)
-    assert row_a._title == "暂无进行中的对话"
+    # Freed slot stays blank+hidden while another request is still active.
+    assert row_a._title == ""
+    assert row_a._hidden is True
     assert "生成中" in row_b._title
     assert "still going" in row_b._title
+    assert row_b._hidden is False
     assert app._live_active_ids == ("", "b")
 
-    # Both finished: both slots return to placeholders; row count stays fixed.
+    # Both finished: only the first free slot shows the idle message.
     snap_done = ActivitySnapshot(
         active=[],
         recent=[
@@ -589,7 +622,9 @@ def test_inplace_patch_releases_finished_rows_to_empty_slots(monkeypatch):
     )
     app._inplace_patch_active_submenu(parent, snap_done)
     assert row_a._title == "暂无进行中的对话"
-    assert row_b._title == "暂无进行中的对话"
+    assert row_a._hidden is False
+    assert row_b._title == ""
+    assert row_b._hidden is True
     assert app._live_active_ids == ("", "")
 
 
@@ -1036,11 +1071,15 @@ def test_open_active_submenu_grows_from_empty_to_multiple_requests(monkeypatch):
     monkeypatch.setattr(
         macos_menu, "apply_menu_item_title", lambda item, title: item.setTitle_(title)
     )
+    monkeypatch.setattr(
+        macos_menu, "apply_menu_item_hidden", lambda item, hidden: item.setHidden_(hidden)
+    )
 
     class _Item:
         def __init__(self):
             self._title = "暂无进行中的对话"
             self._enabled = False
+            self._hidden = False
 
         def title(self):
             return self._title
@@ -1053,6 +1092,9 @@ def test_open_active_submenu_grows_from_empty_to_multiple_requests(monkeypatch):
 
         def setEnabled_(self, enabled):
             self._enabled = bool(enabled)
+
+        def setHidden_(self, hidden):
+            self._hidden = bool(hidden)
 
         def setTarget_(self, _target):
             pass
@@ -1098,10 +1140,11 @@ def test_open_active_submenu_grows_from_empty_to_multiple_requests(monkeypatch):
 
     rows = parent.submenu()._items
     assert len(rows) == 10
-    assert "first" in rows[0]._title and rows[0]._enabled is True
-    assert "second" in rows[1]._title and rows[1]._enabled is True
-    assert all(row._title == "暂无进行中的对话" for row in rows[2:])
+    assert "first" in rows[0]._title and rows[0]._enabled is True and rows[0]._hidden is False
+    assert "second" in rows[1]._title and rows[1]._enabled is True and rows[1]._hidden is False
+    assert all(row._title == "" for row in rows[2:])
     assert all(row._enabled is False for row in rows[2:])
+    assert all(row._hidden is True for row in rows[2:])
     assert app._live_active_ids[:2] == ("a", "b")
 
 
@@ -1128,6 +1171,12 @@ def test_live_active_row_titles_crossplatform_releases_finished_slots(monkeypatc
     titles = app._live_active_row_titles(snap, n_slots=1)
     assert titles == ["暂无进行中的对话"]
     assert app._live_active_ids == ("",)
+
+    # With multiple free slots, only the first keeps the idle label.
+    app._live_active_ids = ("x", "y")
+    titles = app._live_active_row_titles(snap, n_slots=2)
+    assert titles == ["暂无进行中的对话", ""]
+    assert app._live_active_ids == ("", "")
 
 
 

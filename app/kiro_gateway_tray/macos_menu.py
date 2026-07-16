@@ -246,6 +246,21 @@ def apply_menu_item_title(item, title: str) -> None:
             pass
 
 
+def apply_menu_item_hidden(item, hidden: bool) -> None:
+    """Show or hide a menu item without removing it from the ``NSMenu``.
+
+    Used for spare 「进行中」 capacity slots: they must stay in the menu model
+    so live updates can reuse them, but should not render a tall empty list.
+    Safe while the menu is open. No-op when ``setHidden:`` is unavailable.
+    """
+    if item is None:
+        return
+    try:
+        item.setHidden_(bool(hidden))
+    except Exception:
+        pass
+
+
 _SubmenuAutoRebuildCls = None
 
 
