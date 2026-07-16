@@ -103,14 +103,15 @@ def apply_live_titles(
     icon,
     *,
     top_level_prefixes: list[tuple[str, str]] | None = None,
-    submenu_by_parent_prefix: dict[str, list[str]] | None = None,
-    submenu_by_parent_exact: dict[str, list[str]] | None = None,
+    submenu_by_parent_prefix: dict[str, list[str | tuple[str, bool]]] | None = None,
+    submenu_by_parent_exact: dict[str, list[str | tuple[str, bool]]] | None = None,
 ) -> None:
     """In-place title updates for an already-open tray popup.
 
     Safe during Win32 ``TrackPopupMenuEx`` / GTK menu grab — does not destroy
     or replace the menu. Only existing rows are updated (by index); structural
-    add/remove is deferred to the next full rebuild after close.
+    add/remove is deferred to the next full rebuild after close. Submenu rows
+    may be ``title`` or ``(title, enabled)`` for stable dynamic slots.
     """
     if icon is None:
         return
@@ -268,8 +269,8 @@ def _on_win32_timer(wparam, _lparam):
 def _apply_live_titles_win32(
     icon,
     top_level_prefixes: list[tuple[str, str]],
-    submenu_by_parent_prefix: dict[str, list[str]],
-    submenu_by_parent_exact: dict[str, list[str]],
+    submenu_by_parent_prefix: dict[str, list[str | tuple[str, bool]]],
+    submenu_by_parent_exact: dict[str, list[str | tuple[str, bool]]],
 ) -> None:
     import ctypes
     from ctypes import wintypes
@@ -293,7 +294,10 @@ def _apply_live_titles_win32(
         MENUITEMINFO = win32_util.MENUITEMINFO
         MIIM_STRING = win32_util.MIIM_STRING
         MIIM_FTYPE = win32_util.MIIM_FTYPE
+        MIIM_STATE = win32_util.MIIM_STATE
         MFT_SEPARATOR = win32_util.MFT_SEPARATOR
+        MFS_DISABLED = win32_util.MFS_DISABLED
+        MFS_ENABLED = win32_util.MFS_ENABLED
     except Exception:
         return
 
@@ -323,17 +327,26 @@ def _apply_live_titles_win32(
         info.dwTypeData = title
         SetMenuItemInfoW(hmenu_local, index, True, ctypes.byref(info))
 
-    def _patch_rows(hsubmenu, rows: list[str]) -> None:
+    def _patch_rows(
+        hsubmenu, rows: list[str | tuple[str, bool]]
+    ) -> None:
         if not hsubmenu or not rows:
             return
         n = int(GetMenuItemCount(hsubmenu))
-        for i, title in enumerate(rows):
+        for i, row in enumerate(rows):
             if i >= n:
                 break
             text, _sub = _read(hsubmenu, i)
             if text is None:
                 continue
+            title, enabled = row if isinstance(row, tuple) else (row, None)
             _write(hsubmenu, i, title)
+            if enabled is not None:
+                info = MENUITEMINFO()
+                info.cbSize = ctypes.sizeof(MENUITEMINFO)
+                info.fMask = MIIM_STATE
+                info.fState = MFS_ENABLED if enabled else MFS_DISABLED
+                SetMenuItemInfoW(hsubmenu, i, True, ctypes.byref(info))
 
     count = int(GetMenuItemCount(hmenu))
     for i in range(count):
@@ -460,8 +473,8 @@ def _stop_glib_tick() -> None:
 def _apply_live_titles_gtk(
     icon,
     top_level_prefixes: list[tuple[str, str]],
-    submenu_by_parent_prefix: dict[str, list[str]],
-    submenu_by_parent_exact: dict[str, list[str]],
+    submenu_by_parent_prefix: dict[str, list[str | tuple[str, bool]]],
+    submenu_by_parent_exact: dict[str, list[str | tuple[str, bool]]],
 ) -> None:
     menu = getattr(icon, "_menu_handle", None)
     if menu is None:
@@ -483,7 +496,9 @@ def _apply_live_titles_gtk(
         except Exception:
             pass
 
-    def _patch_submenu(parent_item, rows: list[str]) -> None:
+    def _patch_submenu(
+        parent_item, rows: list[str | tuple[str, bool]]
+    ) -> None:
         if not rows:
             return
         try:
@@ -496,7 +511,7 @@ def _apply_live_titles_gtk(
             sub_children = list(sub.get_children())
         except Exception:
             return
-        for i, title in enumerate(rows):
+        for i, row in enumerate(rows):
             if i >= len(sub_children):
                 break
             child = sub_children[i]
@@ -506,7 +521,13 @@ def _apply_live_titles_gtk(
                     continue
             except Exception:
                 pass
+            title, enabled = row if isinstance(row, tuple) else (row, None)
             _set_label(child, title)
+            if enabled is not None:
+                try:
+                    child.set_sensitive(bool(enabled))
+                except Exception:
+                    pass
 
     for item in children:
         text = _label_of(item)

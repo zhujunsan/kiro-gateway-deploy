@@ -100,8 +100,11 @@ def test_activity_submenus_render_rows(monkeypatch):
     monkeypatch.setattr(app._activity_cache, "refresh", lambda **kw: None)
 
     active_items = app._activity_active_submenu()
-    assert len(active_items) == 1
+    assert len(active_items) == 10
     assert "等待响应" in active_items[0].text
+    assert active_items[0].kwargs["enabled"] is True
+    assert all(item.text == "暂无进行中的对话" for item in active_items[1:])
+    assert all(item.kwargs["enabled"] is False for item in active_items[1:])
 
     recent_items = app._activity_recent_submenu()
     assert len(recent_items) == 1
@@ -326,8 +329,13 @@ def test_status_menu_will_open_patches_without_update_menu(monkeypatch, tmp_path
     assert tunnel._title.endswith("连接中")
     assert "进行中 (1)" in active._title
     assert "最长" in active._title
-    assert active_sub.numberOfItems() == 1
+    assert active_sub.numberOfItems() == 10
     assert "生成中" in active_sub.itemAtIndex_(0).title()
+    assert all(
+        active_sub.itemAtIndex_(i).title() == "暂无进行中的对话"
+        for i in range(1, 10)
+    )
+    assert all(not active_sub.itemAtIndex_(i).isEnabled() for i in range(1, 10))
     assert recent_sub.numberOfItems() == 1
     recent_title = recent_sub.itemAtIndex_(0).title()
     assert "old q" in recent_title
@@ -416,8 +424,8 @@ def test_is_status_menu_open_respects_session_flag(monkeypatch):
     assert macos_menu.is_status_menu_open(None) is False
 
 
-def test_inplace_patch_flips_finished_rows_to_completed(monkeypatch):
-    """Regression: finished slots must not freeze on 「生成中」 while menu is open."""
+def test_inplace_patch_releases_finished_rows_to_empty_slots(monkeypatch):
+    """Finished requests immediately restore their fixed slot to gray/empty."""
     from kiro_gateway_tray import macos_menu
 
     app = _make_app()
@@ -487,14 +495,12 @@ def test_inplace_patch_flips_finished_rows_to_completed(monkeypatch):
         ],
     )
     app._inplace_patch_active_submenu(parent, snap)
-    assert row_a._title.startswith("已完成 ·")
-    assert "done q" in row_a._title
+    assert row_a._title == "暂无进行中的对话"
     assert "生成中" in row_b._title
     assert "still going" in row_b._title
-    # Slot membership stays stable while the submenu is displayed.
-    assert app._live_active_ids == ("a", "b")
+    assert app._live_active_ids == ("", "b")
 
-    # Both finished (one failed): titles flip, count of rows unchanged.
+    # Both finished: both slots return to placeholders; row count stays fixed.
     snap_done = ActivitySnapshot(
         active=[],
         recent=[
@@ -524,9 +530,9 @@ def test_inplace_patch_flips_finished_rows_to_completed(monkeypatch):
         ],
     )
     app._inplace_patch_active_submenu(parent, snap_done)
-    assert row_a._title.startswith("已完成 ·")
-    assert row_b._title.startswith("失败 ·")
-    assert app._live_active_ids == ("a", "b")
+    assert row_a._title == "暂无进行中的对话"
+    assert row_b._title == "暂无进行中的对话"
+    assert app._live_active_ids == ("", "")
 
 
 def test_inplace_patch_recent_submenu_updates_open_list(monkeypatch):
@@ -830,7 +836,85 @@ def test_inplace_patch_replaces_finished_slot_with_new_active(monkeypatch):
     assert app._live_active_ids == ("new",)
 
 
-def test_live_active_row_titles_crossplatform_keeps_finished_slots(monkeypatch):
+def test_open_active_submenu_grows_from_empty_to_multiple_requests(monkeypatch):
+    """Ten preallocated rows allow 0→N requests without changing menu structure."""
+    from kiro_gateway_tray import macos_menu
+
+    app = _make_app()
+    monkeypatch.setattr(app.sup, "status", lambda: {"gateway": "running"})
+    monkeypatch.setattr(
+        macos_menu, "apply_menu_item_title", lambda item, title: item.setTitle_(title)
+    )
+
+    class _Item:
+        def __init__(self):
+            self._title = "暂无进行中的对话"
+            self._enabled = False
+
+        def title(self):
+            return self._title
+
+        def setTitle_(self, title):
+            self._title = title
+
+        def isSeparatorItem(self):
+            return False
+
+        def setEnabled_(self, enabled):
+            self._enabled = bool(enabled)
+
+        def setTarget_(self, _target):
+            pass
+
+        def setAction_(self, _action):
+            pass
+
+        def setTag_(self, _tag):
+            pass
+
+    class _Sub:
+        def __init__(self):
+            self._items = [_Item() for _ in range(10)]
+
+        def numberOfItems(self):
+            return len(self._items)
+
+        def itemAtIndex_(self, index):
+            return self._items[index]
+
+    class _Parent:
+        def __init__(self):
+            self._submenu = _Sub()
+
+        def submenu(self):
+            return self._submenu
+
+    parent = _Parent()
+    app._live_active_ids = tuple("" for _ in range(10))
+    now = time.time()
+    snap = ActivitySnapshot(active=[
+        ActiveRequest(
+            id="a", started_at=now - 2, model="m1", path="/v1/messages",
+            phase="streaming", question_preview="first",
+        ),
+        ActiveRequest(
+            id="b", started_at=now - 1, model="m2", path="/v1/messages",
+            phase="waiting", question_preview="second",
+        ),
+    ])
+
+    app._inplace_patch_active_submenu(parent, snap)
+
+    rows = parent.submenu()._items
+    assert len(rows) == 10
+    assert "first" in rows[0]._title and rows[0]._enabled is True
+    assert "second" in rows[1]._title and rows[1]._enabled is True
+    assert all(row._title == "暂无进行中的对话" for row in rows[2:])
+    assert all(row._enabled is False for row in rows[2:])
+    assert app._live_active_ids[:2] == ("a", "b")
+
+
+def test_live_active_row_titles_crossplatform_releases_finished_slots(monkeypatch):
     app = _make_app()
     monkeypatch.setattr(app.sup, "status", lambda: {"gateway": "running"})
     app._live_active_ids = ("x",)
@@ -850,9 +934,9 @@ def test_live_active_row_titles_crossplatform_keeps_finished_slots(monkeypatch):
             ),
         ],
     )
-    titles = app._live_active_row_titles(snap)
-    assert len(titles) == 1
-    assert titles[0].startswith("已完成 ·")
+    titles = app._live_active_row_titles(snap, n_slots=1)
+    assert titles == ["暂无进行中的对话"]
+    assert app._live_active_ids == ("",)
 
 
 

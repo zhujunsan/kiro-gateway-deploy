@@ -26,7 +26,7 @@ from .async_cache import AsyncRefreshCache
 from .icon import make_icon
 from .log import logger
 from .notify import APP_NAME
-from .request_activity import ActivitySnapshot
+from .request_activity import ActiveRequest, ActivitySnapshot
 from .supervisor import Supervisor
 from .theme_watcher import ThemeWatcher
 
@@ -46,6 +46,8 @@ _STATUS_ZH = {
 # Prefixes used to find live-updatable NSMenuItems while the menu is open.
 _ACTIVITY_ACTIVE_PREFIX = "📡 进行中"
 _ACTIVITY_RECENT_TITLE = "💬 最近对话"
+_ACTIVITY_ACTIVE_SLOTS = 10
+_ACTIVITY_EMPTY_SLOT_TITLE = "暂无进行中的对话"
 _GATEWAY_PREFIX = "🖥 网关:"
 _TUNNEL_PREFIX = "🌐 隧道:"
 
@@ -425,7 +427,23 @@ class TrayApp:
         except Exception:
             logger.debug("live status title patch failed", exc_info=True)
 
+    @staticmethod
+    def _empty_active_rows(count: int) -> list[tuple[str, bool, object | None]]:
+        """Return disabled placeholders used to keep submenu structure stable."""
+        return [(_ACTIVITY_EMPTY_SLOT_TITLE, False, None) for _ in range(max(0, count))]
+
+    def _active_row(
+        self, entry: ActiveRequest, *, now: float | None = None
+    ) -> tuple[str, bool, object]:
+        """Build one occupied active-slot row and its current copy handler."""
+        title = request_activity.format_active_line(entry, now=now)
+        detail = entry.question_preview or entry.model
+        handler = self._on_copy_activity_text(detail, "进行中请求")
+        # Live-click handlers are zero-arg; pystray handlers take (icon, item).
+        return title, True, lambda h=handler: h(self._icon, None)
+
     def _rebuild_active_submenu(self, active_item, snap: ActivitySnapshot) -> None:
+        """Fill all ten stable slots before a submenu is displayed."""
         submenu = active_item.submenu() if active_item is not None else None
         if submenu is None:
             return
@@ -433,24 +451,19 @@ class TrayApp:
         if gw != "running":
             label = _STATUS_ZH.get(gw, gw)
             rows = [(f"网关未运行（{label}）", False, None)]
-        elif not snap.active:
-            rows = [("当前无进行中的请求", False, None)]
+            rows.extend(self._empty_active_rows(_ACTIVITY_ACTIVE_SLOTS - 1))
+            ids = [""] * _ACTIVITY_ACTIVE_SLOTS
         else:
+            active = snap.active[:_ACTIVITY_ACTIVE_SLOTS]
             now = time.time()
-            rows = []
-            for entry in snap.active:
-                detail = entry.question_preview or entry.model
-                handler = self._on_copy_activity_text(detail, "进行中请求")
-                # Live-click handlers are zero-arg; pystray handlers take (icon, item).
-                rows.append((
-                    request_activity.format_active_line(entry, now=now),
-                    True,
-                    lambda h=handler: h(self._icon, None),
-                ))
+            rows = [self._active_row(entry, now=now) for entry in active]
+            rows.extend(self._empty_active_rows(_ACTIVITY_ACTIVE_SLOTS - len(rows)))
+            ids = [entry.id for entry in active]
+            ids.extend([""] * (_ACTIVITY_ACTIVE_SLOTS - len(ids)))
         macos_menu.replace_submenu_rows(
             submenu, rows, click_delegate=self._ensure_live_click_delegate("active")
         )
-        self._live_active_ids = tuple(a.id for a in snap.active)
+        self._live_active_ids = tuple(ids)
 
     def _recent_live_rows(
         self, snap: ActivitySnapshot
@@ -578,73 +591,61 @@ class TrayApp:
         except Exception:
             logger.debug("attach submenu autorebuild failed", exc_info=True)
 
-    def _live_active_row_titles(
-        self, snap: ActivitySnapshot, *, n_slots: int | None = None
-    ) -> list[str]:
-        """Titles for currently displayed 进行中 rows (stable slots while open).
+    def _live_active_rows(
+        self, snap: ActivitySnapshot, *, n_slots: int = _ACTIVITY_ACTIVE_SLOTS
+    ) -> list[tuple[str, bool, object | None]]:
+        """Render stable slots and update their request membership in place.
 
-        Row *count* cannot change under an already-shown submenu, so we keep the
-        ID order captured when the submenu was built / first patched. Finished
-        IDs flip to ``format_finished_active_line`` instead of freezing on
-        「生成中」. When a *new* in-flight request appears, it takes over a
-        finished slot so the submenu shows the live request rather than the
-        previous 「已完成」 row. The next full rebuild drops finished-only rows.
+        Requests retain their slot while active. Finished requests immediately
+        release their slot back to a disabled placeholder, and newcomers occupy
+        the first free slot. The NSMenu item count never changes while tracking.
         """
+        n_slots = max(0, n_slots)
         gw = self.sup.status()["gateway"]
         if gw != "running":
-            return [f"网关未运行（{_STATUS_ZH.get(gw, gw)}）"]
+            if n_slots == 0:
+                return []
+            self._live_active_ids = tuple("" for _ in range(n_slots))
+            rows = [(f"网关未运行（{_STATUS_ZH.get(gw, gw)}）", False, None)]
+            rows.extend(self._empty_active_rows(n_slots - 1))
+            return rows
 
         active_by_id = {a.id: a for a in snap.active}
-        recent_by_id = {r.id: r for r in snap.recent}
-        now = time.time()
         active_order = [a.id for a in snap.active]
-
         ids = self._live_active_ids
-        if ids is None or (not ids and snap.active):
-            limit = len(snap.active) if n_slots is None else max(0, n_slots)
-            ids = tuple(active_order[:limit])
-            self._live_active_ids = ids
+
+        if ids is None or len(ids) != n_slots:
+            slot_ids = [""] * n_slots
         else:
-            # Swap finished slots for newly-started active requests so the open
-            # submenu tracks what's actually in flight.
-            slot_ids = list(ids)
-            shown_active = {rid for rid in slot_ids if rid in active_by_id}
-            newcomers = [rid for rid in active_order if rid not in shown_active]
-            ni = 0
-            for i, rid in enumerate(slot_ids):
-                if rid in active_by_id:
-                    continue
-                if ni >= len(newcomers):
-                    break
-                slot_ids[i] = newcomers[ni]
-                ni += 1
-            ids = tuple(slot_ids)
-            self._live_active_ids = ids
+            # A finished request is no longer in progress: release its slot now.
+            slot_ids = [rid if rid in active_by_id else "" for rid in ids]
+        shown_active = {rid for rid in slot_ids if rid}
+        newcomers = [rid for rid in active_order if rid not in shown_active]
+        empty_slots = [i for i, rid in enumerate(slot_ids) if not rid]
+        for i, rid in zip(empty_slots, newcomers):
+            slot_ids[i] = rid
 
-        if not ids:
-            return ["当前无进行中的请求"]
-
-        titles: list[str] = []
-        for rid in ids:
-            entry = active_by_id.get(rid)
-            if entry is not None:
-                titles.append(request_activity.format_active_line(entry, now=now))
+        self._live_active_ids = tuple(slot_ids)
+        now = time.time()
+        rows: list[tuple[str, bool, object | None]] = []
+        for rid in slot_ids:
+            active = active_by_id.get(rid)
+            if active is not None:
+                rows.append(self._active_row(active, now=now))
                 continue
-            recent = recent_by_id.get(rid)
-            if recent is not None:
-                titles.append(request_activity.format_finished_active_line(recent))
-            else:
-                titles.append("已完成")
-        return titles
+            rows.append((_ACTIVITY_EMPTY_SLOT_TITLE, False, None))
+        return rows
+
+    def _live_active_row_titles(
+        self, snap: ActivitySnapshot, *, n_slots: int = _ACTIVITY_ACTIVE_SLOTS
+    ) -> list[str]:
+        """Compatibility helper for native backends that only consume titles."""
+        return [title for title, _enabled, _handler in self._live_active_rows(
+            snap, n_slots=n_slots
+        )]
 
     def _inplace_patch_active_submenu(self, active_item, snap: ActivitySnapshot) -> None:
-        """Refresh visible active rows in place (works while the submenu is open).
-
-        Structural add/remove does not re-render an already-displayed submenu,
-        so we only ``setTitle:`` existing rows. Finished requests keep their
-        slot and switch to 「已完成 / 失败」; ``menuNeedsUpdate:`` drops them on
-        the next expand.
-        """
+        """Refresh the ten existing active rows without replacing the NSMenu."""
         submenu = active_item.submenu() if active_item is not None else None
         if submenu is None:
             return
@@ -654,14 +655,32 @@ class TrayApp:
             return
         if n <= 0:
             return
-        titles = self._live_active_row_titles(snap, n_slots=n)
-        for i, title in enumerate(titles):
+        rows = self._live_active_rows(snap, n_slots=n)
+        click_delegate = self._ensure_live_click_delegate("active")
+        for i, (title, enabled, on_click) in enumerate(rows):
             if i >= n:
                 break
             row = submenu.itemAtIndex_(i)
             if row is None or row.isSeparatorItem():
                 continue
             macos_menu.apply_menu_item_title(row, title)
+            try:
+                row.setEnabled_(bool(enabled))
+            except Exception:
+                pass
+            if on_click is not None and click_delegate is not None:
+                try:
+                    row.setTarget_(click_delegate)
+                    row.setAction_(b"activateLiveItem:")
+                    row.setTag_(i)
+                    click_delegate.setHandler_forTag_(on_click, i)
+                except Exception:
+                    pass
+            elif click_delegate is not None:
+                try:
+                    click_delegate.setHandler_forTag_(None, i)
+                except Exception:
+                    pass
 
     def _live_patch_open_menu(self, snap: ActivitySnapshot, nsmenu=None, *, force_rebuild: bool = False) -> None:
         """In-place updates for an already-open status menu (macOS).
@@ -688,10 +707,8 @@ class TrayApp:
                 if force_rebuild:
                     self._rebuild_active_submenu(active_item, snap)
                 else:
-                    # Menu is open: structural add/remove won't re-render a
-                    # displayed submenu, so only patch titles in place (finished
-                    # rows become 已完成 / 失败). menuNeedsUpdate: rebuilds
-                    # structure on the next expand.
+                    # Menu is open: preserve the ten-item structure and only
+                    # patch each slot's title, enabled state, and click handler.
                     self._inplace_patch_active_submenu(active_item, snap)
 
             recent_item = macos_menu.find_menu_item_by_exact_title(
@@ -773,9 +790,8 @@ class TrayApp:
         self._on_menu_open()
         self._refresh_activity_cache_quiet()
         snap = self._activity_snapshot()
-        # Capture slot IDs before the popup is shown so live patches can flip
-        # finished rows to 已完成 / 失败 without shrinking the submenu.
-        self._live_active_ids = tuple(a.id for a in snap.active)
+        # The synchronous rebuild below expands this snapshot into ten slots.
+        self._live_active_ids = None
         tray_live.sync_rebuild_menu(self._icon)
 
     def _on_non_macos_menu_did_close(self) -> None:
@@ -801,7 +817,10 @@ class TrayApp:
 
     def _live_patch_open_menu_crossplatform(self, snap: ActivitySnapshot) -> None:
         """In-place Win/Linux title updates (no DestroyMenu / set_menu)."""
-        active_rows = self._live_active_row_titles(snap)
+        active_rows = [
+            (title, enabled)
+            for title, enabled, _handler in self._live_active_rows(snap)
+        ]
 
         if not snap.recent:
             recent_rows = ["暂无最近对话"]
@@ -1052,26 +1071,58 @@ class TrayApp:
         return self._activity_active_title()
 
     def _activity_active_submenu(self):
+        """Build ten slots so an open native submenu never needs structural edits."""
         pystray = self._pystray
         gw = self.sup.status()["gateway"]
         if gw != "running":
             label = _STATUS_ZH.get(gw, gw)
-            return [pystray.MenuItem(f"网关未运行（{label}）", None, enabled=False)]
-        self._activity_cache.refresh()
-        snap = self._activity_snapshot()
-        if not snap.active:
-            return [pystray.MenuItem("当前无进行中的请求", None, enabled=False)]
-        now = time.time()
+            rows = [(f"网关未运行（{label}）", False)]
+            rows.extend(
+                (_ACTIVITY_EMPTY_SLOT_TITLE, False)
+                for _ in range(_ACTIVITY_ACTIVE_SLOTS - 1)
+            )
+            self._live_active_ids = tuple("" for _ in range(_ACTIVITY_ACTIVE_SLOTS))
+        else:
+            self._activity_cache.refresh()
+            snap = self._activity_snapshot()
+            active = snap.active[:_ACTIVITY_ACTIVE_SLOTS]
+            now = time.time()
+            rows = [
+                (request_activity.format_active_line(a, now=now), True)
+                for a in active
+            ]
+            rows.extend(
+                (_ACTIVITY_EMPTY_SLOT_TITLE, False)
+                for _ in range(_ACTIVITY_ACTIVE_SLOTS - len(rows))
+            )
+            ids = [a.id for a in active]
+            ids.extend([""] * (_ACTIVITY_ACTIVE_SLOTS - len(ids)))
+            self._live_active_ids = tuple(ids)
         return [
             pystray.MenuItem(
-                request_activity.format_active_line(a, now=now),
-                self._on_copy_activity_text(
-                    a.question_preview or a.model,
-                    "进行中请求",
-                ),
+                title,
+                self._on_copy_live_active_slot(index),
+                enabled=enabled,
             )
-            for a in snap.active
+            for index, (title, enabled) in enumerate(rows)
         ]
+
+    def _on_copy_live_active_slot(self, slot_index: int):
+        """Resolve a fixed slot at click time so reused slots copy fresh text."""
+        def _handler(_icon, _item):
+            ids = self._live_active_ids or ()
+            if slot_index >= len(ids) or not ids[slot_index]:
+                return
+            rid = ids[slot_index]
+            snap = self._activity_snapshot()
+            entry = next(
+                (item for item in [*snap.active, *snap.recent] if item.id == rid),
+                None,
+            )
+            if entry is None:
+                return
+            self._copy(entry.question_preview or entry.model, "进行中请求")
+        return _handler
 
     def _activity_recent_submenu(self):
         pystray = self._pystray
