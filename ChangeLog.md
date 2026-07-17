@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.4.11 (2026-07-17)
+
+**Changed**
+- 同步上游网关至 `main-a42ef9d`：Codex 读取的 `/v1/models`（及 `/v1/responses/models`）`models` 列表不再包含 `kiro-*` 等 alias，只保留规范模型 ID；OpenAI/Cursor 用的 `data` 仍保留 alias。
+- docker-compose 镜像 pin 至 `ghcr.io/zhujunsan/kiro-gateway:main-a42ef9d`。
+
 ## v0.4.10 (2026-07-16)
 
 **Fixed**
