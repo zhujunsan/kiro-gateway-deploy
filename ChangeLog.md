@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.4.12 (2026-07-20)
+
+**Changed**
+- 同步上游网关至 `main-3c5e5a2`：发往 Kiro 前按 `toolUseId` 去重（同 ID 保留参数更完整的 toolUse、第一条 toolResult），避免 Cursor 复用同一 tool_call_id 时触发 Bedrock `TOOL_DUPLICATE` 整单失败；正常唯一 ID 请求不受影响。
+- docker-compose 镜像 pin 至 `ghcr.io/zhujunsan/kiro-gateway:main-3c5e5a2`。
+- 遥测上报跳过 `requests == 0` 的空闲 Credit 桶，减少无意义的 D1 写入。
+
 ## v0.4.11 (2026-07-17)
 
 **Changed**

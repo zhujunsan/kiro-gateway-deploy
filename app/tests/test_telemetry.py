@@ -429,9 +429,39 @@ def test_upload_zeroes_credit_when_bucket_has_no_tokens(tmp_path):
 
     assert len(up.batches) == 1
     row = up.batches[0][0]
+    assert row["requests"] == 1
     assert row["total_tokens_sum"] == 0
     assert row["estimated_credits"] == 0.0
     assert row["credit_estimate_segments"] == 1
+    assert pend.load_all() == []
+
+
+def test_upload_skips_zero_request_credit_only_bucket(tmp_path):
+    """Idle Credit checkpoints (no gateway requests) must not be uploaded."""
+    rep, up, pend = _reporter(tmp_path)
+    # Checkpoint-style settle with no RequestSample → requests stay 0.
+    rep.aggregator.record_credit_estimate("m", credits=42.5, now=1200)
+
+    rep.tick(now=1800)
+
+    assert up.batches == []
+    assert pend.load_all() == []
+
+
+def test_upload_keeps_traffic_row_drops_idle_sibling(tmp_path):
+    """A batch may mix real traffic and idle Credit rows; only traffic uploads."""
+    rep, up, pend = _reporter(tmp_path)
+    rep.aggregator.record(
+        RequestSample(model="used", success=True, total_tokens=10), now=1200
+    )
+    rep.aggregator.record_credit_estimate("idle", credits=9.0, now=1200)
+
+    rep.tick(now=1800)
+
+    assert len(up.batches) == 1
+    assert len(up.batches[0]) == 1
+    assert up.batches[0][0]["model"] == "used"
+    assert up.batches[0][0]["requests"] == 1
     assert pend.load_all() == []
 
 
@@ -450,8 +480,8 @@ def test_upload_keeps_credit_when_bucket_has_tokens(tmp_path):
     assert row["estimated_credits"] == 12.5
 
 
-def test_pending_retry_zeroes_legacy_credit_without_tokens(tmp_path):
-    """Previously spooled dirty rows are sanitized before retry upload."""
+def test_pending_retry_drops_zero_request_rows(tmp_path):
+    """Legacy spooled idle/zero-request rows are discarded, not re-uploaded."""
     rep, up, pend = _reporter(tmp_path)
     pend.append([{
         "bucket_start": 1200,
@@ -468,9 +498,40 @@ def test_pending_retry_zeroes_legacy_credit_without_tokens(tmp_path):
 
     rep._retry_pending(now=2000, force=True)
 
+    assert up.batches == []
+    assert pend.load_all() == []
+
+
+def test_pending_retry_zeroes_credit_on_failed_request_bucket(tmp_path):
+    """Failed-request buckets (requests>0, tokens=0) still upload with Credit=0."""
+    rep, up, pend = _reporter(tmp_path)
+    pend.append([{
+        "bucket_start": 1200,
+        "bucket_seconds": 600,
+        "username": "u",
+        "model": "m",
+        "app_version": "v",
+        "requests": 3,
+        "total_tokens_sum": 0,
+        "estimated_credits": 99.0,
+        "credit_estimate_segments": 1,
+        "credit_estimate_missing_segments": 0,
+    }])
+
+    rep._retry_pending(now=2000, force=True)
+
     assert len(up.batches) == 1
+    assert up.batches[0][0]["requests"] == 3
     assert up.batches[0][0]["estimated_credits"] == 0.0
     assert pend.load_all() == []
+
+
+def test_is_meaningful_rollup_row():
+    assert telemetry._is_meaningful_rollup_row({"requests": 1}) is True
+    assert telemetry._is_meaningful_rollup_row({"requests": 0}) is False
+    assert telemetry._is_meaningful_rollup_row({"requests": "0"}) is False
+    assert telemetry._is_meaningful_rollup_row({}) is False
+    assert telemetry._is_meaningful_rollup_row({"requests": "x"}) is False
 
 
 def test_pending_retry_idempotent_dedup(tmp_path):
@@ -489,11 +550,14 @@ def test_pending_retry_idempotent_dedup(tmp_path):
 
 def test_pending_retry_keeps_on_failure(tmp_path):
     rep, up, pend = _reporter(tmp_path, ok=False)
-    pend.append([{"bucket_start": 1200, "bucket_seconds": 600, "username": "u",
-                  "model": "m", "app_version": "v"}])
+    pend.append([{
+        "bucket_start": 1200, "bucket_seconds": 600, "username": "u",
+        "model": "m", "app_version": "v", "requests": 2,
+    }])
     rep._retry_pending(now=2000, force=True)
-    # Upload failed -> row stays spooled for next time.
+    # Upload failed -> meaningful row stays spooled for next time.
     assert len(pend.load_all()) == 1
+    assert pend.load_all()[0]["requests"] == 2
 
 
 # --- secret refresh (401 -> /telemetry-secret -> retry, 60s throttle) -------

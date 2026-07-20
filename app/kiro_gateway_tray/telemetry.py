@@ -653,9 +653,38 @@ def _sanitize_credit_for_upload(row: dict[str, Any]) -> dict[str, Any]:
     return sanitized
 
 
+def _is_meaningful_rollup_row(row: dict[str, Any]) -> bool:
+    """Return whether a rollup row is worth uploading to the worker.
+
+    Idle Credit checkpoints can open a ``(user, model, version, bucket)`` row
+    with ``requests == 0``. After token-based Credit sanitization those rows are
+    all zeros and only waste D1 writes / storage. Keep only buckets that saw at
+    least one collected gateway request.
+
+    Args:
+        row: Sanitized telemetry row about to cross the upload boundary.
+
+    Returns:
+        True when ``requests > 0``; False for idle/empty checkpoints or
+        malformed request counts.
+    """
+    try:
+        return int(row.get("requests") or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
 def _sanitize_credit_rows(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     """Sanitize Credit attribution for every row crossing the upload boundary."""
     return [_sanitize_credit_for_upload(row) for row in rows]
+
+
+def _prepare_rows_for_upload(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Sanitize Credit fields and drop idle zero-request buckets."""
+    return [
+        row for row in _sanitize_credit_rows(rows)
+        if _is_meaningful_rollup_row(row)
+    ]
 
 
 class PendingStore:
@@ -928,7 +957,9 @@ class Reporter:
     def _upload_or_spool(self, rows: list[dict[str, Any]]) -> None:
         if not rows:
             return
-        rows = _sanitize_credit_rows(rows)
+        rows = _prepare_rows_for_upload(rows)
+        if not rows:
+            return
         self.uploader.secret = self.runtime_secret_store.get()
         result = self.uploader.upload(rows)
         if result == UPLOAD_OK:
@@ -971,9 +1002,13 @@ class Reporter:
         if not rows:
             self._backoff = _BACKOFF_BASE
             return
-        # Sanitize legacy pending rows too, so previously captured account-wide
-        # Credit deltas cannot leak into a later retry upload.
-        rows = _sanitize_credit_rows(rows)
+        # Sanitize Credit + drop idle zero-request rows (including legacy spool).
+        rows = _prepare_rows_for_upload(rows)
+        if not rows:
+            # Spool held only noise / expired-eligible empties — clear it.
+            self.pending.rewrite([], now=ts)
+            self._backoff = _BACKOFF_BASE
+            return
         # Dedupe by aggregation key (idempotent terminal values) and order
         # newest-first for LIFO retry (design 十.3).
         by_key: dict[tuple, dict[str, Any]] = {}
