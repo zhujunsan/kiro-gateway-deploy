@@ -21,9 +21,8 @@ database_id = "<wrangler d1 create 输出的 id>"
 [triggers]
 crons = ["7 * * * *"]
 
-# Workers Logs：错误事件 (/telemetry/errors) 依赖此配置落盘。
-# head_sampling_rate=1 确保不分片丢失；关闭 invocation_logs 避免每个分片
-# 额外消耗一条 invocation log 与 256KB 预算。
+# Workers Logs（可选）：便于排查 provision / usage telemetry 的 Worker 自身问题。
+# 网关失败请求抓包已改走 Sentry，不再依赖此处落盘。
 [observability]
 enabled = true
 head_sampling_rate = 1

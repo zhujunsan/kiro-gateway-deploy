@@ -256,6 +256,11 @@ def run_gateway_blocking() -> int:
     if not os.environ.get("SERVER_PORT"):
         _apply_env(appconfig.load())
 
+    # Sentry must init BEFORE importing vendored main.py so FastAPI/Starlette
+    # auto-instrumentation can wrap the ASGI app at construction time.
+    from . import sentry_setup
+    sentry_setup.init_sentry(process="gateway")
+
     vendor = _vendor_root()
     if str(vendor) not in sys.path:
         sys.path.insert(0, str(vendor))
@@ -278,17 +283,20 @@ def run_gateway_blocking() -> int:
     from . import request_activity
     app = request_activity.wrap_app(app)
 
-    # Register the error-incident uploader against vendor debug_logger's
-    # snapshot callback. Must run AFTER vendor import so kiro.debug_logger is
-    # importable. No-op when INCIDENT_URL is unset.
-    from . import incident_report
-    incident_report.install()
+    # Failed-request debug snapshots → Sentry (attachments + context). Must run
+    # AFTER vendor import so kiro.debug_logger is importable. No-op when Sentry
+    # is disabled.
+    sentry_setup.install_debug_snapshot_bridge()
 
     # Also wrap the speed-test side-channel (adds /speedtest routes). Same
     # rationale: it lives here, not in vendor/, so vendor_sync can't clobber it.
     # No-op when SPEEDTEST_ENABLED=false.
     from . import speedtest
     app = speedtest.wrap_app(app)
+
+    # Optional setup-only verify route (SENTRY_VERIFY=1). Outer-most so it fires
+    # before other middleware swallows the path.
+    app = sentry_setup.install_gateway_verify_route(app)
 
     config = uvicorn.Config(
         app=app,
@@ -298,5 +306,8 @@ def run_gateway_blocking() -> int:
     )
     # uvicorn installs its own SIGINT/SIGTERM handlers and exits cleanly on
     # terminate(), which is exactly what GatewayProcess.stop() sends.
-    uvicorn.Server(config).run()
+    try:
+        uvicorn.Server(config).run()
+    finally:
+        sentry_setup.flush()
     return 0

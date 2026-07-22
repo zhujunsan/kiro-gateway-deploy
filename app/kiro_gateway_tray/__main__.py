@@ -77,6 +77,12 @@ def main() -> int:
 
     _setup_logging()  # parent-process log sink (tray.log); child has its own
 
+    try:
+        from . import sentry_setup
+    except ImportError:
+        from kiro_gateway_tray import sentry_setup
+    sentry_setup.init_sentry(process="tray")
+
     if not _acquire_lock():
         _show_already_running()
         logger.warning("another instance is already running; refusing to start")
@@ -93,12 +99,15 @@ def main() -> int:
             except ImportError:
                 from kiro_gateway_tray import tray
             tray.run()
+            sentry_setup.flush()
             return 0
         except tray.TrayUnavailable as e:
             print(f"[tray unavailable: {e}] 退化到 CLI 模式", file=sys.stderr)
             logger.info("tray unavailable ({}); falling back to CLI mode", e)
         except Exception as e:
             logger.exception("tray.run() failed")
+            sentry_setup.capture_exception(e)
+            sentry_setup.flush()
             if sys.platform == "win32":
                 import ctypes
                 ctypes.windll.user32.MessageBoxW(
@@ -111,16 +120,19 @@ def main() -> int:
             from . import cli
         except ImportError:
             from kiro_gateway_tray import cli
-        return cli.run()
+        code = cli.run()
+        sentry_setup.flush()
+        return code
     except Exception as e:
         logger.exception("cli.run() failed")
+        sentry_setup.capture_exception(e)
+        sentry_setup.flush()
         if sys.platform == "win32":
             import ctypes
             ctypes.windll.user32.MessageBoxW(
                 0, str(e), "Kiro Gateway Tray - 启动失败", 0x10
             )
         return 1
-
 
 if __name__ == "__main__":
     raise SystemExit(main())
