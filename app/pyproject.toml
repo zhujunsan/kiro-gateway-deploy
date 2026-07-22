@@ -22,6 +22,8 @@ dependencies = [
     "loguru",
     "python-dotenv",
     "tiktoken",
+    # Error / tracing for tray + gateway (DSN is public ingest-only).
+    "sentry-sdk[fastapi]>=2.35.0",
 ]
 
 [project.optional-dependencies]

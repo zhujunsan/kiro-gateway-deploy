@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.4.13 (2026-07-22)
+
+**New**
+- 接入 Sentry（org `san` / 项目 `kiro-gateway-tray`）：tray 与 gateway 双进程上报未捕获异常与 tracing；网关失败请求的 debug 抓包（请求体、Kiro payload、响应流、`app_logs` 等）作为 Issue 附件与上下文直达 Sentry，可按 `source` / `code` / `path` 聚合检索。
+
+**Changed**
+- 移除原 Cloudflare Workers Logs 错误上报（客户端 `incident_report`、Worker `POST /telemetry/errors`）；用量遥测 `/telemetry` 不受影响。
+- 打包依赖增加 `sentry-sdk[fastapi]`，PyInstaller 收集 `sentry_sdk`。
+
 ## v0.4.12 (2026-07-20)
 
 **Changed**
