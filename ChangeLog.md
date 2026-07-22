@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.4.14 (2026-07-22)
+
+**Changed**
+- 同步上游网关至 `main-95c5074`：`GET /usage` 对上游网络抖动做退避重试，失败返回软 503；仅在连续失败或持续不可达时限流上报 Sentry，避免偶发 ConnectError 刷屏。
+- docker-compose 镜像 pin 至 `ghcr.io/zhujunsan/kiro-gateway:main-95c5074`。
+
 ## v0.4.13 (2026-07-22)
 
 **New**
