@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.4.15 (2026-07-24)
+
+**Changed**
+- 升级内嵌 cloudflared 二进制至 2026.7.3（含 golang.org/x/text CVE 修复）；darwin 资产的官方 release 正文 checksum 仍有误，已按实际 GitHub asset 重新计算并 pin。
+
 ## v0.4.14 (2026-07-22)
 
 **Changed**
