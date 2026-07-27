@@ -478,12 +478,17 @@ class Supervisor:
                     relaxed = self._consecutive_ok >= 2
                 else:
                     self._consecutive_ok = 0
-                    self._consecutive_failures += 1
-                    self._gw_health = (
-                        "error"
-                        if self._consecutive_failures >= self._UNHEALTHY_THRESHOLD
-                        else "starting"
-                    )
+                    # Keep an explicit start-failure (health wait timed out while
+                    # the child is still alive) visible; _set_gateway_error resets
+                    # consecutive_failures to 0, so the first background probe
+                    # would otherwise demote "error" back to "starting".
+                    if not (self._last_error and self._gw_health == "error"):
+                        self._consecutive_failures += 1
+                        self._gw_health = (
+                            "error"
+                            if self._consecutive_failures >= self._UNHEALTHY_THRESHOLD
+                            else "starting"
+                        )
                     relaxed = False
                 self._tunnel_connected = tunnel_connected
                 changed = (self._gw_health != prev_gw

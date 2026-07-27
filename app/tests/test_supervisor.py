@@ -329,6 +329,24 @@ def test_start_sets_error_when_health_fails(monkeypatch, tmp_path):
     assert "健康检查" in (s.last_error or "")
 
 
+def test_run_probe_cycle_preserves_start_failure_error_when_alive_unhealthy(
+    monkeypatch, tmp_path
+):
+    # Race: start() sets error + zeros consecutive_failures, then the health
+    # loop's first alive-but-unhealthy probe must NOT demote error -> starting.
+    s = _make_sup(monkeypatch, tmp_path)
+    s.gateway.start(None)
+    s._set_gateway_error("网关未能在时限内就绪（健康检查失败）。")
+
+    class _Fail:
+        status_code = 503
+
+    monkeypatch.setattr(s._client, "get", lambda *a, **k: _Fail())
+    s._run_probe_cycle()
+    assert s.status()["gateway"] == "error"
+    assert "健康检查" in (s.last_error or "")
+
+
 def test_wait_healthy_fails_fast_when_process_dead(monkeypatch, tmp_path):
     # Dead child + failed /health must return False immediately, not burn the
     # full 30s timeout (bind failures exit uvicorn at once).
