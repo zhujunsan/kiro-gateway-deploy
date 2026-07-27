@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.4.19 (2026-07-27)
+
+**Fixed**
+- 修复冻结 App（PyInstaller）下 tiktoken 导入时 zlib 解压失败导致非流式 chat completions 500；tokenizer 捕获该错误并回退估算，不再拖垮整次请求。
+- 同步上游网关至 `main-3b2db9d`；docker-compose 镜像 pin 至 `ghcr.io/zhujunsan/kiro-gateway:main-3b2db9d`。
+
 ## v0.4.18 (2026-07-27)
 
 **Fixed**
