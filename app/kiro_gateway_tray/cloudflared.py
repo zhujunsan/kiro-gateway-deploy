@@ -134,11 +134,16 @@ class CloudflaredProcess:
         if protocol:
             cmd += ["--protocol", protocol]
         cmd += ["run", "--token", run_token]
+        # Force UTF-8: on Windows, text=True alone uses the system ANSI code
+        # page (often GBK), which raises UnicodeDecodeError on cloudflared's
+        # UTF-8 log lines and kills the reader thread (pipe backpressure risk).
         self._proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             **proc_guard.spawn_kwargs(),
         )
         proc_guard.after_spawn(self._proc)
@@ -151,9 +156,12 @@ class CloudflaredProcess:
         proc = self._proc
         if not proc or not proc.stdout:
             return
-        logger = _build_log_writer()
-        for line in proc.stdout:
-            logger(line.rstrip("\n"))
+        write = _build_log_writer()
+        try:
+            for line in proc.stdout:
+                write(line.rstrip("\n"))
+        except Exception as exc:  # noqa: BLE001 — last-resort reader-thread guard
+            logger.warning("cloudflared stdout reader stopped: {}", exc)
 
     def stop(self) -> None:
         if self._proc and self._proc.poll() is None:

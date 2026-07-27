@@ -65,6 +65,141 @@ def test_before_send_drops_system_exit():
     assert ss.before_send(event, {"exc_info": (SystemExit, SystemExit(0), None)}) is None
 
 
+def test_before_send_drops_addr_in_use_oserror():
+    import errno
+
+    event = {"message": "bind failed"}
+    exc = OSError(errno.EADDRINUSE, "Address already in use")
+    assert ss.before_send(event, {"exc_info": (OSError, exc, None)}) is None
+
+
+def test_before_send_drops_addr_in_use_message_event():
+    event = {
+        "message": "error while attempting to bind on address ('127.0.0.1', 64005): "
+        "[errno 48] address already in use",
+    }
+    assert ss.before_send(event, {}) is None
+
+
+def test_before_send_drops_addr_in_use_uvicorn_logentry():
+    """LoggingIntegration path: uvicorn.error logentry, no exc_info."""
+    event = {
+        "logger": "uvicorn.error",
+        "logentry": {
+            "formatted": (
+                "[Errno 48] error while attempting to bind on address "
+                "('127.0.0.1', 64005): address already in use"
+            ),
+        },
+    }
+    assert ss.before_send(event, {}) is None
+
+
+def test_before_send_drops_addr_in_use_exception_values():
+    event = {
+        "exception": {
+            "values": [
+                {
+                    "type": "OSError",
+                    "value": "[Errno 48] Address already in use",
+                }
+            ]
+        }
+    }
+    assert ss.before_send(event, {}) is None
+
+
+def test_before_send_keeps_unrelated_oserror():
+    event = {"message": "disk full"}
+    exc = OSError(28, "No space left on device")
+    assert ss.before_send(event, {"exc_info": (OSError, exc, None)}) is event
+
+
+def test_before_send_drops_client_disconnect_by_tags():
+    event = {
+        "message": "Gateway incident: client_disconnect (cancelled) /v1/chat/completions",
+        "tags": {
+            "incident.code": "client_disconnect",
+            "incident.source": "cancelled",
+            "incident.client_disconnected": "true",
+        },
+    }
+    assert ss.before_send(event, {}) is None
+
+
+def test_before_send_drops_client_disconnect_by_message():
+    event = {
+        "message": (
+            "Gateway incident: client_disconnect (cancelled) "
+            "/v1/responses status=200: client disconnected"
+        ),
+    }
+    assert ss.before_send(event, {}) is None
+
+
+def test_before_send_drops_expected_upstream_invalid_model():
+    event = {
+        "message": (
+            "Gateway incident: INVALID_MODEL_ID (expected_upstream) "
+            "/v1/chat/completions status=400"
+        ),
+        "tags": [
+            ["incident.code", "INVALID_MODEL_ID"],
+            ["incident.source", "expected_upstream"],
+        ],
+    }
+    assert ss.before_send(event, {}) is None
+
+
+def test_before_send_drops_application_startup_failed_logentry():
+    event = {
+        "logger": "uvicorn.error",
+        "message": "Application startup failed. Exiting.",
+        "logentry": {"message": "Application startup failed. Exiting."},
+    }
+    assert ss.before_send(event, {}) is None
+
+
+def test_before_send_keeps_failed_to_initialize_account_exception():
+    """Real startup root cause must remain observable (TRAY-W class)."""
+    event = {
+        "exception": {
+            "values": [
+                {
+                    "type": "RuntimeError",
+                    "value": "Failed to initialize any account",
+                }
+            ]
+        }
+    }
+    assert ss.before_send(event, {
+        "exc_info": (RuntimeError, RuntimeError("Failed to initialize any account"), None),
+    }) is event
+
+
+def test_before_send_keeps_first_token_streaming_error_incident():
+    """TRAY-K class first-token timeout incidents must not be filtered."""
+    event = {
+        "message": (
+            "Gateway incident: streaming_error (gateway) /v1/chat/completions "
+            "status=500: 504: Model did not respond within 30.0s after 3 attempts."
+        ),
+        "tags": {
+            "incident.code": "streaming_error",
+            "incident.source": "gateway",
+            "incident.status_code": "500",
+        },
+        "contexts": {
+            "incident": {
+                "code": "streaming_error",
+                "source": "gateway",
+                "client_disconnected": False,
+            }
+        },
+    }
+    assert ss.before_send(event, {}) is event
+
+
 def test_before_send_scrubs_auth_headers_and_token_vars():
     event = {
         "request": {
@@ -217,6 +352,118 @@ def test_report_incident_snapshot_noop_when_disabled():
         "code": "test",
         "artifacts": {"request_body.json": b'{"a":1}'},
     })
+
+
+def test_report_incident_skips_client_disconnect(monkeypatch):
+    captured: dict = {}
+
+    class _FakeSdk:
+        @staticmethod
+        def new_scope():
+            raise AssertionError("client_disconnect must not open a Sentry scope")
+
+        @staticmethod
+        def capture_message(*a, **k):
+            captured["called"] = True
+
+    monkeypatch.setattr(ss, "_READY", True)
+    monkeypatch.setitem(__import__("sys").modules, "sentry_sdk", _FakeSdk)
+
+    ss.report_incident_snapshot({
+        "incident_id": "disc-1",
+        "path": "/v1/chat/completions",
+        "source": "cancelled",
+        "code": "client_disconnect",
+        "client_disconnected": True,
+        "status_code": 200,
+        "error_message": "client disconnected",
+        "artifacts": {},
+    })
+    assert "called" not in captured
+
+
+def test_report_incident_skips_expected_upstream_invalid_model(monkeypatch):
+    captured: dict = {}
+
+    class _FakeSdk:
+        @staticmethod
+        def new_scope():
+            raise AssertionError("INVALID_MODEL_ID must not open a Sentry scope")
+
+        @staticmethod
+        def capture_message(*a, **k):
+            captured["called"] = True
+
+    monkeypatch.setattr(ss, "_READY", True)
+    monkeypatch.setitem(__import__("sys").modules, "sentry_sdk", _FakeSdk)
+
+    ss.report_incident_snapshot({
+        "incident_id": "model-1",
+        "path": "/v1/chat/completions",
+        "source": "expected_upstream",
+        "code": "INVALID_MODEL_ID",
+        "client_disconnected": False,
+        "status_code": 400,
+        "error_message": "The requested model is unavailable for this account.",
+        "artifacts": {},
+    })
+    assert "called" not in captured
+
+
+def test_report_incident_keeps_first_token_streaming_error(monkeypatch):
+    captured: dict = {}
+
+    class _Scope:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def set_tag(self, *a, **k):
+            pass
+
+        def set_context(self, *a, **k):
+            pass
+
+        def add_attachment(self, **kwargs):
+            pass
+
+        @property
+        def fingerprint(self):
+            return captured.get("fingerprint")
+
+        @fingerprint.setter
+        def fingerprint(self, value):
+            captured["fingerprint"] = value
+
+    class _FakeSdk:
+        @staticmethod
+        def new_scope():
+            return _Scope()
+
+        @staticmethod
+        def capture_message(message, level="info"):
+            captured["message"] = message
+            captured["level"] = level
+
+    monkeypatch.setattr(ss, "_READY", True)
+    monkeypatch.setitem(__import__("sys").modules, "sentry_sdk", _FakeSdk)
+
+    ss.report_incident_snapshot({
+        "incident_id": "ttft-1",
+        "path": "/v1/chat/completions",
+        "source": "gateway",
+        "code": "streaming_error",
+        "phase": "streaming",
+        "client_disconnected": False,
+        "status_code": 500,
+        "error_message": "504: Model did not respond within 30.0s after 3 attempts.",
+        "artifacts": {},
+    })
+    assert "streaming_error" in captured["message"]
+    assert captured["level"] == "error"
+    assert "streaming_error" in captured["fingerprint"]
 
 
 def test_report_incident_snapshot_attaches_artifacts(monkeypatch):

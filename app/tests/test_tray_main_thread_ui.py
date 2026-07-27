@@ -118,7 +118,7 @@ def test_start_or_restart_worker_does_not_call_update_menu_directly(monkeypatch)
     done = threading.Event()
 
     monkeypatch.setattr(app.sup, "status", lambda: {"gateway": "stopped"})
-    monkeypatch.setattr(app.sup, "start", lambda: None)
+    monkeypatch.setattr(app.sup, "start", lambda: True)
     monkeypatch.setattr(app, "_notify", lambda *_a, **_k: None)
     monkeypatch.setattr(tray_mod.appconfig, "load", lambda: MagicMock(
         cloudflare=MagicMock(hostname="x.example"),
@@ -262,3 +262,26 @@ def test_darwin_backend_rejects_update_menu_during_tracking(monkeypatch):
     button.highlighted = False
     icon._update_menu()
     assert calls == ["original"]
+
+
+def test_gateway_title_shows_port_busy_hint(monkeypatch):
+    from kiro_gateway_tray import tray as tray_mod
+
+    app = tray_mod.TrayApp()
+    monkeypatch.setattr(
+        app.sup,
+        "status",
+        lambda: {
+            "gateway": "error",
+            "tunnel": "stopped",
+            "hostname": "x.example",
+            "error": "本机端口 64005 已被占用，网关未能启动。请关闭占用该端口的进程。",
+        },
+    )
+    monkeypatch.setattr(
+        tray_mod.appconfig,
+        "load",
+        lambda use_cache=False: MagicMock(gateway=MagicMock(port=64005)),
+    )
+    title = app._gateway_title()
+    assert "异常（端口 64005 占用）" in title

@@ -15,6 +15,7 @@ signal for gateway incidents.
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
 import sys
@@ -141,8 +142,190 @@ def _scrub_frame_vars(event: dict[str, Any]) -> None:
                     vars_[key] = "[Filtered]"
 
 
+# OSError.errno values for "address already in use" across platforms.
+_ADDR_IN_USE_ERRNOS = frozenset({
+    errno.EADDRINUSE,
+    getattr(errno, "WSAEADDRINUSE", 10048),
+})
+
+# Client/account feedback from Kiro — not gateway bugs (see kiro_errors).
+_EXPECTED_UPSTREAM_CODES = frozenset({
+    "INVALID_MODEL_ID",
+})
+
+
+def _exception_text(exc: BaseException) -> str:
+    """Flatten exception type + message for substring matching."""
+    return f"{type(exc).__name__}: {exc}".lower()
+
+
+def _looks_like_addr_in_use(text: str) -> bool:
+    """True when ``text`` describes a TCP bind conflict (EADDRINUSE)."""
+    lowered = text.lower()
+    needles = (
+        "address already in use",
+        "eaddrinuse",
+        "only one usage of each socket address",  # Windows English
+        "通常每个套接字地址",  # Windows Chinese WSAEADDRINUSE
+    )
+    return any(n in lowered for n in needles)
+
+
+def _tag_map(event: dict[str, Any]) -> dict[str, str]:
+    """Normalize event tags to a flat ``str → str`` map.
+
+    Sentry may present tags as a dict or as a list of ``[key, value]`` pairs
+    (or ``{"key": ..., "value": ...}`` objects) depending on SDK stage.
+    """
+    tags = event.get("tags")
+    if isinstance(tags, dict):
+        return {str(k): str(v) for k, v in tags.items()}
+    if not isinstance(tags, list):
+        return {}
+    out: dict[str, str] = {}
+    for item in tags:
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            out[str(item[0])] = str(item[1])
+        elif isinstance(item, dict) and "key" in item:
+            out[str(item["key"])] = str(item.get("value") or "")
+    return out
+
+
+def _event_text_parts(event: dict[str, Any]) -> list[str]:
+    """Collect human-readable strings from message / logentry / exception."""
+    parts: list[str] = []
+    message = event.get("message")
+    if message:
+        parts.append(str(message))
+
+    logentry = event.get("logentry")
+    if isinstance(logentry, dict):
+        for key in ("formatted", "message"):
+            val = logentry.get(key)
+            if val:
+                parts.append(str(val))
+
+    exception = event.get("exception")
+    if isinstance(exception, dict):
+        values = exception.get("values")
+        if isinstance(values, list):
+            for item in values:
+                if not isinstance(item, dict):
+                    continue
+                parts.append(f"{item.get('type') or ''} {item.get('value') or ''}")
+    return parts
+
+
+def _event_text_blob(event: dict[str, Any]) -> str:
+    """Lowercased concatenation of event text parts for substring matching."""
+    return " ".join(_event_text_parts(event)).lower()
+
+
+def _is_addr_in_use_event(event: dict[str, Any], hint: dict[str, Any]) -> bool:
+    """Detect port-bind conflicts that tray already surfaces to the user.
+
+    These are environmental (another process holds the gateway port), not
+    actionable application bugs — drop them to cut Sentry noise.
+
+    Covers:
+      * ``OSError`` / ``WSAEADDRINUSE`` via ``hint["exc_info"]``
+      * exception values on the event
+      * uvicorn / LoggingIntegration message + logentry text
+    """
+    exc_info = hint.get("exc_info")
+    if exc_info and len(exc_info) >= 2 and isinstance(exc_info[1], BaseException):
+        exc = exc_info[1]
+        if isinstance(exc, OSError) and getattr(exc, "errno", None) in _ADDR_IN_USE_ERRNOS:
+            return True
+        if _looks_like_addr_in_use(_exception_text(exc)):
+            return True
+
+    for part in _event_text_parts(event):
+        if _looks_like_addr_in_use(part):
+            return True
+    return False
+
+
+def _is_noisy_incident_event(event: dict[str, Any]) -> bool:
+    """True for client-cancel / expected-upstream incidents that must not Issue.
+
+    Primary drop is in ``report_incident_snapshot``; this is defense-in-depth for
+    events that already carry incident tags / message text.
+    """
+    tags = _tag_map(event)
+    if tags.get("incident.client_disconnected", "").lower() == "true":
+        return True
+    code = tags.get("incident.code", "")
+    source = tags.get("incident.source", "")
+    if code == "client_disconnect" or source == "cancelled":
+        return True
+    if source == "expected_upstream" or code in _EXPECTED_UPSTREAM_CODES:
+        return True
+
+    contexts = event.get("contexts")
+    if isinstance(contexts, dict):
+        incident = contexts.get("incident")
+        if isinstance(incident, dict):
+            if incident.get("client_disconnected"):
+                return True
+            if str(incident.get("code") or "") == "client_disconnect":
+                return True
+            if str(incident.get("source") or "") in ("cancelled", "expected_upstream"):
+                return True
+            if str(incident.get("code") or "") in _EXPECTED_UPSTREAM_CODES:
+                return True
+
+    blob = _event_text_blob(event)
+    if "gateway incident: client_disconnect" in blob:
+        return True
+    if "gateway incident: invalid_model_id" in blob and "expected_upstream" in blob:
+        return True
+    return False
+
+
+def _is_duplicate_startup_log_event(event: dict[str, Any], hint: dict[str, Any]) -> bool:
+    """Drop uvicorn's ``Application startup failed`` logentry duplicate.
+
+    The real failure (e.g. ``Failed to initialize any account``) is already
+    captured as an exception Issue; the wrapper log creates a second Issue.
+    Keep exception events; only drop pure message / logentry events.
+    """
+    exc_info = hint.get("exc_info")
+    if exc_info and len(exc_info) >= 2 and isinstance(exc_info[1], BaseException):
+        return False
+
+    exception = event.get("exception")
+    if isinstance(exception, dict):
+        values = exception.get("values")
+        if isinstance(values, list) and any(isinstance(v, dict) for v in values):
+            return False
+
+    blob = _event_text_blob(event)
+    return "application startup failed" in blob
+
+
+def _should_skip_incident_snapshot(snapshot: dict[str, Any]) -> bool:
+    """Return True when a debug_logger snapshot must not create a Sentry Issue.
+
+    Drops:
+      * client disconnect / cancelled (user abort — not a bug)
+      * expected_upstream rejections (esp. INVALID_MODEL_ID)
+
+    Keeps actionable incidents such as first-token ``streaming_error`` timeouts.
+    """
+    if bool(snapshot.get("client_disconnected")):
+        return True
+    code = str(snapshot.get("code") or "")
+    source = str(snapshot.get("source") or "")
+    if code == "client_disconnect" or source == "cancelled":
+        return True
+    if source == "expected_upstream" or code in _EXPECTED_UPSTREAM_CODES:
+        return True
+    return False
+
+
 def before_send(event: dict[str, Any], hint: dict[str, Any]) -> dict[str, Any] | None:
-    """Drop non-actionable exits and scrub secrets from outbound events.
+    """Drop non-actionable noise and scrub secrets from outbound events.
 
     Args:
         event: Sentry event payload about to be sent.
@@ -158,6 +341,13 @@ def before_send(event: dict[str, Any], hint: dict[str, Any]) -> dict[str, Any] |
                 return None
         except TypeError:
             pass
+
+    if _is_addr_in_use_event(event, hint):
+        return None
+    if _is_noisy_incident_event(event):
+        return None
+    if _is_duplicate_startup_log_event(event, hint):
+        return None
 
     _scrub_headers(event)
     _scrub_frame_vars(event)
@@ -335,6 +525,8 @@ def report_incident_snapshot(snapshot: dict[str, Any]) -> None:
         snapshot: Immutable-enough dict from vendor ``DebugSession.build_snapshot``.
     """
     if not _READY or not isinstance(snapshot, dict):
+        return
+    if _should_skip_incident_snapshot(snapshot):
         return
     try:
         import sentry_sdk

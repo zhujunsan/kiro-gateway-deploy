@@ -112,6 +112,20 @@ def test_wait_port_free_succeeds_after_release():
     assert gateway.wait_port_free(port, timeout=1, interval=0.05) is True
 
 
+def test_format_port_busy_message_is_actionable():
+    msg = gateway.format_port_busy_message(64005)
+    assert "64005" in msg
+    assert "占用" in msg
+    assert "重新启动" in msg or "重启" in msg
+
+
+def test_port_busy_error_embeds_message():
+    err = gateway.PortBusyError(64005)
+    assert err.port == 64005
+    assert "64005" in str(err)
+    assert "占用" in str(err)
+
+
 def test_stop_waits_after_kill(monkeypatch):
     # If terminate() doesn't make the child exit in time, stop() must kill AND
     # wait again so it never returns while the port-holding child is still alive.

@@ -41,6 +41,7 @@ def test_start_pins_metrics_port(monkeypatch, tmp_path):
 
     def fake_popen(cmd, **kwargs):
         captured["cmd"] = cmd
+        captured["kwargs"] = kwargs
         return _FakeProc()
 
     monkeypatch.setattr(cf.subprocess, "Popen", fake_popen)
@@ -57,6 +58,10 @@ def test_start_pins_metrics_port(monkeypatch, tmp_path):
     assert "--metrics" in cmd
     assert cmd[cmd.index("--metrics") + 1] == "127.0.0.1:20299"
     assert proc.metrics_port == 20299
+    # Windows system code page (e.g. GBK) must not decode UTF-8 cloudflared logs.
+    assert captured["kwargs"]["text"] is True
+    assert captured["kwargs"]["encoding"] == "utf-8"
+    assert captured["kwargs"]["errors"] == "replace"
 
 
 def test_start_falls_back_when_metrics_port_busy(monkeypatch):
@@ -111,6 +116,30 @@ def test_start_requires_run_token():
         assert False, "expected RuntimeError"
     except RuntimeError as e:
         assert "run_token" in str(e)
+
+
+def test_watch_output_swallows_reader_errors(monkeypatch):
+    # A dying reader thread used to leave stdout unread → pipe backpressure.
+    # Any iteration/decode failure must be logged and exit cleanly.
+    import kiro_gateway_tray.cloudflared as cf
+
+    warnings = []
+
+    class _BoomStdout:
+        def __iter__(self):
+            raise UnicodeDecodeError("gbk", b"\xff", 0, 1, "boom")
+
+    class _FakeProc:
+        stdout = _BoomStdout()
+
+    monkeypatch.setattr(cf, "_build_log_writer", lambda: (lambda _line: None))
+    monkeypatch.setattr(cf.logger, "warning", lambda *a, **k: warnings.append((a, k)))
+
+    proc = cf.CloudflaredProcess()
+    proc._proc = _FakeProc()
+    proc._watch_output()  # must not raise
+
+    assert warnings, "expected warning when stdout reader fails"
 
 
 def test_provision_username_from_client_id_hash(monkeypatch):

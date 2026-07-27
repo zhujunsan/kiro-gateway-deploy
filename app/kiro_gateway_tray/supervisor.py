@@ -27,6 +27,8 @@ class Supervisor:
     # how long restart() waits for the old gateway's port to free before
     # starting the new child (seconds)
     _PORT_FREE_TIMEOUT = 10
+    # brief wait on cold start after orphan cleanup, before failing on a busy port
+    _PORT_FREE_START_TIMEOUT = 3
 
     def __init__(self, gateway=None, tunnel=None) -> None:
         self.gateway = gateway or GatewayProcess()
@@ -36,6 +38,8 @@ class Supervisor:
         self.provision_callback: Callable[[AppCfg], str] | None = None
         # Cached gateway health status (never block the main/UI thread)
         self._gw_health: str = "stopped"
+        # Last user-facing gateway failure reason (Chinese); cleared on success.
+        self._last_error: str | None = None
         # Cached tunnel connectivity, refreshed by the health loop via the
         # cloudflared /ready probe (not by parsing logs).
         self._tunnel_connected: bool = False
@@ -101,12 +105,59 @@ class Supervisor:
             logger.debug("closing supervisor http client failed", exc_info=True)
 
     def _wait_healthy(self, timeout: int = 30) -> bool:
+        """Poll /health until ready, or fail fast if the child already exited."""
         deadline = time.time() + timeout
         while time.time() < deadline:
             if self._probe_gateway_once(timeout=3):
                 return True
+            # Bind failures (EADDRINUSE) make uvicorn exit immediately; don't
+            # burn the full timeout pretending the gateway is still "starting".
+            if not self.gateway.is_alive():
+                return False
             time.sleep(1)
         return False
+
+    @property
+    def last_error(self) -> str | None:
+        """Most recent user-facing gateway start failure, or None when healthy."""
+        with self._state_lock:
+            return self._last_error
+
+    def _set_gateway_error(self, message: str) -> None:
+        """Flip cached health to error and remember the user-facing reason."""
+        with self._state_lock:
+            self._gw_health = "error"
+            self._last_error = message
+            self._consecutive_failures = 0
+            self._consecutive_ok = 0
+
+    def _diagnose_start_failure(self, cfg: AppCfg) -> str:
+        """Build an actionable Chinese message after a failed health wait."""
+        port = cfg.gateway.port
+        if not gateway.can_bind("127.0.0.1", port):
+            return gateway.format_port_busy_message(port)
+        if not self.gateway.is_alive():
+            return (
+                "网关进程启动后异常退出，未能提供服务。"
+                "请查看日志目录中的 gateway-bootstrap.log 与 gateway.log。"
+            )
+        return (
+            "网关未能在时限内就绪（健康检查失败）。"
+            "请查看日志目录或尝试重新启动。"
+        )
+
+    def _ensure_port_free_or_raise(self, cfg: AppCfg, *, timeout: float) -> None:
+        """Wait briefly for the listen port; raise PortBusyError if still taken.
+
+        Never picks an alternate port — Worker/docs pin the gateway port.
+        """
+        port = cfg.gateway.port
+        if gateway.wait_port_free(port, timeout=timeout):
+            return
+        msg = gateway.format_port_busy_message(port)
+        self._set_gateway_error(msg)
+        logger.error(msg)
+        raise gateway.PortBusyError(port)
 
     def _probe_gateway_once(self, *, timeout: float = 1) -> bool:
         """One gateway /health probe. True iff it answered 200. Never raises."""
@@ -243,12 +294,22 @@ class Supervisor:
         cfg = self._sync_telemetry_secret(cfg)
         with self._state_lock:
             self._gw_health = "starting"
+            self._last_error = None
+        # Orphan cleanup may have just signalled a leftover child; give the OS a
+        # short window to release the port. If something else still holds it,
+        # fail fast with a clear message — never auto-change the port.
+        self._ensure_port_free_or_raise(cfg, timeout=self._PORT_FREE_START_TIMEOUT)
         self.gateway.start(cfg)
         healthy = self._wait_healthy()
         if healthy:
             with self._state_lock:
                 self._gw_health = "running"
                 self._consecutive_ok = 1
+                self._last_error = None
+        else:
+            msg = self._diagnose_start_failure(cfg)
+            self._set_gateway_error(msg)
+            logger.error("gateway failed to become healthy: {}", msg)
         self.tunnel.start(cfg)
         self._start_health_loop()
         return healthy
@@ -259,6 +320,7 @@ class Supervisor:
         self.gateway.stop()
         with self._state_lock:
             self._gw_health = "stopped"
+            self._last_error = None
             self._tunnel_connected = False
             self._consecutive_failures = 0
             self._consecutive_ok = 0
@@ -269,16 +331,10 @@ class Supervisor:
         # stop() already waits for the old gateway child to exit, but the OS can
         # hold its listening socket open a beat longer. Starting the new child
         # before the port frees would make uvicorn fail to bind. Poll until the
-        # port is bindable (bounded wait); proceed anyway on timeout so a stuck
-        # external listener doesn't wedge restart forever — start() surfaces the
-        # bind failure via the health probe.
+        # port is bindable; if an external listener still holds it, fail fast
+        # with a clear error instead of spawning a child that cannot bind.
         cfg = self._get_cfg()
-        if not gateway.wait_port_free(cfg.gateway.port, timeout=self._PORT_FREE_TIMEOUT):
-            logger.warning(
-                "gateway port {} still busy after {}s; starting anyway",
-                cfg.gateway.port,
-                self._PORT_FREE_TIMEOUT,
-            )
+        self._ensure_port_free_or_raise(cfg, timeout=self._PORT_FREE_TIMEOUT)
         return self.start()
 
     def mark_starting(self) -> None:
@@ -404,15 +460,20 @@ class Supervisor:
 
             with self._state_lock:
                 if not alive:
-                    self._gw_health = "stopped"
                     self._consecutive_failures = 0
                     self._consecutive_ok = 0
+                    # Keep an explicit start-failure (e.g. port busy) visible in
+                    # the menu until the user retries successfully; only clear to
+                    # "stopped" when there is no remembered start error.
+                    if not (self._last_error and self._gw_health == "error"):
+                        self._gw_health = "stopped"
                     # Nothing is settling when the gateway is down: relax cadence.
                     relaxed = True
                 elif healthy:
                     self._gw_health = "running"
                     self._consecutive_failures = 0
                     self._consecutive_ok += 1
+                    self._last_error = None
                     # Back off only after the gateway has proven stable.
                     relaxed = self._consecutive_ok >= 2
                 else:
@@ -470,8 +531,10 @@ class Supervisor:
         provisioned = appconfig.is_provisioned(cfg)
         with self._state_lock:
             gw_health = self._gw_health
+            last_error = self._last_error or ""
         return {
             "gateway": gw_health,
             "tunnel": self._tunnel_status(),
             "hostname": cfg.cloudflare.hostname if provisioned else "(未注册)",
+            "error": last_error,
         }

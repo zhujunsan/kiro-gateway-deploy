@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.4.16 (2026-07-27)
+
+**New**
+- 同步上游网关至 `main-cc41c09`：按可用模型自动生成别名（`generate_model_alias`），托盘菜单可配对 `claude-opus-5` → `kiro-o-5`；退役文档中的 `kiro-o-4.7` / `kiro-o-4.8` 等过时条目。
+- 网关监听端口被占用时快速失败，托盘 / CLI 给出可操作的中文提示（不自动换端口）。
+
+**Changed**
+- docker-compose 镜像 pin 至 `ghcr.io/zhujunsan/kiro-gateway:main-cc41c09`。
+- Sentry 过滤环境噪声与预期上游反馈：端口占用（EADDRINUSE）、客户端取消断开、`INVALID_MODEL_ID`、以及重复的 uvicorn「Application startup failed」日志；保留账户初始化失败与首 token 超时等可行动 Issue。
+- cloudflared 子进程日志强制 UTF-8 解码（修复 Windows GBK 下解码失败导致读线程退出）。
+
+**Fixed**
+- 网关子进程绑端口失败后立即退出时，健康等待不再空耗满超时；启动/重启在端口仍被占用时抛出明确错误并保留菜单异常状态。
+
 ## v0.4.15 (2026-07-24)
 
 **Changed**

@@ -378,7 +378,18 @@ class TrayApp:
 
     def _gateway_title(self) -> str:
         s = self.sup.status()
-        return f"{_GATEWAY_PREFIX} 本地 Kiro Gateway\t{_STATUS_ZH.get(s['gateway'], s['gateway'])}"
+        gw = s["gateway"]
+        label = _STATUS_ZH.get(gw, gw)
+        if gw == "error":
+            detail = (s.get("error") or "").strip()
+            if "端口" in detail and "占用" in detail:
+                # Keep the menu line short; full text goes to the system notify.
+                try:
+                    port = appconfig.load(use_cache=True).gateway.port
+                except Exception:
+                    port = None
+                label = f"异常（端口 {port} 占用）" if port else "异常（端口占用）"
+        return f"{_GATEWAY_PREFIX} 本地 Kiro Gateway\t{label}"
 
     def _tunnel_title(self) -> str:
         s = self.sup.status()
@@ -910,13 +921,17 @@ class TrayApp:
         def _work():
             try:
                 if restarting:
-                    self.sup.restart()
+                    ok = self.sup.restart()
                     verb = "已重启"
                 else:
-                    self.sup.start()
+                    ok = self.sup.start()
                     verb = "已启动"
                 cfg = appconfig.load()
-                self._notify(APP_NAME, f"{verb}\n{_tunnel_url(cfg)}")
+                if ok:
+                    self._notify(APP_NAME, f"{verb}\n{_tunnel_url(cfg)}")
+                else:
+                    detail = self.sup.last_error or "网关未能就绪，请查看日志目录。"
+                    self._notify(f"{APP_NAME} 错误", detail)
             except Exception as e:
                 self._notify(f"{APP_NAME} 错误", str(e)[:200])
             # Never call icon.update_menu() here — worker thread; see _request_redraw.
@@ -1365,7 +1380,10 @@ class TrayApp:
                 if pending_secret is not None:
                     cfg_reg = appconfig.load()
                     self.sup.register(cfg_reg, pending_secret)
-                self.sup.start()
+                ok = self.sup.start()
+                if not ok:
+                    detail = self.sup.last_error or "网关未能启动，请查看日志目录。"
+                    self._notify(f"{APP_NAME} 错误", detail)
             except Exception as e:
                 print(f"[kiro-gateway-tray startup error] {e}", file=sys.stderr)
                 logger.exception("supervisor start failed")

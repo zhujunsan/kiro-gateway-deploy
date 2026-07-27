@@ -61,10 +61,15 @@ def run() -> int:
     print("  启动中...")
 
     try:
-        sup.start()
+        ok = sup.start()
     except Exception as e:
         print(f"  启动失败: {e}", file=sys.stderr)
         logger.exception("CLI supervisor start failed")
+        return 1
+    if not ok:
+        detail = sup.last_error or "网关未能就绪"
+        print(f"  启动失败: {detail}", file=sys.stderr)
+        logger.error("CLI supervisor start returned unhealthy: {}", detail)
         return 1
 
     cfg = appconfig.load()  # reload after potential provision

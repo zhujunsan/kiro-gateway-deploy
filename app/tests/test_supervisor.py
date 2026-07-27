@@ -25,6 +25,8 @@ def _make_sup(monkeypatch, tmp_path, provisioned=True):
         appconfig.save(cfg)
     s = supervisor.Supervisor(gateway=_FakeGateway(), tunnel=_FakeTunnel())
     monkeypatch.setattr(s, "_wait_healthy", lambda timeout=30: True)
+    # Unit tests don't occupy the real gateway port; keep the preflight green.
+    monkeypatch.setattr(supervisor.gateway, "wait_port_free", lambda *a, **k: True)
     return s
 
 
@@ -85,6 +87,7 @@ def test_persisted_secret_enables_port_sync_across_restart(monkeypatch, tmp_path
 
     s = supervisor.Supervisor(gateway=_FakeGateway(), tunnel=_FakeTunnel())
     monkeypatch.setattr(s, "_wait_healthy", lambda timeout=30: True)
+    monkeypatch.setattr(supervisor.gateway, "wait_port_free", lambda *a, **k: True)
 
     calls = {"update_port": 0}
     import kiro_gateway_tray.provision as pmod
@@ -113,6 +116,7 @@ def test_port_sync_skipped_without_secret(monkeypatch, tmp_path, capsys):
 
     s = supervisor.Supervisor(gateway=_FakeGateway(), tunnel=_FakeTunnel())
     monkeypatch.setattr(s, "_wait_healthy", lambda timeout=30: True)
+    monkeypatch.setattr(supervisor.gateway, "wait_port_free", lambda *a, **k: True)
     s.start()
     err = capsys.readouterr().err
     assert "无法同步" in err
@@ -275,9 +279,9 @@ def test_restart_waits_for_port_before_start(monkeypatch, tmp_path):
     assert order.index(f"wait:{s._get_cfg().gateway.port}") < order.index("start")
 
 
-def test_restart_starts_even_if_port_stays_busy(monkeypatch, tmp_path, capsys):
-    # A wedged external listener must not wedge restart forever: on port-free
-    # timeout we warn and start anyway (the health probe surfaces any failure).
+def test_restart_raises_when_port_stays_busy(monkeypatch, tmp_path):
+    # External listener still holding the port after stop: fail fast with
+    # PortBusyError instead of spawning a child that cannot bind.
     s = _make_sup(monkeypatch, tmp_path)
     s.start()
 
@@ -285,8 +289,61 @@ def test_restart_starts_even_if_port_stays_busy(monkeypatch, tmp_path, capsys):
     started = {"n": 0}
     monkeypatch.setattr(s, "start", lambda: started.__setitem__("n", started["n"] + 1) or True)
 
-    s.restart()
-    assert started["n"] == 1
+    try:
+        s.restart()
+        assert False, "expected PortBusyError"
+    except supervisor.gateway.PortBusyError as e:
+        assert e.port == s._get_cfg().gateway.port
+        assert "占用" in str(e)
+    assert started["n"] == 0
+    assert s.status()["gateway"] == "error"
+    assert "占用" in (s.last_error or "")
+
+
+def test_start_raises_when_port_busy(monkeypatch, tmp_path):
+    s = _make_sup(monkeypatch, tmp_path)
+    monkeypatch.setattr(supervisor.gateway, "wait_port_free", lambda port, **k: False)
+
+    try:
+        s.start()
+        assert False, "expected PortBusyError"
+    except supervisor.gateway.PortBusyError as e:
+        assert "64005" in str(e) or str(e.port) in str(e)
+    assert s.gateway.is_alive() is False
+    assert s.status()["gateway"] == "error"
+    assert "端口" in (s.last_error or "")
+
+
+def test_start_sets_error_when_health_fails(monkeypatch, tmp_path):
+    s = _make_sup(monkeypatch, tmp_path)
+    monkeypatch.setattr(s, "_wait_healthy", lambda timeout=30: False)
+    monkeypatch.setattr(
+        s,
+        "_diagnose_start_failure",
+        lambda cfg: "网关未能在时限内就绪（健康检查失败）。请查看日志目录或尝试重新启动。",
+    )
+
+    ok = s.start()
+    assert ok is False
+    assert s.status()["gateway"] == "error"
+    assert "健康检查" in (s.last_error or "")
+
+
+def test_wait_healthy_fails_fast_when_process_dead(monkeypatch, tmp_path):
+    # Dead child + failed /health must return False immediately, not burn the
+    # full 30s timeout (bind failures exit uvicorn at once).
+    monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
+    cfg = appconfig.load()
+    cfg.cloudflare.hostname = "kg-test.example.com"
+    cfg.cloudflare.run_token = "eyJ_test"
+    appconfig.save(cfg)
+    s = supervisor.Supervisor(gateway=_FakeGateway(), tunnel=_FakeTunnel())
+    s.gateway.started = False
+    monkeypatch.setattr(s, "_probe_gateway_once", lambda timeout=1: False)
+
+    t0 = time.monotonic()
+    assert s._wait_healthy(timeout=30) is False
+    assert time.monotonic() - t0 < 2.0
 
 
 def test_reprovision_if_deleted_exists_true(monkeypatch, tmp_path):
@@ -430,6 +487,7 @@ def test_startup_sync_persists_changed_telemetry_secret(monkeypatch, tmp_path):
     appconfig.save(cfg)
     s = supervisor.Supervisor(gateway=_FakeGateway(), tunnel=_FakeTunnel())
     monkeypatch.setattr(s, "_wait_healthy", lambda timeout=30: True)
+    monkeypatch.setattr(supervisor.gateway, "wait_port_free", lambda *a, **k: True)
     import kiro_gateway_tray.provision as provision
     monkeypatch.setattr(provision, "_get_username", lambda _cfg: "user")
     monkeypatch.setattr(

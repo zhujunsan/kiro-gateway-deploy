@@ -170,6 +170,34 @@ class GatewayProcess:
         return bool(self._proc and self._proc.poll() is None)
 
 
+class PortBusyError(RuntimeError):
+    """Raised when the configured gateway listen port cannot be bound.
+
+    The gateway port is fixed for Worker/tunnel ingress (default 64005); we never
+    auto-pick another port. Callers should fail fast and show
+    ``format_port_busy_message`` to the user.
+    """
+
+    def __init__(self, port: int) -> None:
+        self.port = int(port)
+        super().__init__(format_port_busy_message(self.port))
+
+
+def format_port_busy_message(port: int) -> str:
+    """User-facing Chinese message when ``port`` is already in use.
+
+    Args:
+        port: Gateway listen port that could not be bound.
+
+    Returns:
+        Actionable error text for tray notifications / CLI stderr.
+    """
+    return (
+        f"本机端口 {int(port)} 已被占用，网关未能启动。"
+        "请关闭占用该端口的进程后，在托盘菜单中重新启动；或重启托盘应用。"
+    )
+
+
 def wait_port_free(
     port: int,
     host: str = "127.0.0.1",
@@ -183,19 +211,19 @@ def wait_port_free(
     Used between stop() and start() on restart: the OS may keep the listening
     socket around briefly after the child dies, and a new uvicorn binding the
     same port too soon would fail. We probe by attempting a bind (matching how
-    asyncio/uvicorn bind, see _can_bind) rather than connecting, so we don't
+    asyncio/uvicorn bind, see can_bind) rather than connecting, so we don't
     depend on anything still answering.
     """
     deadline = time.monotonic() + timeout
     while True:
-        if _can_bind(host, port):
+        if can_bind(host, port):
             return True
         if time.monotonic() >= deadline:
             return False
         time.sleep(interval)
 
 
-def _can_bind(host: str, port: int) -> bool:
+def can_bind(host: str, port: int) -> bool:
     """True if a TCP listener can currently bind ``host:port``.
 
     We mirror asyncio/uvicorn's bind options: SO_REUSEADDR is set on
@@ -212,6 +240,10 @@ def _can_bind(host: str, port: int) -> bool:
             return True
         except OSError:
             return False
+
+
+# Back-compat alias for older call sites / tests.
+_can_bind = can_bind
 
 
 def _setup_child_logging() -> None:
