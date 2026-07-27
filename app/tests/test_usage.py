@@ -54,33 +54,33 @@ def test_split_models_for_menu_pairs_aliases_and_keeps_native_models():
         "auto",
         "claude-haiku-4.5",
         "claude-opus-4.6",
-        "claude-sonnet-4.6",
+        "claude-sonnet-5",
         "deepseek-3.2",
         "gpt-5.6-sol",
         "gpt-5.6-terra",
         "kiro-deepseek-3.2",
         "kiro-h-4.5",
         "kiro-o-4.6",
-        "kiro-s-4.6",
+        "kiro-s-5",
     ])
     aliases = {
         "kiro-h-4.5": "claude-haiku-4.5",
         "kiro-o-4.6": "claude-opus-4.6",
-        "kiro-s-4.6": "claude-sonnet-4.6",
+        "kiro-s-5": "claude-sonnet-5",
         "kiro-deepseek-3.2": "deepseek-3.2",
     }
     canonical, alias_list = usage.split_models_for_menu(ids, aliases=aliases)
     assert alias_list == [
         "kiro-h-4.5",
         "kiro-o-4.6",
-        "kiro-s-4.6",
+        "kiro-s-5",
         "kiro-deepseek-3.2",
     ]
     assert canonical == [
         "auto",
         "claude-haiku-4.5",
         "claude-opus-4.6",
-        "claude-sonnet-4.6",
+        "claude-sonnet-5",
         "deepseek-3.2",
         "gpt-5.6-sol",
         "gpt-5.6-terra",
@@ -93,3 +93,34 @@ def test_split_models_for_menu_unpaired_real_appended():
     canonical, alias_list = usage.split_models_for_menu(ids, aliases=aliases)
     assert canonical == ["claude-haiku-4.5", "mystery-model"]
     assert alias_list == ["kiro-h-4.5"]
+
+
+def test_split_models_for_menu_pairs_opus_5_via_generate_alias(monkeypatch):
+    """Newly discovered models pair via generate_model_alias without static table."""
+    import sys
+    import types
+
+    fake_aliases = types.ModuleType("kiro.model_aliases")
+
+    def generate_model_alias(model_id: str):
+        mapping = {
+            "claude-opus-5": "kiro-o-5",
+            "claude-haiku-4.5": "kiro-h-4.5",
+        }
+        return mapping.get(model_id)
+
+    fake_aliases.generate_model_alias = generate_model_alias  # type: ignore[attr-defined]
+    fake_kiro = types.ModuleType("kiro")
+    fake_kiro.model_aliases = fake_aliases  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "kiro", fake_kiro)
+    monkeypatch.setitem(sys.modules, "kiro.model_aliases", fake_aliases)
+
+    ids = [
+        "claude-haiku-4.5",
+        "claude-opus-5",
+        "kiro-h-4.5",
+        "kiro-o-5",
+    ]
+    canonical, alias_list = usage.split_models_for_menu(ids, aliases={})
+    assert canonical == ["claude-haiku-4.5", "claude-opus-5"]
+    assert alias_list == ["kiro-h-4.5", "kiro-o-5"]

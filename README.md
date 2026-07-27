@@ -72,22 +72,20 @@ Cursor 支持自定义 OpenAI 兼容的 API 地址，但有几个坑：
 
 直接使用真实模型名（无需 alias，也无需在 Cursor 手动增加 model name）：`auto`、`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`。
 
-需要手动添加的别名：
+需要手动添加的别名（网关会按可用模型自动生成；下表为当前常见集合）：
 
 | 别名 | 实际模型 |
 |---|---|
-| `kiro-o-4.8` | `claude-opus-4.8` |
-| `kiro-o-4.7` | `claude-opus-4.7` |
+| `kiro-o-5` | `claude-opus-5` |
 | `kiro-o-4.6` | `claude-opus-4.6` |
 | `kiro-s-5` | `claude-sonnet-5` |
-| `kiro-s-4.6` | `claude-sonnet-4.6` |
 | `kiro-h-4.5` | `claude-haiku-4.5` |
 | `kiro-deepseek-3.2` | `deepseek-3.2` |
 | `kiro-glm-5` | `glm-5` |
 | `kiro-minimax-m2.5` | `minimax-m2.5` |
 | `kiro-qwen3-coder-next` | `qwen3-coder-next` |
 
-要修改别名，编辑 fork（[`zhujunsan/kiro-gateway`](https://github.com/zhujunsan/kiro-gateway)）`kiro/config.py` 里的 `MODEL_ALIASES`，推送后 CI 产出新镜像 tag。
+别名由上游 `generate_model_alias` 规则自动生成（`claude-opus|sonnet|haiku-*` → `kiro-o|s|h-*`，其它 → `kiro-{id}`）。改规则见 fork（[`zhujunsan/kiro-gateway`](https://github.com/zhujunsan/kiro-gateway)）`kiro/model_aliases.py`，推送后 CI 产出新镜像 tag。
 
 ## 查额度（`GET /usage`）
 

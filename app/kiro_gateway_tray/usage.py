@@ -97,6 +97,11 @@ def split_models_for_menu(
     - Native ``auto`` has no alias and is pinned first in the canonical block.
     - Alias entries follow the same order as their paired canonical rows.
     - Other models with no menu alias appear at the end of the canonical list.
+
+    When ``aliases`` is omitted, the static ``MODEL_ALIASES`` table is loaded
+    and then augmented with ``generate_model_alias`` for every canonical ID in
+    ``ids`` so newly discovered models (e.g. ``claude-opus-5`` → ``kiro-o-5``)
+    pair correctly even before the static table is republished.
     """
     if aliases is None:
         try:
@@ -105,6 +110,21 @@ def split_models_for_menu(
             aliases = {}
 
     alias_to_real = dict(aliases or {})
+    # Augment with auto-generated aliases for canonical IDs present in the list.
+    try:
+        from kiro.model_aliases import generate_model_alias  # type: ignore
+    except ImportError:
+        generate_model_alias = None  # type: ignore[assignment]
+
+    if generate_model_alias is not None:
+        for mid in ids:
+            # Skip names that are already known aliases.
+            if mid in alias_to_real:
+                continue
+            generated = generate_model_alias(mid)
+            if generated:
+                alias_to_real.setdefault(generated, mid)
+
     real_to_alias = {real: alias for alias, real in alias_to_real.items()}
     id_set = set(ids)
 
@@ -123,6 +143,8 @@ def split_models_for_menu(
     unpaired: list[str] = []
     for real in order:
         alias = real_to_alias.get(real)
+        if alias is None and generate_model_alias is not None:
+            alias = generate_model_alias(real)
         alias_present = bool(alias and alias in id_set)
         real_present = real in id_set
         if not real_present and not alias_present:
