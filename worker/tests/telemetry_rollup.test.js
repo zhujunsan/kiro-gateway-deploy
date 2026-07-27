@@ -40,13 +40,16 @@ function normalizeRollupRow(row, receivedAt) {
   const bucketSeconds = toInt(row.bucket_seconds, -1);
   if (bucketStart < 0 || bucketSeconds <= 0) return null;
 
+  const requests = toInt(row.requests);
+  if (requests <= 0) return null;
+
   return [
     bucketStart,
     bucketSeconds,
     username,
     model,
     appVersion,
-    toInt(row.requests),
+    requests,
     toInt(row.successes),
     toInt(row.errors),
     toInt(row.prompt_tokens_sum),
@@ -99,6 +102,7 @@ describe("normalizeRollupRow credit fields", () => {
       username: "abc123def456",
       model: "m",
       app_version: "v",
+      requests: 1,
       estimated_credits: 0,
       credit_estimate_segments: 1,
       credit_estimate_missing_segments: 0,
@@ -115,6 +119,7 @@ describe("normalizeRollupRow credit fields", () => {
       username: "abc123def456",
       model: "m",
       app_version: "v",
+      requests: 1,
       estimated_credits: 12.5,
       credit_estimate_segments: 2,
       credit_estimate_missing_segments: 1,
@@ -127,12 +132,33 @@ describe("normalizeRollupRow credit fields", () => {
   it("invalid / negative credits become null", () => {
     assert.equal(normalizeRollupRow({
       bucket_start: 1, bucket_seconds: 600, username: "abc123def456",
-      model: "m", app_version: "v", estimated_credits: -3,
+      model: "m", app_version: "v", requests: 1, estimated_credits: -3,
     }, 1)[18], null);
     assert.equal(normalizeRollupRow({
       bucket_start: 1, bucket_seconds: 600, username: "abc123def456",
-      model: "m", app_version: "v", estimated_credits: "NaN",
+      model: "m", app_version: "v", requests: 1, estimated_credits: "NaN",
     }, 1)[18], null);
+  });
+
+  it("rejects idle zero-request buckets", () => {
+    assert.equal(normalizeRollupRow({
+      bucket_start: 1200,
+      bucket_seconds: 600,
+      username: "abc123def456",
+      model: "m",
+      app_version: "v",
+      requests: 0,
+      estimated_credits: 12.5,
+    }, 1), null);
+    assert.equal(normalizeRollupRow({
+      bucket_start: 1200,
+      bucket_seconds: 600,
+      username: "abc123def456",
+      model: "m",
+      app_version: "v",
+      // omitted requests → 0
+      estimated_credits: 1,
+    }, 1), null);
   });
 });
 
@@ -144,6 +170,7 @@ describe("normalizeRollupRow latency fields", () => {
       username: "abc123def456",
       model: "m",
       app_version: "v",
+      requests: 1,
       ttft_ms_sum: 2500,
       ttft_count: 5,
       generation_ms_sum: 10000,

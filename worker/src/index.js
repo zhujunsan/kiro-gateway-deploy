@@ -327,13 +327,19 @@ function normalizeRollupRow(row, receivedAt) {
   const bucketSeconds = toInt(row.bucket_seconds, -1);
   if (bucketStart < 0 || bucketSeconds <= 0) return null;
 
+  // Idle Credit checkpoints can open a bucket with requests == 0. Those rows
+  // inflate active-user counts and waste D1 storage; reject them at ingest
+  // (client also filters, but older builds may still upload).
+  const requests = toInt(row.requests);
+  if (requests <= 0) return null;
+
   return [
     bucketStart,
     bucketSeconds,
     username,
     model,
     appVersion,
-    toInt(row.requests),
+    requests,
     toInt(row.successes),
     toInt(row.errors),
     toInt(row.prompt_tokens_sum),
