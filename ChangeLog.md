@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.4.17 (2026-07-27)
+
+**Changed**
+- 同步上游网关至 `main-5f9533b`：流已启动后 first-token 失败不再 re-raise（TRAY-M），改为流内 SSE error 结束；`classify_streaming_exception` 将 HTTPException 504 /「did not respond within」正确归为 `network/first_token_timeout`（TRAY-K）。
+- docker-compose 镜像 pin 至 `ghcr.io/zhujunsan/kiro-gateway:main-5f9533b`。
+
 ## v0.4.16 (2026-07-27)
 
 **New**
