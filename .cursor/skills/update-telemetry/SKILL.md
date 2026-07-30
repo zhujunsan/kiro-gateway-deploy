@@ -48,24 +48,32 @@ Agent 会话里 **默认用 Sentry MCP**，不要依赖、也不要要求用户�
 
 Token 文件路径仅作 **CI/无头脚本** 可选增强：有则 `refresh.py` 会跑 `sentry_errors.py`；Agent 仍应以 MCP 结果为准做最终报告（MCP 可补细节与根因）。
 
-### 3. 更新 `usage-observations.md`
+### 3. 加速：先跑 `update_observations.py`，再手补
 
-优先从 `report-latest.json` 取数（辅以 `report-latest.md`、CF/Sentry 报告）。必改：
+```bash
+python3 update_observations.py
+# 可选：--dry-run / --md-only / --canvas-only
+```
+
+脚本从 `report-latest.json` + CF/Sentry 报告自动：
+
+- 补丁 `usage-observations.md` 累计/自然日/版本表，并写入 `BEGIN/END AUTO OBSERVATIONS` 草稿
+- 同步 canvas `usage-observations.canvas.tsx` 的 `BEGIN/END AUTO-GENERATED DATA` 常量（成本三图保持「不含过路费 Gateway vs Cursor Teams」；月估算默认近 **7** 个完整 UTC 自然日，并写 `MONTHLY_14` 对照）
+
+然后 Agent **手补**定性部分（必做）：
 
 | 位置 | 说明 |
 |---|---|
-| 一、累计概览趋势 | 追加一行：北京观测时刻 + UTC 截至 + 用户/请求/成功率/token |
-| 二、按自然日 | 历史日定稿；当天行用 rollup，备注「进行中」 |
-| 二·补、每日汇总 | 成功率、人均；更新观察 bullets（含 CF + **Sentry MCP**） |
-| 二·补·二、版本错误率 | 全量表 + 请求 ≥ 50 表（不排除用户）；版本号用语义排序 |
-| 二·补·三、TTFT/Credit | 累计与按日；成本对比表 |
-| 三、核心结论 | 滚动改写 |
+| 二·补 观察 bullets | 用 AUTO 草稿改写；含 CF + **Sentry MCP** 要点 |
+| 二·补·二 解读 / 二·补·三 | 核对 AUTO 数字已进正文；补一句解读 |
+| 三、核心结论 | 滚动改写（勿留过期数字） |
+| canvas Callout | 确认 `AUTO_META.callout` 合理 |
 
-版本列必须用「最近活跃桶」的 `app_version`，禁止 `MAX(app_version)`。
+版本列必须用「最近活跃桶」的 `app_version`，禁止 `MAX(app_version)`。活跃人数口径：`requests>0`。
 
 ### 4. 回复用户
 
-中文、简洁：观测时刻、累计、当日/进行中、CF 事故数、Sentry 要点（含 Issue 短 ID）、版本稳定性一句。
+中文、简洁：观测时刻、累计、当日/进行中、CF 事故数、Sentry 要点（含 Issue 短 ID）、版本稳定性一句；并提一句「已跑 update_observations.py」。
 
 ## 禁止事项
 

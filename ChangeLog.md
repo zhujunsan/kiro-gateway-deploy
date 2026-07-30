@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.4.20 (2026-07-30)
+
+**Fixed**
+- 修复 Kiro 同 `toolUseId` 空参数幽灵 `tool_use` 被转发给 Anthropic 客户端（如 Claude Code）的问题：真实 Edit 成功后不再出现第二轮空参数调用导致的 `Error editing file` / `Invalid tool parameters` 假失败；OpenAI 流式同步按 id 去重。
+
+**Changed**
+- 同步上游网关至 `main-6e0e11a`；docker-compose 镜像 pin 至 `ghcr.io/zhujunsan/kiro-gateway:main-6e0e11a`。
+- 更新本地遥测观测 skill：优先跑 `update_observations.py` 自动补丁，再手补定性结论。
+
 ## v0.4.19 (2026-07-27)
 
 **Fixed**
