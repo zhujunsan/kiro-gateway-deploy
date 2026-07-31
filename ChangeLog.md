@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.4.21 (2026-07-31)
+
+**Fixed**
+- 修复 OpenAI 流式路径（`/v1/chat/completions`）工具调用参数被清空的严重回归：v0.4.20 的幽灵 `tool_use` 去重只在 `tool_start` 处按 id 拦截，但没有在 `tool_stop` 时清理流状态，Kiro 幽灵那轮复用同一 `toolUseId` 的 `{}` 增量仍会被追加到已完成调用的参数尾部，客户端拿到 `{"command":"ls"}{}` 解析失败后退化成空参数——Cursor 表现为满屏空的 `Ran command`，且空调用写回会话历史后会诱导模型继续生成空调用。Anthropic 与 Responses 路径本就在 `tool_stop` 处清理，不受影响。
+
+**Changed**
+- 同步上游网关至 `main-d5c076c`；docker-compose 镜像 pin 至 `ghcr.io/zhujunsan/kiro-gateway:main-d5c076c`。
+
 ## v0.4.20 (2026-07-30)
 
 **Fixed**
