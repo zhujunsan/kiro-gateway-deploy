@@ -38,6 +38,7 @@ _TIMER_ID = 0x4B470001  # 'KG\x00\x01'
 
 def install_open_refresh(
     *,
+    icon=None,
     on_will_open: _WillOpen | None = None,
     on_did_close: _DidClose | None = None,
     on_tick: _Tick | None = None,
@@ -55,9 +56,11 @@ def install_open_refresh(
     _hooks["tick"] = on_tick
     _tick_interval_ms = max(250, int(float(tick_interval) * 1000))
     if _installed:
+        if sys.platform == "win32":
+            _bind_win32_notify_handler(icon)
         return
     if sys.platform == "win32":
-        ok = _install_win32()
+        ok = _install_win32(icon)
     else:
         ok = _install_linux()
     _installed = bool(ok)
@@ -76,6 +79,7 @@ def sync_rebuild_menu(icon) -> None:
     try:
         if sys.platform == "win32":
             icon.update_menu()
+            _apply_win32_no_check_style(icon)
             return
         create = getattr(icon, "_create_menu", None)
         if create is None:
@@ -212,7 +216,81 @@ def _stop_tick() -> None:
 
 # --- Win32 ------------------------------------------------------------------
 
-def _install_win32() -> bool:
+def _apply_win32_no_check_style(icon) -> None:
+    """Remove Win32's unused check-mark gutter from all tray menu levels.
+
+    Native popup menus reserve a left column for checks/bitmaps by default.
+    None of this tray's items use that column, so ``MNS_NOCHECK`` makes the
+    text align with the compact layout used on macOS. The style must be
+    re-applied after every pystray rebuild because that creates a new HMENU.
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        handle = getattr(icon, "_menu_handle", None)
+        if not handle or not handle[0]:
+            return
+        hmenu = handle[0]
+
+        class _MENUINFO(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.DWORD),
+                ("fMask", wintypes.DWORD),
+                ("dwStyle", wintypes.DWORD),
+                ("cyMax", wintypes.UINT),
+                ("hbrBack", wintypes.HBRUSH),
+                ("dwContextHelpID", wintypes.DWORD),
+                ("dwMenuData", ctypes.c_size_t),
+            ]
+
+        MIM_STYLE = 0x00000010
+        MIM_APPLYTOSUBMENUS = 0x80000000
+        MNS_NOCHECK = 0x80000000
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        get_menu_info = user32.GetMenuInfo
+        get_menu_info.argtypes = [wintypes.HMENU, ctypes.POINTER(_MENUINFO)]
+        get_menu_info.restype = wintypes.BOOL
+        set_menu_info = user32.SetMenuInfo
+        set_menu_info.argtypes = [wintypes.HMENU, ctypes.POINTER(_MENUINFO)]
+        set_menu_info.restype = wintypes.BOOL
+
+        info = _MENUINFO(
+            cbSize=ctypes.sizeof(_MENUINFO),
+            fMask=MIM_STYLE,
+        )
+        if not get_menu_info(hmenu, ctypes.byref(info)):
+            return
+        info.fMask = MIM_STYLE | MIM_APPLYTOSUBMENUS
+        info.dwStyle |= MNS_NOCHECK
+        set_menu_info(hmenu, ctypes.byref(info))
+    except Exception:
+        # Cosmetic only: a platform/API mismatch must not block the menu.
+        pass
+
+
+def _bind_win32_notify_handler(icon) -> None:
+    """Point an existing pystray icon at the patched notify handler.
+
+    ``pystray._win32.Icon.__init__`` stores a bound ``_on_notify`` method in
+    ``_message_handlers``. Replacing the class method after the icon has been
+    constructed therefore does not affect real message dispatch unless that
+    cached entry is rebound too.
+    """
+    if icon is None:
+        return
+    try:
+        from pystray._util import win32 as win32_util
+
+        handlers = getattr(icon, "_message_handlers", None)
+        if isinstance(handlers, dict):
+            handlers[win32_util.WM_NOTIFY] = icon._on_notify
+    except Exception:
+        pass
+
+
+def _install_win32(icon=None) -> bool:
     global _active_icon
     try:
         from pystray import _win32
@@ -235,6 +313,7 @@ def _install_win32() -> bool:
         return orig(self, wparam, lparam)
 
     _win32.Icon._on_notify = _patched
+    _bind_win32_notify_handler(icon)
     return True
 
 

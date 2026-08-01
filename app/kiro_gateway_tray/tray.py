@@ -1406,6 +1406,7 @@ class TrayApp:
             tick_interval=1.0,
         )
         tray_live.install_open_refresh(
+            icon=self._icon,
             on_will_open=self._on_non_macos_menu_will_open,
             on_did_close=self._on_non_macos_menu_did_close,
             on_tick=self._on_non_macos_menu_tick,

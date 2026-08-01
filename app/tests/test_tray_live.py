@@ -46,12 +46,17 @@ def test_install_win32_wraps_notify_and_fires_hooks(monkeypatch):
     class _FakeWin32Util:
         WM_LBUTTONUP = 0x0202
         WM_RBUTTONUP = 0x0205
+        WM_NOTIFY = 0x0400
 
     class _FakeIcon:
         def __init__(self):
             self._menu_handle = ("hmenu", [])
             self._hwnd = 1
-            self._message_handlers = {}
+            # Match pystray: Icon.__init__ caches the then-current bound
+            # method. The production hook is installed after construction.
+            self._message_handlers = {
+                _FakeWin32Util.WM_NOTIFY: self._on_notify,
+            }
             self.calls = []
 
         def _on_notify(self, wparam, lparam):
@@ -73,21 +78,31 @@ def test_install_win32_wraps_notify_and_fires_hooks(monkeypatch):
     monkeypatch.setitem(sys.modules, "pystray._util.win32", fake_util)
     util_mod.win32 = fake_util
 
+    icon = _FakeIcon()
+    cached_before_install = icon._message_handlers[_FakeWin32Util.WM_NOTIFY]
+
     tray_live.install_open_refresh(
+        icon=icon,
         on_will_open=lambda: events.append("open"),
         on_did_close=lambda: events.append("close"),
         on_tick=lambda: events.append("tick"),
     )
     assert tray_live._installed is True
+    assert icon._message_handlers[_FakeWin32Util.WM_NOTIFY] != cached_before_install
 
-    icon = _FakeIcon()
-    _FakeIcon._on_notify(icon, 0, _FakeWin32Util.WM_RBUTTONUP)
+    # Exercise the same cached message table used by pystray's real WndProc,
+    # rather than calling the monkey-patched class method directly.
+    icon._message_handlers[_FakeWin32Util.WM_NOTIFY](
+        0, _FakeWin32Util.WM_RBUTTONUP
+    )
     assert events == ["open", "close"]
     assert icon.calls == [_FakeWin32Util.WM_RBUTTONUP]
 
     events.clear()
     icon.calls.clear()
-    _FakeIcon._on_notify(icon, 0, _FakeWin32Util.WM_LBUTTONUP)
+    icon._message_handlers[_FakeWin32Util.WM_NOTIFY](
+        0, _FakeWin32Util.WM_LBUTTONUP
+    )
     assert events == []
     assert icon.calls == [_FakeWin32Util.WM_LBUTTONUP]
 
@@ -141,6 +156,10 @@ def test_sync_rebuild_menu_win32_calls_update_menu(monkeypatch):
     from kiro_gateway_tray import tray_live
 
     monkeypatch.setattr(tray_live.sys, "platform", "win32")
+    styled = []
+    monkeypatch.setattr(
+        tray_live, "_apply_win32_no_check_style", lambda icon: styled.append(icon)
+    )
 
     class _Icon:
         def __init__(self):
@@ -152,6 +171,58 @@ def test_sync_rebuild_menu_win32_calls_update_menu(monkeypatch):
     icon = _Icon()
     tray_live.sync_rebuild_menu(icon)
     assert icon.n == 1
+    assert styled == [icon]
+
+
+def test_apply_win32_no_check_style_preserves_other_styles(monkeypatch):
+    import ctypes
+
+    from kiro_gateway_tray import tray_live
+
+    captured = {}
+
+    class _FakeFunction:
+        def __init__(self, impl):
+            self.impl = impl
+            self.argtypes = None
+            self.restype = None
+
+        def __call__(self, *args):
+            return self.impl(*args)
+
+    def _get_menu_info(hmenu, info_ptr):
+        captured["get_hmenu"] = hmenu
+        info_ptr._obj.dwStyle = 0x20
+        return 1
+
+    def _set_menu_info(hmenu, info_ptr):
+        captured["set_hmenu"] = hmenu
+        captured["mask"] = info_ptr._obj.fMask
+        captured["style"] = info_ptr._obj.dwStyle
+        return 1
+
+    class _FakeUser32:
+        GetMenuInfo = _FakeFunction(_get_menu_info)
+        SetMenuInfo = _FakeFunction(_set_menu_info)
+
+    monkeypatch.setattr(
+        ctypes,
+        "WinDLL",
+        lambda name, use_last_error=True: _FakeUser32(),
+        raising=False,
+    )
+
+    class _Icon:
+        _menu_handle = (0x1234, [])
+
+    tray_live._apply_win32_no_check_style(_Icon())
+
+    assert captured == {
+        "get_hmenu": 0x1234,
+        "set_hmenu": 0x1234,
+        "mask": 0x80000010,  # MIM_APPLYTOSUBMENUS | MIM_STYLE
+        "style": 0x80000020,  # existing style | MNS_NOCHECK
+    }
 
 
 def test_sync_rebuild_menu_gtk_creates_synchronously(monkeypatch):
