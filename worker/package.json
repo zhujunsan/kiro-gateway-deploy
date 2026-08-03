@@ -1,0 +1,10 @@
+{
+  "name": "kiro-provision-worker",
+  "private": true,
+  "type": "module",
+  "description": "Cloudflare Worker: tunnel provisioning + usage telemetry + announcements. No runtime dependencies.",
+  "scripts": {
+    "test": "node --test",
+    "deploy": "wrangler deploy"
+  }
+}

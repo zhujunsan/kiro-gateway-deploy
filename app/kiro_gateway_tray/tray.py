@@ -11,6 +11,7 @@ from typing import Callable
 from . import (
     __version__,
     GITHUB_REPO,
+    announcements,
     appconfig,
     autostart,
     dialogs,
@@ -53,6 +54,10 @@ _ACTIVITY_EMPTY_SLOT_TITLE = "暂无进行中的对话"
 _ACTIVITY_SPARE_SLOT_TITLE = ""
 _GATEWAY_PREFIX = "🖥 网关:"
 _TUNNEL_PREFIX = "🌐 隧道:"
+# Fixed announcement rows reserved between the update notice and the status
+# block. pystray builds the menu once, so the slots must exist up front; each
+# one hides itself when there is no announcement to put in it.
+_ANNOUNCEMENT_SLOTS = announcements.MAX_ITEMS
 
 
 def _local_url(cfg) -> str:
@@ -250,6 +255,7 @@ class TrayApp:
 
     _PROBE_MIN_INTERVAL = 2.0  # seconds between on-open health probes
     _USAGE_REFRESH_INTERVAL = 60  # seconds between background usage refreshes
+    _ANNOUNCEMENT_REFRESH_INTERVAL = 3600  # seconds between announcement polls
     # Poll the activity file often enough to notice start/finish; do NOT redraw
     # on this cadence just to tick elapsed time (see _on_activity_update).
     _ACTIVITY_REFRESH_INTERVAL = 3.0
@@ -283,6 +289,9 @@ class TrayApp:
         self._update_info = None
         self._update_gate = _ThrottleGate()
         self._probe_gate = _ThrottleGate(min_interval=self._PROBE_MIN_INTERVAL)
+        self._announcements: list[announcements.Announcement] = []
+        self._announcements_loaded = False
+        self._announcement_gate = _ThrottleGate()
         self._usage_refresh_stop = threading.Event()
         # Windows-only: auto-adapt the tray icon to the taskbar light/dark
         # theme. Constructed in run(); start() is a no-op off Windows.
@@ -1230,6 +1239,94 @@ class TrayApp:
         info = self._update_info
         return f"🔔 有新版本 {info.latest}，点击下载" if info else ""
 
+    # --- announcements ---
+    #
+    # The menu is built once with _ANNOUNCEMENT_SLOTS rows; each row binds to a
+    # fixed index and resolves its own content at render time. Empty indices
+    # report visible=False, and pystray collapses the surrounding separators, so
+    # a user with no announcements sees the menu exactly as before.
+
+    def _ensure_announcements_sync(self) -> None:
+        """Apply cached announcements immediately (no network).
+
+        Reads the disk cache at most once per process; after that the background
+        poll keeps ``_announcements`` current in memory.
+        """
+        if self._announcements_loaded:
+            return
+        self._announcements_loaded = True
+        try:
+            self._announcements = announcements.peek_cached()
+        except Exception:
+            logger.debug("announcement cache peek failed", exc_info=True)
+
+    def _announcement_at(self, index: int):
+        """The announcement rendered in slot ``index``, or None if unfilled."""
+        self._ensure_announcements_sync()
+        items = self._announcements
+        return items[index] if index < len(items) else None
+
+    def _announcement_visible(self, index: int) -> Callable[[object], bool]:
+        def _visible(_item) -> bool:
+            return self._announcement_at(index) is not None
+        return _visible
+
+    def _announcement_line(self, index: int) -> Callable[[object], str]:
+        def _line(_item) -> str:
+            item = self._announcement_at(index)
+            return announcements.menu_title(item) if item else ""
+        return _line
+
+    def _announcement_enabled(self, index: int) -> Callable[[object], bool]:
+        # Gray/enabled is cloud-controlled via ``dimmed``, not inferred from url.
+        def _enabled(_item) -> bool:
+            item = self._announcement_at(index)
+            return bool(item) and not item.dimmed
+        return _enabled
+
+    def _on_announcement(self, index: int) -> Callable[[object, object], None]:
+        def _click(_icon, _item) -> None:
+            item = self._announcement_at(index)
+            if item and item.url and not item.dimmed:
+                webbrowser.open(item.url)
+        return _click
+
+    def _kick_announcement_check(self) -> None:
+        """Poll the Worker on a background thread (no-op if one is in flight).
+
+        The hourly cadence lives in announcements.check()'s on-disk TTL, so this
+        is safe to call from the startup path, the hourly loop, and every menu
+        open alike — at most one network round-trip per hour results.
+        """
+        if not self._announcement_gate.try_enter():
+            logger.debug("announcement check skipped (in flight)")
+            return
+
+        def _work():
+            try:
+                items = announcements.check()
+                if items != self._announcements:
+                    self._announcements = items
+                    self._announcements_loaded = True
+                    self._request_redraw()
+            except Exception:
+                logger.warning("announcement check failed", exc_info=True)
+            finally:
+                self._announcement_gate.done()
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _start_announcement_refresh_loop(self) -> None:
+        """Re-poll once an hour so a notice can appear without user interaction.
+
+        Same reason the usage loop exists: on macOS the NSMenu is static, so
+        nothing re-evaluates the row callbacks unless a redraw is pushed.
+        """
+        def _loop():
+            while not self._usage_refresh_stop.wait(self._ANNOUNCEMENT_REFRESH_INTERVAL):
+                self._kick_announcement_check()
+
+        threading.Thread(target=_loop, daemon=True).start()
+
     # --- update check + probe throttle ---
 
     def _kick_update_check(self) -> None:
@@ -1259,6 +1356,9 @@ class TrayApp:
         threading.Thread(target=_work, daemon=True).start()
 
     def _on_menu_open(self) -> None:
+        # TTL-gated on disk, so this costs a thread spawn at most once an hour.
+        # Worth it: the hourly timer lags after the machine wakes from sleep.
+        self._kick_announcement_check()
         if self._probe_gate.try_enter():
             def _probe():
                 try:
@@ -1320,10 +1420,27 @@ class TrayApp:
 
     # --- build the menu and run the loop ---
 
+    def _announcement_menu_items(self) -> list:
+        """Reserved announcement rows, in display order."""
+        pystray = self._pystray
+        return [
+            pystray.MenuItem(
+                self._announcement_line(i),
+                self._on_announcement(i),
+                enabled=self._announcement_enabled(i),
+                visible=self._announcement_visible(i),
+            )
+            for i in range(_ANNOUNCEMENT_SLOTS)
+        ]
+
     def _build_menu(self):
         pystray = self._pystray
         return pystray.Menu(
             pystray.MenuItem(self._update_line, self._on_update, visible=self._update_visible),
+            # pystray drops leading and consecutive separators around hidden
+            # items, so this stays invisible unless both groups have content.
+            pystray.Menu.SEPARATOR,
+            *self._announcement_menu_items(),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(self._gateway_line, None, enabled=False),
             pystray.MenuItem(self._tunnel_line, None, enabled=False),
@@ -1415,8 +1532,10 @@ class TrayApp:
         macos_menu.install_reopen_handler(self._icon, self._on_app_reopen)
         threading.Thread(target=_startup, daemon=True).start()
         self._kick_update_check()
+        self._kick_announcement_check()
         self._start_usage_refresh_loop()
         self._start_activity_refresh_loop()
+        self._start_announcement_refresh_loop()
         # Windows-only taskbar theme auto-adaptation. start() is a no-op on
         # macOS/Linux, so it's safe to call unconditionally.
         self._theme_watcher = ThemeWatcher(self._on_theme_change)

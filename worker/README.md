@@ -78,6 +78,81 @@ wrangler deploy
 
 在 Zero Trust 控制台给 `kiro-gateway-provision.<域名>` 的 **Path `/q`** 加一条 self-hosted application + Service Auth 策略，签发 Service Token，把 `CF-Access-Client-Id/Secret` 填进 Grafana Infinity datasource。`/telemetry` 与 `/provision` 不受此 Access 影响（靠 path 限定）。
 
+## 公告栏（Announcements）
+
+托盘菜单顶部、"新版提醒"下方最多展示 5 条公告。客户端启动时拉一次，之后每小时一次
+（菜单打开也会触发，但受同一个 1 小时 TTL 约束）。
+
+```
+POST /announcements
+headers: { User-Agent: "KiroGatewayTray/<version> (<platform>)" }
+body: { shared_secret, username }
+# body.app_version / body.platform 仅作 curl 调试兜底；正式客户端走 UA。
+→ 200 { ok: true, announcements: [ { id, body, tag, url, level, priority, dimmed, ends_at } ] }
+→ 401 { error: "unauthorized" }
+```
+
+鉴权与 `/tunnel-status` 一致（body 内激活码，恒定时间比较），所以公告内容不对公网公开，
+客户端也不用再存一份新密钥。
+
+### 建表
+
+```bash
+# 已有库加表（或 DROP 后重建）
+wrangler d1 execute kiro-telemetry --remote --file=./migrations/2026-08-03-announcements.sql
+# 新库由 schema.sql 一并建出
+```
+
+### 发布 / 修改公告
+
+没有 admin API —— 直接写 D1。`announcements.example.sql` 是带注释的模板，涵盖定向、
+自动上下架和日常增删改查：
+
+```bash
+wrangler d1 execute kiro-telemetry --remote \
+  --command "INSERT INTO announcements (body) VALUES ('欢迎使用')"
+# 发新后 SELECT id 回看；改/下架用 WHERE id = N
+```
+
+### 字段与定向语义
+
+| 字段 | 作用 |
+|---|---|
+| `id` | 自增主键。INSERT 不写；改/下架用 `WHERE id = N` |
+| `body` | 菜单行文字。客户端会把换行折成空格并截断到 120 字，长内容请放 `url` |
+| `tag` | 行尾灰色小字（macOS 右对齐）；其他平台显示为普通后缀 |
+| `url` | 点击跳转。为空时点击无反应；**是否置灰由 `dimmed` 决定，与有无 url 无关**。只接受 http(s) |
+| `level` | `info` / `warning` / `critical` → 行首 📢 / ⚠️ / 🚨 |
+| `priority` | 排序权重，大的在前；同权重时 `starts_at` 新的在前 |
+| `dimmed` | `1` = 菜单行置灰；`0` = 正常色。与有无链接无关 |
+| `enabled` | 手动总开关，置 0 立刻下架 |
+| `starts_at` / `ends_at` | Unix 秒（UTC），起点含、终点不含；NULL 表示该侧不限 |
+| `min_version` / `max_version` | 版本闭区间 |
+| `target_platforms` | `macos` / `windows` / `linux`，逗号分隔；空 = 全平台 |
+
+匹配全部 **fail-closed**：设了 `min_version` 但客户端没上报版本、设了 `target_platforms`
+但平台未知、版本区间写成非法字符串 —— 这些情况一律不展示。宁可少发一条，也不要发错人。
+
+### 生效延迟
+
+改完 D1 后，用户看到变化最多需要约 **1 小时 5 分钟**：Worker 对 D1 行有 5 分钟边缘缓存
+（查的是 `enabled = 1` 且未过期的行；读次数与在线人数无关），客户端每小时才轮询一次。急事请配合直接通知。
+
+排查时可以直接打端点验证 Worker 侧的判定：
+
+```bash
+curl -s https://kiro-gateway-provision.<域名>/announcements \
+  -H 'Content-Type: application/json' \
+  -H 'User-Agent: KiroGatewayTray/0.4.22 (macos)' \
+  -d '{"shared_secret":"<激活码>","username":"<匿名哈希>"}'
+```
+
+## 本地测试
+
+```bash
+cd worker && node --test    # 无依赖，纯 node:test
+```
+
 ## 注意事项
 
 - run_token 只在 201 响应里返回一次，Worker 本身不存储任何状态（Cloudflare API 是唯一数据源）

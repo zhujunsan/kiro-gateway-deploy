@@ -1,73 +1,19 @@
 /**
  * Tests for usage_rollup field normalization (credits + latency).
- * Run: node --test worker/tests/telemetry_rollup.test.js
+ * Run: node --test worker/tests/
+ *
+ * normalizeRollupRow is imported from the Worker source rather than copied, so
+ * these assertions can never silently drift from the code that actually runs.
  */
-const { describe, it } = require("node:test");
-const assert = require("node:assert/strict");
-const fs = require("node:fs");
-const path = require("node:path");
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
-const USERNAME_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
+import { normalizeRollupRow } from "../src/index.js";
 
-function toInt(v, def = 0) {
-  const n = parseInt(v, 10);
-  return Number.isFinite(n) ? n : def;
-}
-
-function toOptionalNonNegFloat(v) {
-  if (v === undefined || v === null || v === "") return null;
-  const n = Number(v);
-  if (!Number.isFinite(n) || n < 0) return null;
-  return n;
-}
-
-function toOptionalNonNegInt(v) {
-  if (v === undefined || v === null || v === "") return null;
-  const n = parseInt(v, 10);
-  if (!Number.isFinite(n) || n < 0) return null;
-  return n;
-}
-
-// Keep in sync with worker/src/index.js normalizeRollupRow.
-function normalizeRollupRow(row, receivedAt) {
-  if (!row || typeof row !== "object") return null;
-  const username = row.username;
-  if (typeof username !== "string" || !USERNAME_RE.test(username)) return null;
-  const model = typeof row.model === "string" && row.model ? row.model : "unknown";
-  const appVersion = typeof row.app_version === "string" && row.app_version ? row.app_version : "unknown";
-
-  const bucketStart = toInt(row.bucket_start, -1);
-  const bucketSeconds = toInt(row.bucket_seconds, -1);
-  if (bucketStart < 0 || bucketSeconds <= 0) return null;
-
-  const requests = toInt(row.requests);
-  if (requests <= 0) return null;
-
-  return [
-    bucketStart,
-    bucketSeconds,
-    username,
-    model,
-    appVersion,
-    requests,
-    toInt(row.successes),
-    toInt(row.errors),
-    toInt(row.prompt_tokens_sum),
-    toInt(row.completion_tokens_sum),
-    toInt(row.total_tokens_sum),
-    toInt(row.request_bytes_sum),
-    toInt(row.response_bytes_sum),
-    toInt(row.ttft_ms_sum),
-    toInt(row.ttft_count),
-    toInt(row.generation_ms_sum),
-    toInt(row.generation_count),
-    toInt(row.generation_completion_tokens_sum),
-    toOptionalNonNegFloat(row.estimated_credits),
-    toOptionalNonNegInt(row.credit_estimate_segments),
-    toOptionalNonNegInt(row.credit_estimate_missing_segments),
-    receivedAt,
-  ];
-}
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 describe("normalizeRollupRow credit fields", () => {
   it("omitted credit fields become null (not 0)", () => {

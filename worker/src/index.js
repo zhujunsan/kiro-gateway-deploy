@@ -31,6 +31,15 @@
 //   → 401 { error: "unauthorized" }
 //   Idempotent overwrite (last-write-wins) via ON CONFLICT DO UPDATE.
 //
+// POST /announcements
+//   headers: { User-Agent: "KiroGatewayTray/<version> (<platform>)" }
+//   body: { shared_secret, username }
+//   → 200 { ok: true, announcements: [ { id, body, tag, url, level, priority, dimmed, ends_at } ] }
+//   → 401 { error: "unauthorized" }
+//   托盘顶部公告栏。版本/平台从 User-Agent 解析（body 里的 app_version/platform 仅作 curl 兜底）。
+//   定向规则见 src/announcements.js，运维模板见 announcements.example.sql。
+//   最多回 5 条；D1 行走边缘缓存（TTL 5 分钟），读次数与在线人数无关。
+//
 // GET|POST /q/*
 //   只读查询端点，仅开放参数化的固定查询，默认查 usage_daily。
 //   注意：/q/* 不自校验密钥 —— 由 Cloudflare Access 在边缘挡（见设计文档第十二/十三节）。
@@ -51,6 +60,15 @@
 //   IDLE_CLEANUP_DAYS — 闲置隧道清理阈值（天）；未配置则不清理
 // Required bindings (wrangler.toml):
 //   TELEMETRY_DB    — D1 database (kiro-telemetry)
+
+import {
+  ANNOUNCEMENTS_SELECT_SQL,
+  ANNOUNCEMENT_CACHE_TTL,
+  ANNOUNCEMENT_CACHE_GEN,
+  ANNOUNCEMENT_ROW_LIMIT,
+  clientContextFromRequest,
+  selectAnnouncements,
+} from "./announcements.js";
 
 const CF_API = "https://api.cloudflare.com/client/v4";
 const DEFAULT_PORT = 64005;
@@ -700,6 +718,83 @@ async function handleTunnelStatus(request, env, json) {
   return json({ exists: !!tunnel });
 }
 
+// --- 公告栏（/announcements） ---
+//
+// 鉴权与 /tunnel-status 一致：body 里的激活码，恒定时间比较。公告内容因此不对
+// 公网裸奔，客户端也不用再存一份新密钥。
+//
+// D1 读取走边缘缓存：每 ANNOUNCEMENT_CACHE_TTL 秒才真查一次（enabled 且未过期的行），
+// 之后版本/平台/用户名/灰度过滤都在内存里做。缓存内容与请求者无关，命中率接近 100%。
+// 查询时已丢掉 ends_at 已过的历史行；缓存窗口内刚好到期的，仍由 JS 侧 ends_at 再挡一层。
+
+async function loadAnnouncementRows(env) {
+  // Cache key embeds a generation so demo/content flips don't wait out TTL.
+  // Bump ANNOUNCEMENT_CACHE_GEN when a force-refresh of D1 rows is needed.
+  const cache = caches.default;
+  const cacheKey = new Request(
+    `https://announcements.cache/rows-g${ANNOUNCEMENT_CACHE_GEN}`,
+    { method: "GET" },
+  );
+
+  const cached = await cache.match(cacheKey);
+  if (cached) {
+    try {
+      return await cached.json();
+    } catch {
+      // 缓存体损坏：退回真查一次，别让公告永久卡死在坏缓存上。
+    }
+  }
+
+  let rows;
+  try {
+    const now = Math.floor(Date.now() / 1000);
+    const result = await env.TELEMETRY_DB
+      .prepare(ANNOUNCEMENTS_SELECT_SQL)
+      .bind(now, ANNOUNCEMENT_ROW_LIMIT)
+      .all();
+    rows = result.results || [];
+  } catch (err) {
+    // 公告是非关键功能：D1 异常（最典型的是 Worker 已部署但迁移还没跑）时
+    // 降级成"没有公告"，绝不把客户端的每小时轮询变成 500 风暴。不缓存失败结果，
+    // 这样迁移一跑完下一次请求就能恢复。
+    console.log(`[announcements] query failed: ${err.message}`);
+    return [];
+  }
+
+  const resp = new Response(JSON.stringify(rows), {
+    headers: {
+      "Content-Type": "application/json",
+      "Cache-Control": `public, max-age=${ANNOUNCEMENT_CACHE_TTL}`,
+    },
+  });
+  await cache.put(cacheKey, resp.clone());
+  return rows;
+}
+
+async function handleAnnouncements(request, env, json) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: "invalid JSON" }, 400);
+  }
+
+  const { shared_secret, username } = body || {};
+  if (!shared_secret || !env.SHARED_SECRET || !timingSafeEqual(shared_secret, env.SHARED_SECRET)) {
+    return json({ error: "unauthorized" }, 401);
+  }
+  if (!username || !USERNAME_RE.test(username)) {
+    return json({ error: "username must be lowercase alphanumeric/hyphen, 1-32 chars" }, 400);
+  }
+
+  const rows = await loadAnnouncementRows(env);
+  const announcements = selectAnnouncements(
+    rows,
+    clientContextFromRequest({ headers: request.headers, body }),
+  );
+  return json({ ok: true, announcements });
+}
+
 // --- request handler ---
 
 export default {
@@ -740,6 +835,18 @@ export default {
       }
       try {
         return await handleTunnelStatus(request, env, json);
+      } catch (err) {
+        return json({ error: err.message }, 500);
+      }
+    }
+
+    // 公告栏：用激活码鉴权，只读 announcements 表，绝不写库、不碰隧道。
+    if (url.pathname === "/announcements") {
+      if (request.method !== "POST") {
+        return new Response("not found", { status: 404 });
+      }
+      try {
+        return await handleAnnouncements(request, env, json);
       } catch (err) {
         return json({ error: err.message }, 500);
       }
@@ -815,3 +922,7 @@ export default {
     ctx.waitUntil(cleanupIdleTunnels(env));
   },
 };
+
+// 供单元测试直接引用真实实现，避免测试里再抄一份逻辑然后悄悄跟源码走偏。
+// Workers 运行时只消费 default export，额外的具名导出没有任何副作用。
+export { normalizeRollupRow, timingSafeEqual };

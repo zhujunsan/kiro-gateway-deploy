@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.4.23 (2026-08-03)
+
+**New**
+- 托盘菜单「新版提醒」下方新增云端公告栏（最多 5 条）：启动与每小时从 provision Worker 拉取，本地磁盘缓存 1 小时；支持 level / 置灰 / 点击跳转 / 时间窗 / 版本区间 / 平台定向；失败静默，不打扰用户。
+- Worker 新增 `POST /announcements` 与 D1 `announcements` 表：按启用状态、时间窗、版本、平台过滤后下发；版本与平台从 `User-Agent`（`KiroGatewayTray/<version> (<platform>)`）解析；公告主键为自增 `id`。
+- 新增发布公告 Cursor skill（`.cursor/skills/publish-announcement`），便于经 wrangler 写入 D1 并刷新边缘缓存。
+
 ## v0.4.22 (2026-08-01)
 
 **Fixed**
