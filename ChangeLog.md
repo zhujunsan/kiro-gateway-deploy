@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.4.24 (2026-08-03)
+
+**Fixed**
+- 修复非流式路径把上游首 token 超时 / 中途断流误报成 gateway 500：与流式一致做首 token 重试，并按网络错误映射为 504 / 502（Sentry TRAY-1C / 1R / 1Q）。
+- 修复空或非 object 的工具 `inputSchema` 触发 Bedrock `TOOL_SCHEMA_INVALID`：发送前归一为 `type: object`（Sentry TRAY-1T）。
+- Sentry 降噪：过滤客户端 422/4xx 校验失败、uvicorn 启动重复日志、缺 vendor 本地环境、Xlib 桌面断连，以及 Starlette 重复捕获的网络 HTTPException。
+
+**Changed**
+- 同步上游网关至 `main-6640284`；docker-compose 镜像 pin 至 `ghcr.io/zhujunsan/kiro-gateway:main-6640284`。
+
 ## v0.4.23 (2026-08-03)
 
 **New**

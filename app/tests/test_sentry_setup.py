@@ -160,6 +160,20 @@ def test_before_send_drops_application_startup_failed_logentry():
     assert ss.before_send(event, {}) is None
 
 
+def test_before_send_drops_failed_to_initialize_account_logentry_duplicate():
+    """uvicorn.error traceback-as-message must not open a second Issue (TRAY-1W)."""
+    event = {
+        "logger": "uvicorn.error",
+        "message": (
+            "Traceback (most recent call last):\n"
+            "  File \"main.py\", line 513, in lifespan\n"
+            "    raise RuntimeError(\"Failed to initialize any account\")\n"
+            "RuntimeError: Failed to initialize any account"
+        ),
+    }
+    assert ss.before_send(event, {}) is None
+
+
 def test_before_send_keeps_failed_to_initialize_account_exception():
     """Real startup root cause must remain observable (TRAY-W class)."""
     event = {
@@ -175,6 +189,116 @@ def test_before_send_keeps_failed_to_initialize_account_exception():
     assert ss.before_send(event, {
         "exc_info": (RuntimeError, RuntimeError("Failed to initialize any account"), None),
     }) is event
+
+
+def test_before_send_drops_client_validation_error_incident():
+    """Empty-body 422 from a misconfigured client is not a gateway bug (TRAY-1X)."""
+    event = {
+        "message": (
+            "Gateway incident: validation_error (client_request) /v1/messages "
+            "status=422: Validation error: Field required"
+        ),
+        "tags": {
+            "incident.code": "validation_error",
+            "incident.source": "client_request",
+            "incident.status_code": "422",
+        },
+        "contexts": {
+            "incident": {
+                "code": "validation_error",
+                "source": "client_request",
+                "status_code": 422,
+            }
+        },
+    }
+    assert ss.before_send(event, {}) is None
+
+
+def test_before_send_drops_client_request_400_incident():
+    """Any client_request 4xx (except rate-limit-class noise we keep elsewhere)."""
+    event = {
+        "message": "Gateway incident: http_400 (client_request) /v1/messages status=400",
+        "tags": [
+            ["incident.code", "http_400"],
+            ["incident.source", "client_request"],
+            ["incident.status_code", "400"],
+        ],
+    }
+    assert ss.before_send(event, {}) is None
+
+
+def test_before_send_keeps_network_502_incident():
+    """Upstream transport failures must remain visible."""
+    event = {
+        "message": (
+            "Gateway incident: incomplete_upstream_response (network) "
+            "/v1/messages status=502"
+        ),
+        "tags": {
+            "incident.code": "incomplete_upstream_response",
+            "incident.source": "network",
+            "incident.status_code": "502",
+        },
+    }
+    assert ss.before_send(event, {}) is event
+
+
+def test_before_send_drops_xlib_display_connection_closed():
+    """Desktop session teardown is not an application bug (TRAY-1S)."""
+    event = {
+        "exception": {
+            "values": [
+                {
+                    "type": "ConnectionClosedError",
+                    "value": "Display connection closed by server: [Errno 104]",
+                }
+            ]
+        }
+    }
+    assert ss.before_send(event, {}) is None
+
+
+def test_before_send_drops_vendored_gateway_not_found():
+    """Incomplete source checkout is a local setup issue (TRAY-1V)."""
+    event = {
+        "exception": {
+            "values": [
+                {
+                    "type": "RuntimeError",
+                    "value": "vendored gateway not found; run scripts/vendor_sync.py",
+                }
+            ]
+        }
+    }
+    assert ss.before_send(event, {
+        "exc_info": (
+            RuntimeError,
+            RuntimeError("vendored gateway not found; run scripts/vendor_sync.py"),
+            None,
+        ),
+    }) is None
+
+
+def test_before_send_drops_starlette_http_exception_504():
+    """Starlette-captured network HTTPException duplicates the incident Issue (TRAY-H)."""
+    class HTTPException(Exception):
+        def __init__(self, status_code: int, detail: str) -> None:
+            super().__init__(detail)
+            self.status_code = status_code
+            self.detail = detail
+
+    exc = HTTPException(504, "Read timeout - server stopped responding during data transfer.")
+    event = {
+        "exception": {
+            "values": [
+                {
+                    "type": "HTTPException",
+                    "value": str(exc),
+                }
+            ]
+        }
+    }
+    assert ss.before_send(event, {"exc_info": (HTTPException, exc, None)}) is None
 
 
 def test_before_send_keeps_first_token_streaming_error_incident():
@@ -198,6 +322,35 @@ def test_before_send_keeps_first_token_streaming_error_incident():
         },
     }
     assert ss.before_send(event, {}) is event
+
+
+def test_report_incident_skips_client_validation_error(monkeypatch):
+    """Primary drop: snapshot path must not create Issues for 422 client faults."""
+    captured: dict = {}
+
+    class _FakeSdk:
+        @staticmethod
+        def new_scope():
+            raise AssertionError("validation_error must not open a Sentry scope")
+
+        @staticmethod
+        def capture_message(*a, **k):
+            captured["called"] = True
+
+    monkeypatch.setattr(ss, "_READY", True)
+    monkeypatch.setitem(__import__("sys").modules, "sentry_sdk", _FakeSdk)
+
+    ss.report_incident_snapshot({
+        "incident_id": "val-1",
+        "path": "/v1/messages",
+        "source": "client_request",
+        "code": "validation_error",
+        "client_disconnected": False,
+        "status_code": 422,
+        "error_message": "Validation error: Field required",
+        "artifacts": {},
+    })
+    assert "called" not in captured
 
 
 def test_before_send_scrubs_auth_headers_and_token_vars():

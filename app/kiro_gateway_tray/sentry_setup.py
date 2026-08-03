@@ -153,6 +153,23 @@ _EXPECTED_UPSTREAM_CODES = frozenset({
     "INVALID_MODEL_ID",
 })
 
+# Incident sources that describe the caller's request, not the gateway. The
+# client sent something the gateway correctly rejected (malformed body, missing
+# fields), so there is nothing for us to fix and every misconfigured client
+# would otherwise open an Issue.
+_CLIENT_FAULT_SOURCES = frozenset({
+    "client_request",
+})
+
+# Incident codes that are always the caller's fault, regardless of source.
+_CLIENT_FAULT_CODES = frozenset({
+    "validation_error",
+})
+
+# Gateway statuses that mean "the request was wrong", excluding 429 (rate limit,
+# which is account state worth tracking) and 5xx (our side).
+_CLIENT_FAULT_STATUSES = frozenset({400, 401, 403, 404, 405, 413, 415, 422})
+
 
 def _exception_text(exc: BaseException) -> str:
     """Flatten exception type + message for substring matching."""
@@ -246,8 +263,29 @@ def _is_addr_in_use_event(event: dict[str, Any], hint: dict[str, Any]) -> bool:
     return False
 
 
+def _coerce_status(value: Any) -> int | None:
+    """Parse an incident status code from a tag/context value."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_client_fault_incident(code: str, source: str, status: int | None) -> bool:
+    """True when an incident describes a bad client request, not a gateway bug."""
+    if code in _CLIENT_FAULT_CODES:
+        return True
+    if source in _CLIENT_FAULT_SOURCES and status in _CLIENT_FAULT_STATUSES:
+        return True
+    return False
+
+
 def _is_noisy_incident_event(event: dict[str, Any]) -> bool:
-    """True for client-cancel / expected-upstream incidents that must not Issue.
+    """True for client-caused / expected-upstream incidents that must not Issue.
 
     Primary drop is in ``report_incident_snapshot``; this is defense-in-depth for
     events that already carry incident tags / message text.
@@ -260,6 +298,10 @@ def _is_noisy_incident_event(event: dict[str, Any]) -> bool:
     if code == "client_disconnect" or source == "cancelled":
         return True
     if source == "expected_upstream" or code in _EXPECTED_UPSTREAM_CODES:
+        return True
+    if _is_client_fault_incident(
+        code, source, _coerce_status(tags.get("incident.status_code"))
+    ):
         return True
 
     contexts = event.get("contexts")
@@ -274,20 +316,31 @@ def _is_noisy_incident_event(event: dict[str, Any]) -> bool:
                 return True
             if str(incident.get("code") or "") in _EXPECTED_UPSTREAM_CODES:
                 return True
+            if _is_client_fault_incident(
+                str(incident.get("code") or ""),
+                str(incident.get("source") or ""),
+                _coerce_status(incident.get("status_code")),
+            ):
+                return True
 
     blob = _event_text_blob(event)
     if "gateway incident: client_disconnect" in blob:
         return True
     if "gateway incident: invalid_model_id" in blob and "expected_upstream" in blob:
         return True
+    if "gateway incident: validation_error" in blob:
+        return True
     return False
 
 
 def _is_duplicate_startup_log_event(event: dict[str, Any], hint: dict[str, Any]) -> bool:
-    """Drop uvicorn's ``Application startup failed`` logentry duplicate.
+    """Drop uvicorn's wrapper logentries that duplicate a real exception Issue.
 
-    The real failure (e.g. ``Failed to initialize any account``) is already
-    captured as an exception Issue; the wrapper log creates a second Issue.
+    Covers:
+      * ``Application startup failed. Exiting.``
+      * Traceback-as-message dumps of ``Failed to initialize any account``
+        (Sentry TRAY-1W; the real Issue is TRAY-W)
+
     Keep exception events; only drop pure message / logentry events.
     """
     exc_info = hint.get("exc_info")
@@ -301,7 +354,61 @@ def _is_duplicate_startup_log_event(event: dict[str, Any], hint: dict[str, Any])
             return False
 
     blob = _event_text_blob(event)
-    return "application startup failed" in blob
+    if "application startup failed" in blob:
+        return True
+    if "failed to initialize any account" in blob:
+        return True
+    return False
+
+
+def _is_environment_noise_event(event: dict[str, Any], hint: dict[str, Any]) -> bool:
+    """Drop desktop / local-setup failures that are not application bugs.
+
+    Covers:
+      * Xlib / pystray display connection resets (user logged out / tray host died)
+      * Missing vendored gateway when running from an incomplete source checkout
+      * Starlette-captured HTTPException 502/504 that already have an incident Issue
+        from ``debug_logger.flush_on_error``
+    """
+    exc_info = hint.get("exc_info")
+    if exc_info and len(exc_info) >= 2 and isinstance(exc_info[1], BaseException):
+        exc = exc_info[1]
+        name = type(exc).__name__
+        text = _exception_text(exc)
+        if name == "ConnectionClosedError" or "display connection closed" in text:
+            return True
+        if "vendored gateway not found" in text:
+            return True
+        # FastAPI HTTPException is not always importable here; match by shape.
+        status = getattr(exc, "status_code", None)
+        if status in (502, 504) and name == "HTTPException":
+            return True
+
+    blob = _event_text_blob(event)
+    if "display connection closed" in blob:
+        return True
+    if "vendored gateway not found" in blob:
+        return True
+
+    exception = event.get("exception")
+    if isinstance(exception, dict):
+        values = exception.get("values")
+        if isinstance(values, list):
+            for item in values:
+                if not isinstance(item, dict):
+                    continue
+                typ = str(item.get("type") or "")
+                val = str(item.get("value") or "").lower()
+                if typ == "ConnectionClosedError" or "display connection closed" in val:
+                    return True
+                if typ == "HTTPException" and (
+                    "read timeout" in val
+                    or "connection failed" in val
+                    or "request timeout" in val
+                    or "did not respond within" in val
+                ):
+                    return True
+    return False
 
 
 def _should_skip_incident_snapshot(snapshot: dict[str, Any]) -> bool:
@@ -310,8 +417,10 @@ def _should_skip_incident_snapshot(snapshot: dict[str, Any]) -> bool:
     Drops:
       * client disconnect / cancelled (user abort — not a bug)
       * expected_upstream rejections (esp. INVALID_MODEL_ID)
+      * client-fault requests (4xx validation errors from a misconfigured caller)
 
-    Keeps actionable incidents such as first-token ``streaming_error`` timeouts.
+    Keeps actionable incidents such as first-token timeouts and truncated
+    upstream responses.
     """
     if bool(snapshot.get("client_disconnected")):
         return True
@@ -320,6 +429,10 @@ def _should_skip_incident_snapshot(snapshot: dict[str, Any]) -> bool:
     if code == "client_disconnect" or source == "cancelled":
         return True
     if source == "expected_upstream" or code in _EXPECTED_UPSTREAM_CODES:
+        return True
+    if _is_client_fault_incident(
+        code, source, _coerce_status(snapshot.get("status_code"))
+    ):
         return True
     return False
 
@@ -347,6 +460,8 @@ def before_send(event: dict[str, Any], hint: dict[str, Any]) -> dict[str, Any] |
     if _is_noisy_incident_event(event):
         return None
     if _is_duplicate_startup_log_event(event, hint):
+        return None
+    if _is_environment_noise_event(event, hint):
         return None
 
     _scrub_headers(event)
