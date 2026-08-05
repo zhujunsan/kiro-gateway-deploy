@@ -285,3 +285,109 @@ def test_gateway_title_shows_port_busy_hint(monkeypatch):
     )
     title = app._gateway_title()
     assert "异常（端口 64005 占用）" in title
+
+
+# =============================================================================
+# Tunnel line rendering with tunnel_detail
+# =============================================================================
+
+
+def test_tunnel_title_running_with_detail(monkeypatch):
+    from kiro_gateway_tray import tray as tray_mod
+
+    app = tray_mod.TrayApp()
+    monkeypatch.setattr(
+        app.sup,
+        "status",
+        lambda: {
+            "gateway": "running",
+            "tunnel": "running",
+            "tunnel_detail": "4/4 连接",
+            "hostname": "x.example",
+            "error": "",
+        },
+    )
+    title = app._tunnel_title()
+    assert "运行中" in title
+    assert "4/4" in title
+
+
+def test_tunnel_title_degraded_connections(monkeypatch):
+    from kiro_gateway_tray import tray as tray_mod
+
+    app = tray_mod.TrayApp()
+    monkeypatch.setattr(
+        app.sup,
+        "status",
+        lambda: {
+            "gateway": "running",
+            "tunnel": "degraded",
+            "tunnel_detail": "1/4 连接",
+            "hostname": "x.example",
+            "error": "",
+        },
+    )
+    title = app._tunnel_title()
+    assert "降级" in title
+    assert "1/4" in title
+
+
+def test_tunnel_title_degraded_edge_unreachable(monkeypatch):
+    from kiro_gateway_tray import tray as tray_mod
+
+    app = tray_mod.TrayApp()
+    monkeypatch.setattr(
+        app.sup,
+        "status",
+        lambda: {
+            "gateway": "running",
+            "tunnel": "degraded",
+            "tunnel_detail": "边缘不可达",
+            "hostname": "x.example",
+            "error": "",
+        },
+    )
+    title = app._tunnel_title()
+    assert "降级" in title
+    assert "边缘不可达" in title
+
+
+def test_tunnel_title_connecting_no_detail(monkeypatch):
+    from kiro_gateway_tray import tray as tray_mod
+
+    app = tray_mod.TrayApp()
+    monkeypatch.setattr(
+        app.sup,
+        "status",
+        lambda: {
+            "gateway": "running",
+            "tunnel": "connecting",
+            "tunnel_detail": "",
+            "hostname": "x.example",
+            "error": "",
+        },
+    )
+    title = app._tunnel_title()
+    assert "连接中" in title
+    # No detail appended for connecting state
+    assert "(" not in title
+
+
+def test_tunnel_title_stopped_no_detail(monkeypatch):
+    from kiro_gateway_tray import tray as tray_mod
+
+    app = tray_mod.TrayApp()
+    monkeypatch.setattr(
+        app.sup,
+        "status",
+        lambda: {
+            "gateway": "stopped",
+            "tunnel": "stopped",
+            "tunnel_detail": "",
+            "hostname": "x.example",
+            "error": "",
+        },
+    )
+    title = app._tunnel_title()
+    assert "已停止" in title
+    assert "(" not in title

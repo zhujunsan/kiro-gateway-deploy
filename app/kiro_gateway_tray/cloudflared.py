@@ -15,6 +15,20 @@ from .appconfig import AppCfg
 from .log import logger
 
 
+# Upstream default (and effective ceiling) for cloudflared's hidden
+# `ha-connections` flag: it opens 4 independent edge connections per tunnel.
+# The real count can be LOWER when the edge hands us fewer usable addresses
+# (`if s.config.HAConnections > availableAddrs { ... }`), so callers pass the
+# count they actually observed and this only caps it.
+HA_CONNECTIONS_MAX = 4
+
+# One line accepted by cloudflared's `stdinControl` goroutine. Each HA
+# connection waits on the same unbuffered-ish `reconnectCh`, and the signal is
+# consumed by exactly ONE of them ("one randomly chosen connection" per the
+# upstream help text), so N connections need N separate commands.
+_RECONNECT_COMMAND = "reconnect\n"
+
+
 def _current_target() -> str:
     sysname = platform.system().lower()
     machine = platform.machine().lower()
@@ -112,12 +126,21 @@ class CloudflaredProcess:
     registered), not by parsing stdout. The metrics server is pinned to a fixed
     port via ``--metrics`` so the probe target is stable. stdout is still
     captured verbatim to a rotating log file for debugging.
+
+    stdin is kept open as a control channel (``--stdin-control``) so a network
+    change can be answered with an immediate, backoff-free edge reconnect
+    instead of killing and respawning the process.
     """
 
     def __init__(self) -> None:
         self._proc: subprocess.Popen | None = None
         self._reader: threading.Thread | None = None
         self._metrics_port: int = 20241
+        # stdin is written from the network-watcher thread while the tray/
+        # supervisor threads may be stopping the process; serialize both so
+        # commands never interleave mid-line and stdin is not written after
+        # close.
+        self._stdin_lock = threading.Lock()
 
     def start(self, cfg: AppCfg) -> None:
         run_token = cfg.cloudflare.run_token
@@ -133,12 +156,18 @@ class CloudflaredProcess:
         protocol = getattr(cfg.cloudflare, "protocol", "") or "http2"
         if protocol:
             cmd += ["--protocol", protocol]
+        # `--stdin-control` is a hidden upstream flag (absent from the public
+        # docs) but has been in cloudflared for years and is safe to rely on:
+        # if it ever disappears the process fails fast at startup, and every
+        # caller of request_reconnect() falls back to a full process restart.
+        cmd += ["--stdin-control"]
         cmd += ["run", "--token", run_token]
         # Force UTF-8: on Windows, text=True alone uses the system ANSI code
         # page (often GBK), which raises UnicodeDecodeError on cloudflared's
         # UTF-8 log lines and kills the reader thread (pipe backpressure risk).
         self._proc = subprocess.Popen(
             cmd,
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -163,7 +192,61 @@ class CloudflaredProcess:
         except Exception as exc:  # noqa: BLE001 — last-resort reader-thread guard
             logger.warning("cloudflared stdout reader stopped: {}", exc)
 
+    def request_reconnect(self, count: int) -> bool:
+        """Ask cloudflared to rebuild ``count`` edge connections right now.
+
+        Writes the ``reconnect`` control command to cloudflared's stdin. Upstream
+        treats a ``ReconnectSignal`` specially: the connection is restarted
+        immediately, skipping the exponential backoff (1/2/4/8/16s) and without
+        incrementing the retry counter. That is what makes this faster than
+        waiting for cloudflared to notice a dead connection on its own.
+
+        The signal is unicast — each command wakes exactly one HA connection —
+        so ``count`` commands are written to cover ``count`` connections.
+
+        Args:
+            count: Number of connections to recycle, as observed by the caller.
+                Clamped to ``1..HA_CONNECTIONS_MAX``.
+
+        Returns:
+            True if all commands were written and flushed. False if the process
+            is gone or the pipe is unusable, in which case the caller should
+            escalate to a full process restart.
+        """
+        target = max(1, min(int(count), HA_CONNECTIONS_MAX))
+        with self._stdin_lock:
+            proc = self._proc
+            if proc is None or proc.poll() is not None:
+                logger.debug("cloudflared reconnect skipped: process not running")
+                return False
+            stdin = proc.stdin
+            if stdin is None:
+                logger.debug("cloudflared reconnect skipped: stdin not piped")
+                return False
+            try:
+                for _ in range(target):
+                    stdin.write(_RECONNECT_COMMAND)
+                stdin.flush()
+            # BrokenPipeError: cloudflared died between poll() and write.
+            # ValueError: stdin was closed concurrently by stop().
+            # OSError: pipe-level failure (also the parent of BrokenPipeError).
+            except (BrokenPipeError, ValueError, OSError) as exc:
+                logger.warning("cloudflared reconnect command failed: {}", exc)
+                return False
+        logger.info("cloudflared reconnect requested for {} connection(s)", target)
+        return True
+
     def stop(self) -> None:
+        # Close the control channel first: it also gives cloudflared's stdin
+        # reader goroutine an EOF instead of leaving it blocked on a pipe we are
+        # about to abandon.
+        with self._stdin_lock:
+            proc = self._proc
+            if proc is not None and proc.stdin is not None:
+                try:
+                    proc.stdin.close()
+                except (BrokenPipeError, OSError) as exc:
+                    logger.debug("cloudflared stdin close failed: {}", exc)
         if self._proc and self._proc.poll() is None:
             self._proc.terminate()
             try:

@@ -142,6 +142,257 @@ def test_watch_output_swallows_reader_errors(monkeypatch):
     assert warnings, "expected warning when stdout reader fails"
 
 
+class _FakeStdin:
+    """Records every write/flush so command framing can be asserted."""
+
+    def __init__(self, write_exc=None, flush_exc=None, hook=None):
+        self.events = []
+        self.closed = False
+        self._write_exc = write_exc
+        self._flush_exc = flush_exc
+        self._hook = hook
+
+    def write(self, data):
+        if self._hook:
+            self._hook()
+        if self._write_exc:
+            raise self._write_exc
+        self.events.append(("write", data))
+        return len(data)
+
+    def flush(self):
+        if self._flush_exc:
+            raise self._flush_exc
+        self.events.append(("flush", None))
+
+    def close(self):
+        self.closed = True
+
+    def writes(self):
+        return [d for kind, d in self.events if kind == "write"]
+
+
+class _ControlProc:
+    """Minimal Popen stand-in with a writable stdin and controllable liveness."""
+
+    pid = 4242
+    stdout = None
+
+    def __init__(self, stdin=None, exit_code=None):
+        self.stdin = stdin if stdin is not None else _FakeStdin()
+        self._exit_code = exit_code
+        self.terminated = False
+        self.killed = False
+
+    def poll(self):
+        return self._exit_code
+
+    def terminate(self):
+        self.terminated = True
+
+    def kill(self):
+        self.killed = True
+
+    def wait(self, timeout=None):
+        return self._exit_code or 0
+
+
+def _proc_with_stdin(stdin=None, exit_code=None):
+    """Build a CloudflaredProcess already 'started' with a fake child."""
+    import kiro_gateway_tray.cloudflared as cf
+
+    proc = cf.CloudflaredProcess()
+    proc._proc = _ControlProc(stdin=stdin, exit_code=exit_code)
+    return proc
+
+
+def test_start_enables_stdin_control(monkeypatch):
+    # The stdin control channel must be requested at spawn time: it is the only
+    # way to trigger a backoff-free edge reconnect without killing the process.
+    import kiro_gateway_tray.cloudflared as cf
+
+    monkeypatch.setattr(cf, "binary_path", lambda: Path("/fake/cloudflared"))
+    monkeypatch.setattr(cf, "_port_is_free", lambda _p: True)
+    monkeypatch.setattr(cf.proc_guard, "kill_orphan", lambda: False)
+    monkeypatch.setattr(cf.proc_guard, "after_spawn", lambda _p: None)
+    monkeypatch.setattr(cf.proc_guard, "record_pid", lambda _pid: None)
+
+    captured = {}
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["kwargs"] = kwargs
+        return _ControlProc()
+
+    monkeypatch.setattr(cf.subprocess, "Popen", fake_popen)
+
+    cfg = appconfig.AppCfg()
+    cfg.cloudflare.run_token = "eyJ_test"
+    cf.CloudflaredProcess().start(cfg)
+
+    cmd = captured["cmd"]
+    assert "--stdin-control" in cmd
+    # It is a global flag: cloudflared rejects it after the `run` subcommand.
+    assert cmd.index("--stdin-control") < cmd.index("run")
+    assert cmd.index("--stdin-control") > cmd.index("tunnel")
+    assert captured["kwargs"]["stdin"] is cf.subprocess.PIPE
+
+
+def test_request_reconnect_writes_one_command_per_connection():
+    # The reconnect signal is unicast (one command wakes exactly one HA
+    # connection), so N connections require exactly N commands.
+    stdin = _FakeStdin()
+    proc = _proc_with_stdin(stdin)
+
+    assert proc.request_reconnect(3) is True
+    assert stdin.writes() == ["reconnect\n"] * 3
+    # A single flush after the batch is enough; commands must not be buffered.
+    assert stdin.events[-1] == ("flush", None)
+
+
+def test_request_reconnect_clamps_count():
+    import kiro_gateway_tray.cloudflared as cf
+
+    for given, expected in [
+        (0, 1),
+        (1, 1),
+        (-5, 1),
+        (4, 4),
+        (9, cf.HA_CONNECTIONS_MAX),
+        (10_000, cf.HA_CONNECTIONS_MAX),
+    ]:
+        stdin = _FakeStdin()
+        proc = _proc_with_stdin(stdin)
+        assert proc.request_reconnect(given) is True
+        assert len(stdin.writes()) == expected, f"count={given}"
+    assert cf.HA_CONNECTIONS_MAX == 4
+
+
+def test_request_reconnect_accepts_float_like_count():
+    # Callers derive the count from observed metrics; a non-int numeric must not
+    # blow up the write loop.
+    stdin = _FakeStdin()
+    proc = _proc_with_stdin(stdin)
+    assert proc.request_reconnect(2.9) is True
+    assert len(stdin.writes()) == 2
+
+
+def test_request_reconnect_false_when_never_started():
+    import kiro_gateway_tray.cloudflared as cf
+
+    assert cf.CloudflaredProcess().request_reconnect(4) is False
+
+
+def test_request_reconnect_false_when_process_exited():
+    # A dead child must degrade to False so the caller escalates to a restart
+    # instead of believing the tunnel was healed.
+    stdin = _FakeStdin()
+    proc = _proc_with_stdin(stdin, exit_code=1)
+
+    assert proc.request_reconnect(4) is False
+    assert stdin.writes() == []
+
+
+def test_request_reconnect_false_when_stdin_missing():
+    proc = _proc_with_stdin()
+    proc._proc.stdin = None
+    assert proc.request_reconnect(4) is False
+
+
+def test_request_reconnect_false_on_broken_pipe():
+    # cloudflared can die between poll() and write(); the race must not raise.
+    stdin = _FakeStdin(write_exc=BrokenPipeError("gone"))
+    proc = _proc_with_stdin(stdin)
+    assert proc.request_reconnect(4) is False
+
+
+def test_request_reconnect_false_on_os_error():
+    stdin = _FakeStdin(write_exc=OSError("pipe busted"))
+    proc = _proc_with_stdin(stdin)
+    assert proc.request_reconnect(2) is False
+
+
+def test_request_reconnect_false_on_closed_stdin_value_error():
+    # Writing to a file object closed by stop() raises ValueError, not OSError.
+    stdin = _FakeStdin(write_exc=ValueError("I/O operation on closed file"))
+    proc = _proc_with_stdin(stdin)
+    assert proc.request_reconnect(1) is False
+
+
+def test_request_reconnect_false_when_flush_fails():
+    # Buffered-but-unflushed commands never reach cloudflared, so a failing
+    # flush must be reported as failure too.
+    stdin = _FakeStdin(flush_exc=BrokenPipeError("gone"))
+    proc = _proc_with_stdin(stdin)
+    assert proc.request_reconnect(2) is False
+
+
+def test_request_reconnect_does_not_interleave_across_threads():
+    # Two concurrent callers (network watcher + supervisor) must not splice
+    # their commands together; each batch stays contiguous and ends in a flush.
+    import threading
+
+    barrier = threading.Barrier(2)
+    first = {"done": False}
+
+    def hook():
+        # Force overlap: the first writer parks inside the critical section.
+        if not first["done"]:
+            first["done"] = True
+            barrier.wait(timeout=5)
+
+    stdin = _FakeStdin(hook=hook)
+    proc = _proc_with_stdin(stdin)
+    results = []
+
+    def call():
+        results.append(proc.request_reconnect(3))
+
+    threads = [threading.Thread(target=call) for _ in range(2)]
+    for t in threads:
+        t.start()
+    barrier.wait(timeout=5)
+    for t in threads:
+        t.join(timeout=5)
+        assert not t.is_alive()
+
+    assert results == [True, True]
+    kinds = [kind for kind, _ in stdin.events]
+    assert kinds == ["write"] * 3 + ["flush"] + ["write"] * 3 + ["flush"]
+
+
+def test_stop_closes_stdin():
+    stdin = _FakeStdin()
+    proc = _proc_with_stdin(stdin)
+    child = proc._proc
+
+    proc.stop()
+
+    assert stdin.closed is True
+    assert child.terminated is True
+    # After stop the control channel is dead; further requests must fail loudly
+    # rather than silently no-op.
+    proc._proc._exit_code = 0
+    assert proc.request_reconnect(4) is False
+
+
+def test_stop_survives_stdin_close_error():
+    class _BadStdin(_FakeStdin):
+        def close(self):
+            raise OSError("already gone")
+
+    proc = _proc_with_stdin(_BadStdin())
+    child = proc._proc
+    proc.stop()  # must not raise
+    assert child.terminated is True
+
+
+def test_stop_without_start_is_noop():
+    import kiro_gateway_tray.cloudflared as cf
+
+    cf.CloudflaredProcess().stop()  # must not raise
+
+
 def test_provision_username_from_client_id_hash(monkeypatch):
     from kiro_gateway_tray import provision
     cfg = appconfig.AppCfg()

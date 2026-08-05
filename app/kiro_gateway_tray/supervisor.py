@@ -10,7 +10,7 @@ from typing import Callable
 from . import appconfig
 from . import gateway
 from .log import logger
-from .httpclient import local_client
+from .httpclient import local_client, resolve_proxy
 from .appconfig import AppCfg
 from .gateway import GatewayProcess
 from .cloudflared import CloudflaredProcess
@@ -29,6 +29,13 @@ class Supervisor:
     _PORT_FREE_TIMEOUT = 10
     # brief wait on cold start after orphan cleanup, before failing on a busy port
     _PORT_FREE_START_TIMEOUT = 3
+    # end-to-end probe interval (seconds): after a successful probe, don't
+    # probe again until this much time passes to avoid hitting public edge.
+    _E2E_PROBE_INTERVAL = 60
+    # seconds between soft reconnect attempts (cooldown)
+    _TUNNEL_RECONNECT_COOLDOWN = 10
+    # seconds to wait after a soft reconnect before escalating to process restart
+    _SOFT_RECONNECT_VERIFY_WINDOW = 8
 
     def __init__(self, gateway=None, tunnel=None) -> None:
         self.gateway = gateway or GatewayProcess()
@@ -51,6 +58,13 @@ class Supervisor:
         # fight over _gw_health.
         self._consecutive_failures = 0
         self._consecutive_ok = 0
+        # --- Tunnel health model fields ---
+        self._tunnel_conns: int = 0
+        self._tunnel_conns_expected: int = 0
+        self._tunnel_e2e_ok: bool | None = None
+        self._tunnel_degraded_reason: str = ""
+        self._last_e2e_success_ts: float = 0.0
+        self._last_tunnel_reconnect_ts: float = 0.0
         # Fired whenever gateway health or tunnel connectivity changes, so the
         # tray can redraw the menu the moment the tunnel comes up (instead of
         # waiting for the next time the user opens the menu).
@@ -76,6 +90,8 @@ class Supervisor:
         # HTTP(S)_PROXY; a system proxy would otherwise route these to a proxy
         # and make a healthy gateway/tunnel look down.
         self._client = local_client(timeout=3)
+        # Network change watcher (started by _start_health_loop)
+        self._network_watcher: object | None = None
 
     def _load(self) -> AppCfg:
         with self._cfg_lock:
@@ -99,6 +115,10 @@ class Supervisor:
         followed by start() again (restart), which reuses the client.
         """
         self._stop_health_loop()
+        watcher = self._network_watcher
+        if watcher is not None:
+            watcher.stop()
+            self._network_watcher = None
         try:
             self._client.close()
         except Exception:
@@ -311,6 +331,8 @@ class Supervisor:
             self._set_gateway_error(msg)
             logger.error("gateway failed to become healthy: {}", msg)
         self.tunnel.start(cfg)
+        with self._state_lock:
+            self._tunnel_conns_expected = 0
         self._start_health_loop()
         return healthy
 
@@ -325,6 +347,10 @@ class Supervisor:
             self._consecutive_failures = 0
             self._consecutive_ok = 0
             self._tunnel_disconnected_since = None
+            self._tunnel_conns = 0
+            self._tunnel_conns_expected = 0
+            self._tunnel_e2e_ok = None
+            self._tunnel_degraded_reason = ""
 
     def restart(self) -> bool:
         self.stop()
@@ -352,6 +378,10 @@ class Supervisor:
         case the live thread remains recorded and a later start refuses to clear
         its stop Event, preventing an old loop from being accidentally revived.
         """
+        watcher = self._network_watcher
+        if watcher is not None:
+            watcher.stop()
+            self._network_watcher = None
         with self._health_lifecycle_lock:
             self._health_stopping = True
             self._health_stop.set()
@@ -395,7 +425,15 @@ class Supervisor:
             thread = threading.Thread(target=_loop, name="supervisor-health", daemon=True)
             self._health_thread = thread
             thread.start()
-            return True
+
+        # Start network watcher for instant reconnect on network changes
+        from .network_watch import NetworkWatcher
+        if self._network_watcher is None:
+            self._network_watcher = NetworkWatcher(
+                on_change=lambda: self.request_tunnel_reconnect("network_change")
+            )
+            self._network_watcher.start()
+        return True
 
     def probe_now(self) -> bool:
         """Run one gateway+tunnel health probe immediately, off the loop cadence.
@@ -409,9 +447,15 @@ class Supervisor:
         self._run_probe_cycle()
         return self._state_snapshot() != before
 
-    def _state_snapshot(self) -> tuple[str, bool]:
+    def _state_snapshot(self) -> tuple:
         with self._state_lock:
-            return (self._gw_health, self._tunnel_connected)
+            return (
+                self._gw_health,
+                self._tunnel_connected,
+                self._tunnel_conns,
+                self._tunnel_conns_expected,
+                self._tunnel_e2e_ok,
+            )
 
     def _run_probe_cycle(self) -> bool:
         """Run ONE gateway+tunnel probe and advance the shared state machine.
@@ -426,11 +470,27 @@ class Supervisor:
             with self._state_lock:
                 prev_gw = self._gw_health
                 prev_tunnel = self._tunnel_connected
+                prev_tunnel_status = self._tunnel_status_snapshot()
 
             alive = self.gateway.is_alive()
             healthy = self._probe_gateway_once() if alive else False
             tunnel_alive = self.tunnel.is_alive()
-            tunnel_connected = self._probe_tunnel_ready()
+            conns = self._probe_tunnel_conns()
+            tunnel_connected = conns > 0
+
+            # Update connection tracking under state lock
+            with self._state_lock:
+                self._tunnel_conns = conns
+                if conns > 0:
+                    self._tunnel_conns_expected = max(
+                        self._tunnel_conns_expected, conns
+                    )
+
+            # End-to-end probe (throttled to 60s intervals)
+            if tunnel_connected:
+                e2e_result = self._probe_tunnel_e2e()
+                with self._state_lock:
+                    self._tunnel_e2e_ok = e2e_result
 
             should_restart_tunnel = False
             with self._state_lock:
@@ -448,14 +508,7 @@ class Supervisor:
                     "Cloudflare tunnel has been disconnected for more than {}s; checking status...",
                     self._TUNNEL_RECONNECT_TIMEOUT
                 )
-                try:
-                    reprovisioned = self._reprovision_if_deleted()
-                    if not reprovisioned:
-                        self.tunnel.stop()
-                        cfg = self._get_cfg()
-                        self.tunnel.start(cfg)
-                except Exception:
-                    logger.exception("Failed to restart cloudflared tunnel")
+                self._restart_tunnel_process("tunnel_timeout")
                 tunnel_connected = False
 
             with self._state_lock:
@@ -491,28 +544,171 @@ class Supervisor:
                         )
                     relaxed = False
                 self._tunnel_connected = tunnel_connected
+                cur_tunnel_status = self._tunnel_status_snapshot()
                 changed = (self._gw_health != prev_gw
-                           or self._tunnel_connected != prev_tunnel)
+                           or self._tunnel_connected != prev_tunnel
+                           or cur_tunnel_status != prev_tunnel_status)
 
         if changed:
             self._fire_status_change()
         return relaxed
 
+    def _tunnel_status_snapshot(self) -> tuple:
+        """Snapshot of tunnel state for change detection (called under _state_lock)."""
+        return (
+            self._tunnel_conns,
+            self._tunnel_conns_expected,
+            self._tunnel_e2e_ok,
+        )
+
+    def _restart_tunnel_process(self, reason: str) -> None:
+        """Stop and restart the cloudflared process.
+
+        Handles re-provisioning if the cloud tunnel was deleted. Resets the
+        expected connection count so the new process can learn from scratch.
+
+        Args:
+            reason: Logging tag for why the restart happened.
+        """
+        logger.warning("restarting cloudflared tunnel process (reason: {})", reason)
+        try:
+            reprovisioned = self._reprovision_if_deleted()
+            if not reprovisioned:
+                self.tunnel.stop()
+                cfg = self._get_cfg()
+                self.tunnel.start(cfg)
+        except Exception:
+            logger.exception("Failed to restart cloudflared tunnel")
+        with self._state_lock:
+            self._tunnel_conns_expected = 0
+
+    def request_tunnel_reconnect(self, reason: str) -> None:
+        """Attempt a soft reconnect; escalate to process restart on failure.
+
+        Uses cloudflared's stdin control channel to issue reconnect commands
+        without killing the process. If the soft reconnect doesn't restore
+        connectivity within _SOFT_RECONNECT_VERIFY_WINDOW seconds, escalates
+        to a full process restart.
+
+        Args:
+            reason: Human-readable reason for the reconnect attempt.
+        """
+        now = time.time()
+        with self._state_lock:
+            elapsed = now - self._last_tunnel_reconnect_ts
+            if elapsed < self._TUNNEL_RECONNECT_COOLDOWN:
+                logger.debug(
+                    "tunnel reconnect skipped: cooldown ({:.1f}s < {}s)",
+                    elapsed,
+                    self._TUNNEL_RECONNECT_COOLDOWN,
+                )
+                return
+            self._last_tunnel_reconnect_ts = now
+            count = max(self._tunnel_conns_expected, 1)
+
+        logger.info("requesting tunnel soft reconnect (reason: {}, count: {})", reason, count)
+        success = self.tunnel.request_reconnect(count)
+        if not success:
+            self._restart_tunnel_process(reason)
+            self._fire_status_change()
+            return
+
+        def _verify() -> None:
+            with self._probe_lock:
+                deadline = time.time() + self._SOFT_RECONNECT_VERIFY_WINDOW
+                while time.time() < deadline:
+                    time.sleep(1.0)
+                    conns = self._probe_tunnel_conns()
+                    with self._state_lock:
+                        self._tunnel_conns = conns
+                        if conns > 0:
+                            self._tunnel_conns_expected = max(
+                                self._tunnel_conns_expected, conns
+                            )
+                    if conns > 0:
+                        e2e_ok = self._probe_tunnel_e2e(ignore_throttle=True)
+                        with self._state_lock:
+                            self._tunnel_e2e_ok = e2e_ok
+                            self._tunnel_connected = True
+                        if e2e_ok:
+                            self._fire_status_change()
+                            return
+                # Verification window expired without recovery
+                self._restart_tunnel_process("soft_reconnect_failed")
+                self._fire_status_change()
+
+        threading.Thread(target=_verify, name="reconnect-verify", daemon=True).start()
+
+    def _probe_tunnel_conns(self) -> int:
+        """Return the number of live edge connections cloudflared reports.
+
+        Probes the metrics /ready endpoint and parses ``readyConnections`` from
+        the JSON body. Returns 0 if the process is not alive, the response is
+        not 200, or the body is unparseable.
+        """
+        if not self.tunnel.is_alive():
+            return 0
+        try:
+            resp = self._client.get(
+                f"http://127.0.0.1:{self.tunnel.metrics_port}/ready", timeout=1
+            )
+            if resp.status_code != 200:
+                return 0
+            data = resp.json()
+            conns = int(data.get("readyConnections", 0))
+            return max(conns, 0)
+        except (ValueError, TypeError, KeyError, AttributeError):
+            return 0
+        except Exception:
+            return 0
+
     def _probe_tunnel_ready(self) -> bool:
         """True if cloudflared reports at least one live edge connection.
 
-        Probes the metrics /ready endpoint (200 = ready, 503 = not yet). Any
-        error (process down, port not up yet) counts as not-ready. Uses the port
-        cloudflared actually bound (which may differ from the configured one if
-        that was busy), not the config value."""
-        if not self.tunnel.is_alive():
-            return False
+        Thin wrapper over _probe_tunnel_conns for backward compatibility with
+        the 60s timeout logic.
+        """
+        return self._probe_tunnel_conns() > 0
+
+    def _probe_tunnel_e2e(self, *, ignore_throttle: bool = False) -> bool:
+        """End-to-end probe through the public tunnel to verify the full path.
+
+        Performs GET https://<hostname>/health through the real edge->cloudflared
+        ->local chain. Throttled to once per _E2E_PROBE_INTERVAL after the last
+        success unless ignore_throttle is set. Returns True when no hostname is
+        configured (skip probe for unregistered tunnels).
+
+        Args:
+            ignore_throttle: When True, skip the 60s cooldown (used for post-
+                reconnect verification).
+
+        Returns:
+            True if the probe succeeded or was skipped, False on failure.
+        """
+        cfg = self._get_cfg()
+        hostname = cfg.cloudflare.hostname
+        if not hostname:
+            return True
+        if not ignore_throttle:
+            now = time.time()
+            with self._state_lock:
+                if now - self._last_e2e_success_ts < self._E2E_PROBE_INTERVAL:
+                    return True
+        import httpx
+        proxy_url = resolve_proxy()
         try:
-            return self._client.get(
-                f"http://127.0.0.1:{self.tunnel.metrics_port}/ready", timeout=1
-            ).status_code == 200
+            with httpx.Client(
+                timeout=5.0,
+                proxy=proxy_url,
+            ) as client:
+                resp = client.get(f"https://{hostname}/health")
+                ok = resp.status_code == 200
         except Exception:
-            return False
+            ok = False
+        if ok:
+            with self._state_lock:
+                self._last_e2e_success_ts = time.time()
+        return ok
 
     def _fire_status_change(self) -> None:
         cb = self.on_status_change
@@ -524,11 +720,60 @@ class Supervisor:
             logger.debug("on_status_change callback failed", exc_info=True)
 
     def _tunnel_status(self) -> str:
+        """Compute tunnel status from connection count and e2e probe results.
+
+        Returns:
+            One of "stopped", "connecting", "running", or "degraded".
+        """
         if not self.tunnel.is_alive():
             return "stopped"
         with self._state_lock:
-            connected = self._tunnel_connected
-        return "running" if connected else "connecting"
+            conns = self._tunnel_conns
+            expected = self._tunnel_conns_expected
+            e2e_ok = self._tunnel_e2e_ok
+        if conns == 0:
+            return "connecting"
+        # running: connections at or above expected AND e2e not explicitly failing
+        effective_expected = expected if expected > 0 else 1
+        if conns >= effective_expected and e2e_ok is not False:
+            return "running"
+        return "degraded"
+
+    def _compute_tunnel_degraded_reason(self) -> str:
+        """Determine why the tunnel is degraded (for display)."""
+        with self._state_lock:
+            conns = self._tunnel_conns
+            expected = self._tunnel_conns_expected
+            e2e_ok = self._tunnel_e2e_ok
+        if e2e_ok is False:
+            return "边缘不可达"
+        effective_expected = expected if expected > 0 else 1
+        if conns < effective_expected:
+            return f"{conns}/{expected} 连接"
+        return ""
+
+    def _tunnel_detail(self) -> str:
+        """Return the detail string for the tunnel menu line.
+
+        Returns human-readable connection info like "4/4 连接" or "边缘不可达",
+        or empty string when not applicable.
+        """
+        status = self._tunnel_status()
+        if status in ("stopped", "connecting"):
+            return ""
+        with self._state_lock:
+            conns = self._tunnel_conns
+            expected = self._tunnel_conns_expected
+            e2e_ok = self._tunnel_e2e_ok
+        if status == "degraded":
+            if e2e_ok is False:
+                return "边缘不可达"
+            effective_expected = expected if expected > 0 else 1
+            return f"{conns}/{effective_expected} 连接"
+        # status == "running"
+        if expected > 0:
+            return f"{conns}/{expected} 连接"
+        return ""
 
     def status(self) -> dict[str, str]:
         """Non-blocking: reads cached health state, never does I/O."""
@@ -540,6 +785,7 @@ class Supervisor:
         return {
             "gateway": gw_health,
             "tunnel": self._tunnel_status(),
+            "tunnel_detail": self._tunnel_detail(),
             "hostname": cfg.cloudflare.hostname if provisioned else "(未注册)",
             "error": last_error,
         }

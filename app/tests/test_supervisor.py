@@ -533,3 +533,383 @@ def test_startup_sync_failure_does_not_block_gateway(monkeypatch, tmp_path):
     assert s.start() is True
     assert s.gateway.is_alive() is True
     s.close()
+
+
+# =============================================================================
+# Tunnel Health Model Tests
+# =============================================================================
+
+import json
+
+
+class _FakeTunnelWithReconnect:
+    """Fake tunnel with request_reconnect support."""
+
+    def __init__(self):
+        self.started = False
+        self.reconnect_calls = []
+        self._metrics_port = 20241
+
+    def start(self, cfg):
+        self.started = True
+
+    def stop(self):
+        self.started = False
+
+    def is_alive(self):
+        return self.started
+
+    def request_reconnect(self, count):
+        self.reconnect_calls.append(count)
+        return True
+
+    @property
+    def metrics_port(self):
+        return self._metrics_port
+
+
+def _make_sup_v2(monkeypatch, tmp_path, provisioned=True, tunnel=None):
+    """Create a supervisor with the new fake tunnel supporting reconnect."""
+    monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
+    cfg = appconfig.load()
+    if provisioned:
+        cfg.cloudflare.hostname = "kg-test.example.com"
+        cfg.cloudflare.run_token = "eyJ_test"
+        appconfig.save(cfg)
+    tun = tunnel or _FakeTunnelWithReconnect()
+    s = supervisor.Supervisor(gateway=_FakeGateway(), tunnel=tun)
+    monkeypatch.setattr(s, "_wait_healthy", lambda timeout=30: True)
+    monkeypatch.setattr(supervisor.gateway, "wait_port_free", lambda *a, **k: True)
+    # Block network watcher from actually starting OS-level watchers
+    monkeypatch.setattr(
+        "kiro_gateway_tray.network_watch.NetworkWatcher.start", lambda self: None
+    )
+    monkeypatch.setattr(
+        "kiro_gateway_tray.network_watch.NetworkWatcher.stop", lambda self: None
+    )
+    return s
+
+
+class _ReadyResponse:
+    """Simulates the cloudflared /ready endpoint response."""
+
+    def __init__(self, ready_connections: int):
+        self.status_code = 200 if ready_connections > 0 else 503
+        self._body = {"status": self.status_code, "readyConnections": ready_connections}
+
+    def json(self):
+        return self._body
+
+
+class _ReadyResponseBadJson:
+    status_code = 200
+
+    def json(self):
+        raise ValueError("bad json")
+
+
+class _ReadyResponseNon200:
+    status_code = 503
+
+    def json(self):
+        return {}
+
+
+class TestProbeReadyConnections:
+    """Test _probe_tunnel_conns parses readyConnections correctly."""
+
+    def test_four_connections_running(self, monkeypatch, tmp_path):
+        s = _make_sup_v2(monkeypatch, tmp_path)
+        s.tunnel.started = True
+        monkeypatch.setattr(s._client, "get", lambda *a, **k: _ReadyResponse(4))
+        assert s._probe_tunnel_conns() == 4
+
+    def test_one_connection(self, monkeypatch, tmp_path):
+        s = _make_sup_v2(monkeypatch, tmp_path)
+        s.tunnel.started = True
+        monkeypatch.setattr(s._client, "get", lambda *a, **k: _ReadyResponse(1))
+        assert s._probe_tunnel_conns() == 1
+
+    def test_zero_connections(self, monkeypatch, tmp_path):
+        s = _make_sup_v2(monkeypatch, tmp_path)
+        s.tunnel.started = True
+        monkeypatch.setattr(s._client, "get", lambda *a, **k: _ReadyResponse(0))
+        assert s._probe_tunnel_conns() == 0
+
+    def test_bad_json_returns_zero(self, monkeypatch, tmp_path):
+        s = _make_sup_v2(monkeypatch, tmp_path)
+        s.tunnel.started = True
+        monkeypatch.setattr(s._client, "get", lambda *a, **k: _ReadyResponseBadJson())
+        assert s._probe_tunnel_conns() == 0
+
+    def test_non_200_returns_zero(self, monkeypatch, tmp_path):
+        s = _make_sup_v2(monkeypatch, tmp_path)
+        s.tunnel.started = True
+        monkeypatch.setattr(s._client, "get", lambda *a, **k: _ReadyResponseNon200())
+        assert s._probe_tunnel_conns() == 0
+
+    def test_process_dead_returns_zero(self, monkeypatch, tmp_path):
+        s = _make_sup_v2(monkeypatch, tmp_path)
+        s.tunnel.started = False
+        assert s._probe_tunnel_conns() == 0
+
+
+class TestTunnelExpectedConnections:
+    """Expected connections track observed peak and reset on restart."""
+
+    def test_peak_tracking(self, monkeypatch, tmp_path):
+        s = _make_sup_v2(monkeypatch, tmp_path)
+        s.tunnel.started = True
+        s.gateway.started = True
+
+        # First observation: 4 connections
+        monkeypatch.setattr(s._client, "get", lambda *a, **k: _ReadyResponse(4))
+        monkeypatch.setattr(s, "_probe_gateway_once", lambda: True)
+        monkeypatch.setattr(s, "_probe_tunnel_e2e", lambda **kw: True)
+        s._run_probe_cycle()
+        assert s._tunnel_conns_expected == 4
+
+        # Drop to 3: expected stays at 4
+        monkeypatch.setattr(s._client, "get", lambda *a, **k: _ReadyResponse(3))
+        s._run_probe_cycle()
+        assert s._tunnel_conns_expected == 4
+        assert s._tunnel_status() == "degraded"
+
+    def test_only_seen_two_is_running(self, monkeypatch, tmp_path):
+        s = _make_sup_v2(monkeypatch, tmp_path)
+        s.tunnel.started = True
+        s.gateway.started = True
+
+        monkeypatch.setattr(s._client, "get", lambda *a, **k: _ReadyResponse(2))
+        monkeypatch.setattr(s, "_probe_gateway_once", lambda: True)
+        monkeypatch.setattr(s, "_probe_tunnel_e2e", lambda **kw: True)
+        s._run_probe_cycle()
+        assert s._tunnel_conns_expected == 2
+        assert s._tunnel_conns == 2
+        assert s._tunnel_status() == "running"
+
+    def test_expected_resets_on_restart(self, monkeypatch, tmp_path):
+        s = _make_sup_v2(monkeypatch, tmp_path)
+        s.tunnel.started = True
+        with s._state_lock:
+            s._tunnel_conns_expected = 4
+        monkeypatch.setattr(s, "_reprovision_if_deleted", lambda: False)
+        s._restart_tunnel_process("test")
+        assert s._tunnel_conns_expected == 0
+
+    def test_four_then_three_degraded(self, monkeypatch, tmp_path):
+        s = _make_sup_v2(monkeypatch, tmp_path)
+        s.tunnel.started = True
+        with s._state_lock:
+            s._tunnel_conns = 3
+            s._tunnel_conns_expected = 4
+            s._tunnel_e2e_ok = True
+        assert s._tunnel_status() == "degraded"
+        detail = s._tunnel_detail()
+        assert "3/4" in detail
+
+
+class TestEndToEndProbe:
+    """Test _probe_tunnel_e2e behavior."""
+
+    def test_e2e_failure_with_local_200_is_degraded(self, monkeypatch, tmp_path):
+        s = _make_sup_v2(monkeypatch, tmp_path)
+        s.tunnel.started = True
+        with s._state_lock:
+            s._tunnel_conns = 4
+            s._tunnel_conns_expected = 4
+            s._tunnel_e2e_ok = False
+        assert s._tunnel_status() == "degraded"
+        detail = s._tunnel_detail()
+        assert "边缘不可达" in detail
+
+    def test_e2e_throttled_after_success(self, monkeypatch, tmp_path):
+        s = _make_sup_v2(monkeypatch, tmp_path)
+        with s._state_lock:
+            s._last_e2e_success_ts = time.time()
+        # Should return True immediately due to throttle
+        result = s._probe_tunnel_e2e()
+        assert result is True
+
+    def test_e2e_no_hostname_returns_true(self, monkeypatch, tmp_path):
+        """Unregistered tunnel (no hostname) should not make network requests."""
+        monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
+        cfg = appconfig.load()
+        cfg.cloudflare.hostname = ""
+        appconfig.save(cfg)
+        s = supervisor.Supervisor(
+            gateway=_FakeGateway(), tunnel=_FakeTunnelWithReconnect()
+        )
+        # If it tries to make a request, httpx would fail because we didn't mock it
+        result = s._probe_tunnel_e2e()
+        assert result is True
+
+    def test_e2e_ignore_throttle(self, monkeypatch, tmp_path):
+        """ignore_throttle=True should probe even within the cooldown."""
+        s = _make_sup_v2(monkeypatch, tmp_path)
+        with s._state_lock:
+            s._last_e2e_success_ts = time.time()
+
+        probe_called = {"n": 0}
+
+        class _FakeClient:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+            def get(self, url, **kw):
+                probe_called["n"] += 1
+
+                class _R:
+                    status_code = 200
+                return _R()
+
+        import httpx
+        monkeypatch.setattr(httpx, "Client", lambda **kw: _FakeClient())
+        result = s._probe_tunnel_e2e(ignore_throttle=True)
+        assert result is True
+        assert probe_called["n"] == 1
+
+
+class TestSoftReconnect:
+    """Test request_tunnel_reconnect escalation logic."""
+
+    def test_soft_reconnect_preferred_no_process_kill(self, monkeypatch, tmp_path):
+        s = _make_sup_v2(monkeypatch, tmp_path)
+        s.tunnel.started = True
+        with s._state_lock:
+            s._tunnel_conns_expected = 4
+
+        s.request_tunnel_reconnect("network_change")
+        assert s.tunnel.reconnect_calls == [4]
+        # Process still alive
+        assert s.tunnel.started is True
+
+    def test_soft_reconnect_failure_escalates(self, monkeypatch, tmp_path):
+        tun = _FakeTunnelWithReconnect()
+        tun.request_reconnect = lambda count: False  # simulate failure
+        s = _make_sup_v2(monkeypatch, tmp_path, tunnel=tun)
+        s.tunnel.started = True
+        monkeypatch.setattr(s, "_reprovision_if_deleted", lambda: False)
+
+        restart_calls = []
+        original_restart = s._restart_tunnel_process
+
+        def _track_restart(reason):
+            restart_calls.append(reason)
+            original_restart(reason)
+
+        monkeypatch.setattr(s, "_restart_tunnel_process", _track_restart)
+        s.request_tunnel_reconnect("network_change")
+        assert "network_change" in restart_calls
+
+    def test_cooldown_prevents_duplicate(self, monkeypatch, tmp_path):
+        s = _make_sup_v2(monkeypatch, tmp_path)
+        s.tunnel.started = True
+        with s._state_lock:
+            s._tunnel_conns_expected = 2
+
+        s.request_tunnel_reconnect("test1")
+        assert len(s.tunnel.reconnect_calls) == 1
+        # Second call within cooldown
+        s.request_tunnel_reconnect("test2")
+        assert len(s.tunnel.reconnect_calls) == 1
+
+    def test_cooldown_expires_allows_reconnect(self, monkeypatch, tmp_path):
+        s = _make_sup_v2(monkeypatch, tmp_path)
+        s.tunnel.started = True
+        with s._state_lock:
+            s._tunnel_conns_expected = 2
+            s._last_tunnel_reconnect_ts = time.time() - 20
+
+        s.request_tunnel_reconnect("test")
+        assert len(s.tunnel.reconnect_calls) == 1
+
+
+class TestTunnelTimeout60sBehavior:
+    """60s fallback behavior must not regress."""
+
+    def test_timeout_triggers_restart(self, monkeypatch, tmp_path):
+        s = _make_sup_v2(monkeypatch, tmp_path)
+        s.start()
+        s.gateway.started = True
+        s.tunnel.started = True
+
+        monkeypatch.setattr(s, "_probe_gateway_once", lambda: True)
+        monkeypatch.setattr(s._client, "get", lambda *a, **k: _ReadyResponse(0))
+        monkeypatch.setattr(s, "_probe_tunnel_e2e", lambda **kw: True)
+        monkeypatch.setattr(s, "_reprovision_if_deleted", lambda: False)
+
+        # First probe: sets disconnected_since
+        s._run_probe_cycle()
+        assert s._tunnel_disconnected_since is not None
+        initial_ts = s._tunnel_disconnected_since
+
+        restart_calls = []
+        monkeypatch.setattr(
+            s, "_restart_tunnel_process",
+            lambda reason: restart_calls.append(reason),
+        )
+
+        # Time jump beyond timeout
+        fake_time = initial_ts + s._TUNNEL_RECONNECT_TIMEOUT + 5
+        monkeypatch.setattr(time, "time", lambda: fake_time)
+
+        s._run_probe_cycle()
+        assert "tunnel_timeout" in restart_calls
+
+
+class TestStopStopsWatcher:
+    """stop() must shut down the network watcher."""
+
+    def test_stop_cleans_watcher(self, monkeypatch, tmp_path):
+        s = _make_sup_v2(monkeypatch, tmp_path)
+        s.start()
+
+        class _FakeWatcher:
+            stopped = False
+
+            def stop(self):
+                _FakeWatcher.stopped = True
+
+        s._network_watcher = _FakeWatcher()
+        s.stop()
+        assert _FakeWatcher.stopped is True
+        assert s._network_watcher is None
+
+
+class TestStatusDict:
+    """status() dict includes tunnel_detail."""
+
+    def test_status_includes_tunnel_detail(self, monkeypatch, tmp_path):
+        s = _make_sup_v2(monkeypatch, tmp_path)
+        s.tunnel.started = True
+        with s._state_lock:
+            s._tunnel_conns = 4
+            s._tunnel_conns_expected = 4
+            s._tunnel_e2e_ok = True
+        result = s.status()
+        assert "tunnel_detail" in result
+        assert "4/4" in result["tunnel_detail"]
+
+    def test_status_degraded_detail(self, monkeypatch, tmp_path):
+        s = _make_sup_v2(monkeypatch, tmp_path)
+        s.tunnel.started = True
+        with s._state_lock:
+            s._tunnel_conns = 1
+            s._tunnel_conns_expected = 4
+            s._tunnel_e2e_ok = True
+        result = s.status()
+        assert result["tunnel"] == "degraded"
+        assert "1/4" in result["tunnel_detail"]
+
+    def test_status_connecting_no_detail(self, monkeypatch, tmp_path):
+        s = _make_sup_v2(monkeypatch, tmp_path)
+        s.tunnel.started = True
+        with s._state_lock:
+            s._tunnel_conns = 0
+        result = s.status()
+        assert result["tunnel"] == "connecting"
+        assert result["tunnel_detail"] == ""

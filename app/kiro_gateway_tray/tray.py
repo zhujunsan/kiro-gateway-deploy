@@ -41,6 +41,7 @@ _STATUS_ZH = {
     "stopped": "已停止",
     "starting": "启动中",
     "connecting": "连接中",
+    "degraded": "降级",
     "error": "异常",
 }
 
@@ -402,7 +403,12 @@ class TrayApp:
 
     def _tunnel_title(self) -> str:
         s = self.sup.status()
-        return f"{_TUNNEL_PREFIX} Cloudflare Tunnel\t{_STATUS_ZH.get(s['tunnel'], s['tunnel'])}"
+        tunnel_status = s['tunnel']
+        label = _STATUS_ZH.get(tunnel_status, tunnel_status)
+        detail = s.get('tunnel_detail', '')
+        if detail and tunnel_status in ('running', 'degraded'):
+            return f"{_TUNNEL_PREFIX} Cloudflare Tunnel\t{label} ({detail})"
+        return f"{_TUNNEL_PREFIX} Cloudflare Tunnel\t{label}"
 
     @staticmethod
     def _recent_fingerprint_of(snap: ActivitySnapshot) -> str:
