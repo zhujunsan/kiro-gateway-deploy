@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.4.26 (2026-08-05)
+
+**New**
+- 向模型事前提示 Kiro 工具参数体积上限（约 50 KB）：对接受大段文本的工具（如 Write / StrReplace，按 schema 字段名检测）注入 system prompt，避免整文件写出后被上游整段丢弃。可用 `TOOL_ARGS_SIZE_HINT` / `TOOL_ARGS_SIZE_LIMIT_BYTES` 关闭或调整。
+
+**Changed**
+- 截断恢复消息改为说明「参数被整段丢弃、无可续写」，并给出具体上限与拆分建议，避免模型盲重试或误以为可续写。
+- 同步上游网关至 `main-c2fec3d`；docker-compose 镜像 pin 至 `ghcr.io/zhujunsan/kiro-gateway:main-c2fec3d`。
+
 ## v0.4.25 (2026-08-05)
 
 **New**
