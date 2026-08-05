@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.4.27 (2026-08-05)
+
+**Fixed**
+- 修复托盘菜单打开期间网关/隧道状态行不实时刷新：tick 回调中周期性触发 health probe（复用 2s throttle），确保菜单保持打开时状态标签在 2–3s 内反映真实健康状态变化。macOS / Windows / Linux 三平台均生效。
+
+**Changed**
+- 同步上游网关至 `main-b0770ee`（测试清理与 OpenAI parity 补充）；docker-compose 镜像 pin 至 `ghcr.io/zhujunsan/kiro-gateway:main-b0770ee`。
+
 ## v0.4.26 (2026-08-05)
 
 **New**

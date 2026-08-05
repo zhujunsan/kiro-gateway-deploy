@@ -799,6 +799,7 @@ class TrayApp:
         """1s tick while Win/Linux popup is open: in-place title refresh."""
         if not self._menu_session_open or sys.platform == "darwin":
             return
+        self._kick_probe_if_due()
         try:
             snap = request_activity.load_snapshot()
             self._set_activity_cache_value(snap)
@@ -841,6 +842,7 @@ class TrayApp:
         """Refresh cached titles without doing disk I/O in AppKit's main loop."""
         if not self._menu_session_open:
             return
+        self._kick_probe_if_due()
         try:
             self._activity_cache.refresh(force=True)
             snap = self._activity_snapshot()
@@ -1360,6 +1362,22 @@ class TrayApp:
             finally:
                 self._update_gate.done()
         threading.Thread(target=_work, daemon=True).start()
+
+    def _kick_probe_if_due(self) -> None:
+        """Spawn a background health probe if the throttle gate allows.
+
+        Called from the 1s menu tick so gateway/tunnel status stays fresh
+        while the menu is open, without blocking the UI thread.
+        """
+        if self._probe_gate.try_enter():
+            def _probe():
+                try:
+                    self.sup.probe_now()
+                except Exception:
+                    logger.debug("tick probe_now failed", exc_info=True)
+                finally:
+                    self._probe_gate.done()
+            threading.Thread(target=_probe, daemon=True).start()
 
     def _on_menu_open(self) -> None:
         # TTL-gated on disk, so this costs a thread spawn at most once an hour.
