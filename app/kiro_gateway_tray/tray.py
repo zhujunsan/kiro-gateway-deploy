@@ -285,6 +285,8 @@ class TrayApp:
         self._live_recent_click_delegate = None
         self._redraw_deferred = False
         self._menu_session_open = False
+        # The NSMenu AppKit is currently displaying, captured in menuWillOpen:.
+        self._live_nsmenu = None
         self.sup.on_status_change = self._on_supervisor_status_change
 
         self._update_info = None
@@ -446,12 +448,7 @@ class TrayApp:
 
     def _live_patch_status_titles(self, nsmenu=None) -> None:
         """Refresh gateway/tunnel status labels without setMenu:."""
-        if nsmenu is None:
-            ic = self._icon
-            handle = getattr(ic, "_menu_handle", None) if ic is not None else None
-            if not handle:
-                return
-            nsmenu = handle[0]
+        nsmenu = self._resolve_status_menu(nsmenu)
         if nsmenu is None:
             return
         try:
@@ -575,8 +572,19 @@ class TrayApp:
         self._live_recent_fp = self._recent_fingerprint_of(snap)
 
     def _resolve_status_menu(self, nsmenu=None):
+        """Resolve the NSMenu to patch, preferring the one actually on screen.
+
+        ``icon._menu_handle`` is only reassigned by pystray's ``_update_menu``,
+        which we suppress while the menu is open. It can therefore point at a
+        stale NSMenu that AppKit is no longer displaying, and patching it would
+        silently do nothing. ``menuWillOpen:`` hands us the live menu, so that
+        reference wins for the whole open session.
+        """
         if nsmenu is not None:
             return nsmenu
+        live = self._live_nsmenu
+        if live is not None:
+            return live
         ic = self._icon
         handle = getattr(ic, "_menu_handle", None) if ic is not None else None
         if not handle:
@@ -734,6 +742,9 @@ class TrayApp:
     def _on_status_menu_will_open(self, nsmenu) -> None:
         """Patch existing rows from cache without blocking AppKit tracking."""
         self._menu_session_open = True
+        # Remember the menu AppKit is about to display: _menu_handle may still
+        # reference a previous NSMenu, and live ticks must not patch that one.
+        self._live_nsmenu = nsmenu
         self._live_active_ids = None
         self._live_recent_fp = None
         self._on_menu_open()
@@ -748,6 +759,7 @@ class TrayApp:
 
     def _on_status_menu_did_close(self, _nsmenu) -> None:
         self._menu_session_open = False
+        self._live_nsmenu = None
         self._live_active_ids = None
         self._live_recent_fp = None
         if self._redraw_deferred:
@@ -1383,15 +1395,7 @@ class TrayApp:
         # TTL-gated on disk, so this costs a thread spawn at most once an hour.
         # Worth it: the hourly timer lags after the machine wakes from sleep.
         self._kick_announcement_check()
-        if self._probe_gate.try_enter():
-            def _probe():
-                try:
-                    self.sup.probe_now()
-                except Exception:
-                    logger.debug("probe_now failed", exc_info=True)
-                finally:
-                    self._probe_gate.done()
-            threading.Thread(target=_probe, daemon=True).start()
+        self._kick_probe_if_due()
 
     def _start_usage_refresh_loop(self) -> None:
         """Periodically refresh the usage cache while the gateway is running.

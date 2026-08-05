@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.4.28 (2026-08-05)
+
+**Fixed**
+- 修复菜单持续打开时网关/隧道状态行只在打开瞬间更新一次、随后僵住：pystray 的 `_menu_handle` 仅在 `_update_menu()` 中重新赋值，而菜单打开期间该调用被刻意屏蔽（避免破坏 AppKit 菜单跟踪），导致每秒的实时 patch 打到了一个已不在屏幕上的旧 NSMenu 上。现改为记住 `menuWillOpen:` 递来的当前菜单，整个打开会话内的实时刷新都以它为目标，菜单关闭后再回退到 `_menu_handle`。
+
+**Changed**
+- `_live_patch_status_titles` 原有的独立菜单反查逻辑收敛到 `_resolve_status_menu`，避免两处解析规则不一致。
+- `_on_menu_open` 中与 `_kick_probe_if_due` 重复的探测代码合并为一处。
+
 ## v0.4.27 (2026-08-05)
 
 **Fixed**
