@@ -950,6 +950,11 @@ class TrayApp:
         def _work():
             try:
                 if restarting:
+                    # A restart first drains the running gateway, which can take
+                    # a few seconds when a streaming reply is still open (see
+                    # gateway.GRACEFUL_STOP_TIMEOUT). Without this the click
+                    # looks ignored until the whole restart finishes.
+                    self._notify(APP_NAME, "正在重启网关…")
                     ok = self.sup.restart()
                     verb = "已重启"
                 else:

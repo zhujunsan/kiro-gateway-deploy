@@ -30,6 +30,22 @@ from .appconfig import AppCfg
 from .log import logger
 
 
+# How long stop() lets the child shut down gracefully after SIGTERM, in
+# seconds. uvicorn's SIGTERM handler drains in-flight requests before exiting,
+# and a streaming (SSE) reply can hold the connection open for minutes. A user
+# who reaches for "restart" is usually doing so *because* a request is wedged,
+# so a long graceful window punishes exactly the case it was meant to protect:
+# the tray looks frozen and nothing happens. 5s is enough for an idle or
+# lightly-loaded gateway to exit cleanly, and short enough that a stuck stream
+# gets escalated to SIGKILL while the click still feels connected to the action.
+GRACEFUL_STOP_TIMEOUT = 5.0
+
+# How long stop() waits for the kernel to reap the child after SIGKILL. SIGKILL
+# is not catchable, so this only covers reaping; anything beyond a beat means the
+# process is stuck in an uninterruptible state and waiting longer won't help.
+KILL_REAP_TIMEOUT = 5.0
+
+
 def _candidate_vendor_roots() -> list[Path]:
     here = Path(__file__).resolve().parent
     roots = [here / "vendor"]
@@ -150,16 +166,27 @@ class GatewayProcess:
         second wait), a follow-up start() — i.e. a restart — could race the
         dying child for the gateway port and fail to bind. So we wait after
         terminate, and wait again after the kill fallback.
+
+        The graceful window is deliberately capped at ``GRACEFUL_STOP_TIMEOUT``:
+        uvicorn drains in-flight requests on SIGTERM, and a live SSE stream would
+        otherwise hold the whole stop (and therefore the tray's restart) hostage.
+        Escalating to SIGKILL is safe for our persisted state — every on-disk
+        write goes through a tmp-file + atomic replace, so the worst case is
+        losing the most recent not-yet-flushed in-memory counters, never a
+        corrupt file.
         """
         if self._proc and self._proc.poll() is None:
             self._proc.terminate()
             try:
-                self._proc.wait(timeout=10)
+                self._proc.wait(timeout=GRACEFUL_STOP_TIMEOUT)
             except subprocess.TimeoutExpired:
-                logger.warning("gateway did not exit within 10s of SIGTERM; killing")
+                logger.warning(
+                    "gateway did not exit within {}s of SIGTERM; killing",
+                    GRACEFUL_STOP_TIMEOUT,
+                )
                 self._proc.kill()
                 try:
-                    self._proc.wait(timeout=5)
+                    self._proc.wait(timeout=KILL_REAP_TIMEOUT)
                 except subprocess.TimeoutExpired:
                     logger.error("gateway still alive after SIGKILL; port may stay busy")
         self._proc = None

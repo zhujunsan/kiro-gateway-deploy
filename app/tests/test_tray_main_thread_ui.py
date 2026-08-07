@@ -141,6 +141,116 @@ def test_start_or_restart_worker_does_not_call_update_menu_directly(monkeypatch)
     assert icon.icon == "fake-icon"
 
 
+def test_restart_notifies_before_stopping_gateway(monkeypatch):
+    """Restart can block for seconds draining a live stream; tell the user first.
+
+    Ordering matters: the notification must be emitted *before* ``sup.restart()``
+    runs, otherwise the click still looks ignored for the whole stop window.
+    """
+    import threading
+
+    from kiro_gateway_tray import tray as tray_mod
+
+    app, icon, _marshaled = _make_app(monkeypatch)
+    done = threading.Event()
+    order: list[str] = []
+
+    monkeypatch.setattr(app.sup, "status", lambda: {"gateway": "running"})
+    monkeypatch.setattr(app, "_notify", lambda _t, msg: order.append(f"notify:{msg}"))
+    monkeypatch.setattr(
+        app.sup, "restart", lambda: order.append("restart") or True
+    )
+    monkeypatch.setattr(tray_mod.appconfig, "load", lambda: MagicMock(
+        cloudflare=MagicMock(hostname="x.example"),
+    ))
+    monkeypatch.setattr(tray_mod, "_tunnel_url", lambda _cfg: "https://x.example")
+
+    orig_redraw = app._request_redraw
+
+    def _redraw_and_signal():
+        orig_redraw()
+        done.set()
+
+    monkeypatch.setattr(app, "_request_redraw", _redraw_and_signal)
+
+    app._on_start_or_restart(icon, None)
+    assert done.wait(timeout=2.0)
+
+    assert order[0].startswith("notify:")
+    assert "重启" in order[0]
+    assert order[1] == "restart"
+    assert any("已重启" in e for e in order[2:])
+
+
+def test_cold_start_does_not_show_restart_notice(monkeypatch):
+    """A stopped gateway starts instantly; a "restarting" toast would be wrong."""
+    import threading
+
+    from kiro_gateway_tray import tray as tray_mod
+
+    app, icon, _marshaled = _make_app(monkeypatch)
+    done = threading.Event()
+    messages: list[str] = []
+
+    monkeypatch.setattr(app.sup, "status", lambda: {"gateway": "stopped"})
+    monkeypatch.setattr(app, "_notify", lambda _t, msg: messages.append(msg))
+    monkeypatch.setattr(app.sup, "start", lambda: True)
+    monkeypatch.setattr(tray_mod.appconfig, "load", lambda: MagicMock(
+        cloudflare=MagicMock(hostname="x.example"),
+    ))
+    monkeypatch.setattr(tray_mod, "_tunnel_url", lambda _cfg: "https://x.example")
+
+    orig_redraw = app._request_redraw
+
+    def _redraw_and_signal():
+        orig_redraw()
+        done.set()
+
+    monkeypatch.setattr(app, "_request_redraw", _redraw_and_signal)
+
+    app._on_start_or_restart(icon, None)
+    assert done.wait(timeout=2.0)
+
+    assert not any("正在重启" in m for m in messages)
+    assert any("已启动" in m for m in messages)
+
+
+def test_restart_failure_still_reports_error_after_notice(monkeypatch):
+    """The early notice must not swallow the failure detail that follows it."""
+    import threading
+
+    from kiro_gateway_tray import tray as tray_mod
+
+    app, icon, _marshaled = _make_app(monkeypatch)
+    done = threading.Event()
+    messages: list[str] = []
+
+    monkeypatch.setattr(app.sup, "status", lambda: {"gateway": "running"})
+    monkeypatch.setattr(app, "_notify", lambda _t, msg: messages.append(msg))
+    monkeypatch.setattr(app.sup, "restart", lambda: False)
+    monkeypatch.setattr(
+        type(app.sup), "last_error", property(lambda _self: "端口被占用")
+    )
+    monkeypatch.setattr(tray_mod.appconfig, "load", lambda: MagicMock(
+        cloudflare=MagicMock(hostname="x.example"),
+    ))
+    monkeypatch.setattr(tray_mod, "_tunnel_url", lambda _cfg: "https://x.example")
+
+    orig_redraw = app._request_redraw
+
+    def _redraw_and_signal():
+        orig_redraw()
+        done.set()
+
+    monkeypatch.setattr(app, "_request_redraw", _redraw_and_signal)
+
+    app._on_start_or_restart(icon, None)
+    assert done.wait(timeout=2.0)
+
+    assert any("正在重启" in m for m in messages)
+    assert messages[-1] == "端口被占用"
+
+
 def test_source_has_no_bare_update_menu_outside_request_redraw():
     """Static guard: worker paths must not call ``*.update_menu()`` directly."""
     from pathlib import Path

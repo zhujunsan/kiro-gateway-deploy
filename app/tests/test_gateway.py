@@ -126,39 +126,175 @@ def test_port_busy_error_embeds_message():
     assert "占用" in str(err)
 
 
+class _FakeProc:
+    """Popen stand-in for stop() tests.
+
+    ``exit_after`` controls how many wait() calls happen before the child is
+    considered gone: 0 ⇒ exits immediately on the first wait (graceful),
+    None ⇒ never exits on its own, so only kill() ends it.
+    """
+
+    def __init__(self, *, alive: bool = True, exit_after: int | None = 0) -> None:
+        self._alive = alive
+        self._exit_after = exit_after
+        self._waits = 0
+        self.events: list[str] = []
+
+    def poll(self):
+        return None if self._alive else 0
+
+    def terminate(self):
+        self.events.append("terminate")
+        if self._exit_after == 0:
+            self._alive = False
+
+    def kill(self):
+        self.events.append("kill")
+        self._alive = False
+
+    def wait(self, timeout=None):
+        self._waits += 1
+        self.events.append(f"wait:{timeout}")
+        if self._alive:
+            raise gateway.subprocess.TimeoutExpired(cmd="gw", timeout=timeout)
+        return 0
+
+
+def _silence_pid_clear(monkeypatch, sink: list[str]) -> None:
+    monkeypatch.setattr(
+        gateway.proc_guard, "clear_gateway_pid", lambda: sink.append("clear-pid")
+    )
+
+
+def test_graceful_stop_timeout_stays_within_user_patience():
+    # The whole point of the constant: a user hitting restart because a request
+    # is wedged must not be made to wait out uvicorn's graceful drain. Anything
+    # above 5s regresses that, and a non-positive value would skip the graceful
+    # path entirely.
+    assert 0 < gateway.GRACEFUL_STOP_TIMEOUT <= 5.0
+    assert 0 < gateway.KILL_REAP_TIMEOUT <= 5.0
+
+
+def test_stop_graceful_exit_does_not_kill(monkeypatch):
+    # Child honours SIGTERM before the deadline: no SIGKILL escalation, and the
+    # graceful wait uses the tuned constant rather than a hardcoded number.
+    events: list[str] = []
+    _silence_pid_clear(monkeypatch, events)
+    proc = _FakeProc(exit_after=0)
+
+    gp = gateway.GatewayProcess()
+    gp._proc = proc
+    gp.stop()
+
+    assert proc.events == ["terminate", f"wait:{gateway.GRACEFUL_STOP_TIMEOUT}"]
+    assert "kill" not in proc.events
+    assert events == ["clear-pid"]
+    assert gp._proc is None
+
+
 def test_stop_waits_after_kill(monkeypatch):
     # If terminate() doesn't make the child exit in time, stop() must kill AND
     # wait again so it never returns while the port-holding child is still alive.
-    events = []
-    monkeypatch.setattr(
-        gateway.proc_guard,
-        "clear_gateway_pid",
-        lambda: events.append("clear-pid"),
-    )
-
-    class _FakeProc:
-        def __init__(self):
-            self._alive = True
-
-        def poll(self):
-            return None if self._alive else 0
-
-        def terminate(self):
-            events.append("terminate")
-
-        def kill(self):
-            events.append("kill")
-            self._alive = False
-
-        def wait(self, timeout=None):
-            events.append(f"wait:{timeout}")
-            if self._alive and "kill" not in events:
-                raise gateway.subprocess.TimeoutExpired(cmd="gw", timeout=timeout)
-            return 0
+    events: list[str] = []
+    _silence_pid_clear(monkeypatch, events)
+    proc = _FakeProc(exit_after=None)
 
     gp = gateway.GatewayProcess()
-    gp._proc = _FakeProc()
+    gp._proc = proc
     gp.stop()
 
-    assert events == ["terminate", "wait:10", "kill", "wait:5", "clear-pid"]
+    assert proc.events == [
+        "terminate",
+        f"wait:{gateway.GRACEFUL_STOP_TIMEOUT}",
+        "kill",
+        f"wait:{gateway.KILL_REAP_TIMEOUT}",
+    ]
+    assert events == ["clear-pid"]
     assert gp._proc is None
+
+
+def test_stop_total_wait_budget_is_bounded_by_constants(monkeypatch):
+    # A wedged SSE stream is the worst case: stop() must never block longer than
+    # the two configured windows combined, no matter how the child behaves.
+    _silence_pid_clear(monkeypatch, [])
+    proc = _FakeProc(exit_after=None)
+
+    gp = gateway.GatewayProcess()
+    gp._proc = proc
+    gp.stop()
+
+    budget = sum(float(e.split(":", 1)[1]) for e in proc.events if e.startswith("wait:"))
+    assert budget <= gateway.GRACEFUL_STOP_TIMEOUT + gateway.KILL_REAP_TIMEOUT
+    assert budget <= 10.0
+
+
+def test_stop_survives_child_alive_after_sigkill(monkeypatch):
+    # Uninterruptible-state child: the second wait times out too. stop() must
+    # still clear bookkeeping and return instead of propagating TimeoutExpired.
+    events: list[str] = []
+    _silence_pid_clear(monkeypatch, events)
+
+    class _Unkillable(_FakeProc):
+        def kill(self):
+            self.events.append("kill")  # stays alive on purpose
+
+    proc = _Unkillable(exit_after=None)
+    gp = gateway.GatewayProcess()
+    gp._proc = proc
+    gp.stop()
+
+    assert proc.events == [
+        "terminate",
+        f"wait:{gateway.GRACEFUL_STOP_TIMEOUT}",
+        "kill",
+        f"wait:{gateway.KILL_REAP_TIMEOUT}",
+    ]
+    assert events == ["clear-pid"]
+    assert gp._proc is None
+
+
+def test_stop_already_dead_child_is_not_signalled(monkeypatch):
+    # Child crashed or was reaped earlier: signalling a dead pid is pointless and
+    # on Windows terminate() on a reaped handle is a needless failure surface.
+    events: list[str] = []
+    _silence_pid_clear(monkeypatch, events)
+    proc = _FakeProc(alive=False)
+
+    gp = gateway.GatewayProcess()
+    gp._proc = proc
+    gp.stop()
+
+    assert proc.events == []
+    assert events == ["clear-pid"]
+    assert gp._proc is None
+
+
+def test_stop_without_child_is_idempotent(monkeypatch):
+    # stop() before any start(), or twice in a row, must be a harmless no-op that
+    # still clears the recorded pid.
+    events: list[str] = []
+    _silence_pid_clear(monkeypatch, events)
+
+    gp = gateway.GatewayProcess()
+    gp.stop()
+    gp.stop()
+
+    assert events == ["clear-pid", "clear-pid"]
+    assert gp._proc is None
+
+
+def test_stop_closes_bootstrap_log_even_when_kill_needed(monkeypatch, tmp_path):
+    # The captured-stdout handle must not leak when the child had to be killed.
+    monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
+    _silence_pid_clear(monkeypatch, [])
+
+    gp = gateway.GatewayProcess()
+    gp._proc = _FakeProc(exit_after=None)
+    log_path = tmp_path / "bootstrap.log"
+    handle = open(log_path, "w", encoding="utf-8")
+    gp._bootstrap_log = handle
+
+    gp.stop()
+
+    assert handle.closed is True
+    assert gp._bootstrap_log is None

@@ -16,9 +16,10 @@ changes, so we subscribe to that instead of waiting for a poll tick:
 Routing messages are treated as an untyped *hint*: we deliberately do not parse
 ``rt_msghdr`` / ``nlmsghdr`` to filter on ``RTM_*`` types. The authoritative
 filter is :func:`outbound_fingerprint` — the callback only fires when the
-address the kernel would actually use for outbound traffic changed. That keeps
-this module free of per-platform struct layouts while still being quiet: a
-storm of unrelated routing chatter costs one cheap local socket call.
+address the kernel would actually use for outbound traffic changed *and* the
+machine currently has a route (see :meth:`NetworkWatcher._maybe_fire`). That
+keeps this module free of per-platform struct layouts while still being quiet:
+a storm of unrelated routing chatter costs one cheap local socket call.
 
 Every native event source degrades to plain polling on failure (unsupported
 platform, sandbox, missing symbol), mirroring the ``notify -> poll`` structure
@@ -83,9 +84,10 @@ class NetworkWatcher:
 
     Args:
         on_change: Called with no arguments from the watcher's daemon thread
-            whenever the outbound fingerprint changes. Must marshal any UI work
-            itself. Exceptions raised by it are logged and swallowed so the
-            watcher survives a bad callback.
+            whenever the outbound fingerprint changes to a usable address —
+            including a return from "no route at all" to the same address as
+            before. Must marshal any UI work itself. Exceptions raised by it
+            are logged and swallowed so the watcher survives a bad callback.
         debounce: Seconds to coalesce a routing-event storm before re-reading
             the fingerprint. A single switch produces many kernel messages
             (link down, address removed, address added, default route added);
@@ -161,18 +163,35 @@ class NetworkWatcher:
     def _maybe_fire(self) -> None:
         """Re-read the fingerprint and invoke the callback if it changed.
 
-        An empty fingerprint (no route at all) is not treated as a change: mid
-        switch the machine is briefly offline, and reconnecting a tunnel with no
-        route is pointless. The next non-empty fingerprint still differs from
-        the pre-switch one, so the notification is delayed, not lost.
+        The empty fingerprint (no route at all) is a *recorded* state, not an
+        ignored one, but it never fires the callback: mid switch the machine is
+        briefly offline and reconnecting a tunnel with no route is pointless.
+        Recording it is what makes the offline -> online edge observable even
+        when the address is unchanged — unplug/replug, sleep/wake, and a router
+        reboot that hands back the same DHCP lease all end on an identical
+        fingerprint, so skipping the empty state entirely would collapse them
+        into "nothing happened" and leave the tunnel wedged.
+
+        Transitions: ``address -> empty`` records only, ``empty -> address``
+        notifies (even for the same address as before), ``address A ->
+        address B`` notifies.
         """
         fingerprint = outbound_fingerprint()
-        if not fingerprint or fingerprint == self._last_fingerprint:
+        if fingerprint == self._last_fingerprint:
             return
         previous = self._last_fingerprint
         self._last_fingerprint = fingerprint
+        if not fingerprint:
+            logger.info(
+                "NetworkWatcher: outbound route lost (was {}); "
+                "deferring notification until a route returns",
+                previous,
+            )
+            return
         logger.info(
-            "NetworkWatcher: outbound address changed {} -> {}", previous, fingerprint
+            "NetworkWatcher: outbound address changed {} -> {}",
+            previous or "(none)",
+            fingerprint,
         )
         try:
             self._on_change()

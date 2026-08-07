@@ -22,8 +22,10 @@ class Supervisor:
     # health probe cadence: tight while settling, relaxed once steady-running
     _PROBE_INTERVAL_ACTIVE = 3      # seconds, while starting/unhealthy
     _PROBE_INTERVAL_STEADY = 15     # seconds, once consistently running
-    # automatically restart cloudflared if stuck in connecting/disconnected state for this long (seconds)
-    _TUNNEL_RECONNECT_TIMEOUT = 60
+    # escalate to process restart if still at zero connections this long after
+    # the first soft reconnect (seconds). Kept short: once readyConnections is
+    # already 0 the tunnel is offline either way; waiting only delays recovery.
+    _TUNNEL_RECONNECT_TIMEOUT = 5
     # how long restart() waits for the old gateway's port to free before
     # starting the new child (seconds)
     _PORT_FREE_TIMEOUT = 10
@@ -35,7 +37,16 @@ class Supervisor:
     # seconds between soft reconnect attempts (cooldown)
     _TUNNEL_RECONNECT_COOLDOWN = 10
     # seconds to wait after a soft reconnect before escalating to process restart
-    _SOFT_RECONNECT_VERIFY_WINDOW = 8
+    # (network-change path). Aligned with _TUNNEL_RECONNECT_TIMEOUT.
+    _SOFT_RECONNECT_VERIFY_WINDOW = 5
+    # consecutive failed end-to-end probes before asking for a soft reconnect.
+    # >1 so a single transient blip on the public path (DNS hiccup, edge PoP
+    # reshuffle, captive-portal moment) doesn't churn the tunnel.
+    _E2E_FAILURE_THRESHOLD = 2
+    # the only tunnel status that counts as settled for cadence purposes;
+    # anything else (connecting / degraded / stopped) means recovery is in
+    # progress and the loop must keep probing on the active cadence.
+    _TUNNEL_SETTLED_STATUS = "running"
 
     def __init__(self, gateway=None, tunnel=None) -> None:
         self.gateway = gateway or GatewayProcess()
@@ -65,6 +76,10 @@ class Supervisor:
         self._tunnel_degraded_reason: str = ""
         self._last_e2e_success_ts: float = 0.0
         self._last_tunnel_reconnect_ts: float = 0.0
+        # Run-length of end-to-end probes that actually ran and failed. Drives
+        # the "edge unreachable but cloudflared thinks it is connected" recovery
+        # path; only real probe results move it (a throttled skip does not).
+        self._e2e_consecutive_failures: int = 0
         # Fired whenever gateway health or tunnel connectivity changes, so the
         # tray can redraw the menu the moment the tunnel comes up (instead of
         # waiting for the next time the user opens the menu).
@@ -351,6 +366,7 @@ class Supervisor:
             self._tunnel_conns_expected = 0
             self._tunnel_e2e_ok = None
             self._tunnel_degraded_reason = ""
+            self._e2e_consecutive_failures = 0
 
     def restart(self) -> bool:
         self.stop()
@@ -462,9 +478,15 @@ class Supervisor:
 
         Serialized by ``_probe_lock`` so the background loop and an on-demand
         ``probe_now`` can't interleave half-updates into the one state machine.
-        Returns True when the caller should use the relaxed cadence (gateway
-        down, or running steadily). Fires ``on_status_change`` only on an actual
-        transition.
+        Fires ``on_status_change`` only on an actual transition.
+
+        Returns:
+            True when the caller may use the relaxed cadence. That requires the
+            gateway to be settled (down, or running steadily) *and* the tunnel
+            to be healthily ``running``: a tunnel at zero connections or
+            degraded is mid-recovery, and waiting ``_PROBE_INTERVAL_STEADY``
+            before looking again would stretch a few-second outage into a
+            15-second one even though the gateway itself looks perfect.
         """
         with self._probe_lock:
             with self._state_lock:
@@ -486,27 +508,73 @@ class Supervisor:
                         self._tunnel_conns_expected, conns
                     )
 
-            # End-to-end probe (throttled to 60s intervals)
+            # End-to-end probe (throttled to 60s intervals). cloudflared can
+            # report healthy edge connections while the public path is broken
+            # (stale edge session after a network switch), so repeated failures
+            # here are their own trigger for recovery.
+            should_soft_reconnect_e2e = False
             if tunnel_connected:
                 e2e_result = self._probe_tunnel_e2e()
                 with self._state_lock:
                     self._tunnel_e2e_ok = e2e_result
+                    if self._e2e_consecutive_failures >= self._E2E_FAILURE_THRESHOLD:
+                        # Reset on action so the counter always means "real
+                        # failures observed since the last recovery attempt".
+                        self._e2e_consecutive_failures = 0
+                        should_soft_reconnect_e2e = True
 
+            tunnel_restarted = False
+            if should_soft_reconnect_e2e:
+                logger.warning(
+                    "Cloudflare tunnel edge unreachable for {} consecutive "
+                    "end-to-end probes; requesting soft reconnect",
+                    self._E2E_FAILURE_THRESHOLD,
+                )
+                if self._issue_soft_reconnect("tunnel_e2e_failed") == "restarted":
+                    # Soft path unavailable, so the process was restarted: the
+                    # connection count read above belongs to the dead child. Go
+                    # back to a clean "connecting" state and leave the zero-conn
+                    # escalation clock for the next cycle to start.
+                    tunnel_restarted = True
+                    tunnel_connected = False
+                    with self._state_lock:
+                        self._tunnel_conns = 0
+                        self._tunnel_disconnected_since = None
+
+            # Zero connections: soft-reconnect immediately (skip cloudflared's
+            # own backoff), then escalate to process restart if still zero after
+            # _TUNNEL_RECONNECT_TIMEOUT. Soft reconnect is impossible when the
+            # process is dead / stdin is gone — escalate right away in that case.
             should_restart_tunnel = False
+            should_soft_reconnect = False
             with self._state_lock:
                 if tunnel_connected:
                     self._tunnel_disconnected_since = None
-                else:
-                    if self._tunnel_disconnected_since is None:
-                        self._tunnel_disconnected_since = time.time()
-                    elif time.time() - self._tunnel_disconnected_since > self._TUNNEL_RECONNECT_TIMEOUT:
-                        should_restart_tunnel = True
+                elif tunnel_restarted:
+                    pass  # just restarted above; nothing left to escalate
+                elif self._tunnel_disconnected_since is None:
+                    self._tunnel_disconnected_since = time.time()
+                    should_soft_reconnect = True
+                elif time.time() - self._tunnel_disconnected_since > self._TUNNEL_RECONNECT_TIMEOUT:
+                    should_restart_tunnel = True
+                    self._tunnel_disconnected_since = None
+
+            if should_soft_reconnect:
+                logger.info(
+                    "Cloudflare tunnel has zero edge connections; requesting soft reconnect"
+                )
+                if self._issue_soft_reconnect("tunnel_zero_conns") == "restarted":
+                    # Soft path unavailable (dead process / broken stdin) —
+                    # process already restarted; clear the disconnect clock.
+                    tunnel_connected = False
+                    with self._state_lock:
                         self._tunnel_disconnected_since = None
 
             if should_restart_tunnel:
                 logger.warning(
-                    "Cloudflare tunnel has been disconnected for more than {}s; checking status...",
-                    self._TUNNEL_RECONNECT_TIMEOUT
+                    "Cloudflare tunnel still at zero connections after {}s; "
+                    "restarting cloudflared process",
+                    self._TUNNEL_RECONNECT_TIMEOUT,
                 )
                 self._restart_tunnel_process("tunnel_timeout")
                 tunnel_connected = False
@@ -549,6 +617,17 @@ class Supervisor:
                            or self._tunnel_connected != prev_tunnel
                            or cur_tunnel_status != prev_tunnel_status)
 
+            # A gateway-only view of "settled" would park a broken tunnel on the
+            # 15s cadence, because a tunnel outage does not make the local
+            # gateway unhealthy: zero connections, a degraded edge or a dead
+            # cloudflared would each cost up to _PROBE_INTERVAL_STEADY before
+            # anyone looked. Only relax once BOTH sides are steady. Gated on
+            # ``alive`` so a deliberately-down gateway still relaxes instead of
+            # spinning at the active cadence forever. Recomputed outside
+            # _state_lock: _tunnel_status takes that lock itself.
+            if relaxed and alive and self._tunnel_status() != self._TUNNEL_SETTLED_STATUS:
+                relaxed = False
+
         if changed:
             self._fire_status_change()
         return relaxed
@@ -581,6 +660,51 @@ class Supervisor:
             logger.exception("Failed to restart cloudflared tunnel")
         with self._state_lock:
             self._tunnel_conns_expected = 0
+            # The new process gets a clean slate: a streak inherited from the
+            # old one would make the very next failure escalate prematurely.
+            self._e2e_consecutive_failures = 0
+
+    def _issue_soft_reconnect(self, reason: str) -> str:
+        """Ask cloudflared to rebuild edge connections without killing the process.
+
+        Respects ``_TUNNEL_RECONNECT_COOLDOWN`` so network-change and zero-conn
+        probes cannot spam stdin. When the control channel is unusable (process
+        dead, stdin closed), escalates immediately to a full process restart —
+        there is nothing soft left to try.
+
+        Args:
+            reason: Logging / restart tag for why reconnect was requested.
+
+        Returns:
+            ``"sent"`` if the soft reconnect command was written;
+            ``"skipped"`` if suppressed by cooldown;
+            ``"restarted"`` if soft reconnect was impossible and a process
+            restart was triggered instead.
+        """
+        now = time.time()
+        with self._state_lock:
+            elapsed = now - self._last_tunnel_reconnect_ts
+            if elapsed < self._TUNNEL_RECONNECT_COOLDOWN:
+                logger.debug(
+                    "tunnel reconnect skipped: cooldown ({:.1f}s < {}s)",
+                    elapsed,
+                    self._TUNNEL_RECONNECT_COOLDOWN,
+                )
+                return "skipped"
+            self._last_tunnel_reconnect_ts = now
+            count = max(self._tunnel_conns_expected, 1)
+
+        logger.info(
+            "requesting tunnel soft reconnect (reason: {}, count: {})",
+            reason,
+            count,
+        )
+        success = self.tunnel.request_reconnect(count)
+        if not success:
+            self._restart_tunnel_process(reason)
+            self._fire_status_change()
+            return "restarted"
+        return "sent"
 
     def request_tunnel_reconnect(self, reason: str) -> None:
         """Attempt a soft reconnect; escalate to process restart on failure.
@@ -593,24 +717,8 @@ class Supervisor:
         Args:
             reason: Human-readable reason for the reconnect attempt.
         """
-        now = time.time()
-        with self._state_lock:
-            elapsed = now - self._last_tunnel_reconnect_ts
-            if elapsed < self._TUNNEL_RECONNECT_COOLDOWN:
-                logger.debug(
-                    "tunnel reconnect skipped: cooldown ({:.1f}s < {}s)",
-                    elapsed,
-                    self._TUNNEL_RECONNECT_COOLDOWN,
-                )
-                return
-            self._last_tunnel_reconnect_ts = now
-            count = max(self._tunnel_conns_expected, 1)
-
-        logger.info("requesting tunnel soft reconnect (reason: {}, count: {})", reason, count)
-        success = self.tunnel.request_reconnect(count)
-        if not success:
-            self._restart_tunnel_process(reason)
-            self._fire_status_change()
+        result = self._issue_soft_reconnect(reason)
+        if result != "sent":
             return
 
         def _verify() -> None:
@@ -666,7 +774,7 @@ class Supervisor:
         """True if cloudflared reports at least one live edge connection.
 
         Thin wrapper over _probe_tunnel_conns for backward compatibility with
-        the 60s timeout logic.
+        the zero-conn reconnect timeout logic.
         """
         return self._probe_tunnel_conns() > 0
 
@@ -677,6 +785,12 @@ class Supervisor:
         ->local chain. Throttled to once per _E2E_PROBE_INTERVAL after the last
         success unless ignore_throttle is set. Returns True when no hostname is
         configured (skip probe for unregistered tunnels).
+
+        Side effect: maintains ``_e2e_consecutive_failures``, but only for
+        requests that actually hit the network. A throttled or unconfigured
+        skip also returns True, so counting on the return value alone would
+        silently clear a real failure streak; the two cases are separated here
+        instead of at the call site.
 
         Args:
             ignore_throttle: When True, skip the 60s cooldown (used for post-
@@ -705,9 +819,16 @@ class Supervisor:
                 ok = resp.status_code == 200
         except Exception:
             ok = False
-        if ok:
-            with self._state_lock:
+        with self._state_lock:
+            if ok:
                 self._last_e2e_success_ts = time.time()
+                self._e2e_consecutive_failures = 0
+            else:
+                self._e2e_consecutive_failures += 1
+                logger.debug(
+                    "tunnel end-to-end probe failed ({} consecutive)",
+                    self._e2e_consecutive_failures,
+                )
         return ok
 
     def _fire_status_change(self) -> None:

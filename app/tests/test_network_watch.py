@@ -188,7 +188,7 @@ def test_fires_only_when_fingerprint_changes(monkeypatch):
     assert watcher._last_fingerprint == "192.168.1.9"
 
 
-def test_empty_fingerprint_is_not_a_change(monkeypatch):
+def test_going_offline_records_state_without_firing(monkeypatch):
     """Mid-switch the box is briefly offline: reconnecting then is pointless."""
     fired = []
     _fingerprints(monkeypatch, ["", "", "172.16.0.2"])
@@ -198,10 +198,64 @@ def test_empty_fingerprint_is_not_a_change(monkeypatch):
     watcher._maybe_fire()
     watcher._maybe_fire()
     assert fired == []
-    # The pre-switch fingerprint is retained, so the change is delayed not lost.
-    assert watcher._last_fingerprint == "10.0.0.5"
+    # "Offline" is recorded, not ignored: that is what makes the return
+    # observable even when the address comes back identical.
+    assert watcher._last_fingerprint == ""
     watcher._maybe_fire()
     assert fired == [1]
+
+
+def test_returning_online_with_the_same_address_fires(monkeypatch):
+    """Unplug/replug, sleep/wake, same DHCP lease: the tunnel still needs a kick."""
+    fired = []
+    _fingerprints(monkeypatch, ["", "10.0.0.5"])
+    watcher = NetworkWatcher(lambda: fired.append(1))
+    watcher._last_fingerprint = "10.0.0.5"
+
+    watcher._maybe_fire()
+    assert fired == []
+    watcher._maybe_fire()
+    assert fired == [1]
+    assert watcher._last_fingerprint == "10.0.0.5"
+
+
+def test_staying_offline_fires_at_most_once_per_outage(monkeypatch):
+    """A long outage must not produce a callback per poll tick."""
+    fired = []
+    _fingerprints(monkeypatch, ["", "", "", "10.0.0.5", "10.0.0.5"])
+    watcher = NetworkWatcher(lambda: fired.append(1))
+    watcher._last_fingerprint = "10.0.0.5"
+
+    for _ in range(5):
+        watcher._maybe_fire()
+
+    # Three offline polls: silent. Then one recovery callback, and the repeat
+    # of the same address afterwards is not a change.
+    assert fired == [1]
+
+
+def test_offline_at_startup_then_online_fires(monkeypatch):
+    """A watcher seeded while offline must notify once a route appears."""
+    fired = []
+    _fingerprints(monkeypatch, ["192.168.0.2"])
+    watcher = NetworkWatcher(lambda: fired.append(1))
+    # start() seeds the baseline; offline at that moment means "".
+    watcher._last_fingerprint = ""
+
+    watcher._maybe_fire()
+    assert fired == [1]
+    assert watcher._last_fingerprint == "192.168.0.2"
+
+
+def test_offline_start_stays_quiet_while_still_offline(monkeypatch):
+    fired = []
+    _fingerprints(monkeypatch, ["", ""])
+    watcher = NetworkWatcher(lambda: fired.append(1))
+    watcher._last_fingerprint = ""
+
+    watcher._maybe_fire()
+    watcher._maybe_fire()
+    assert fired == []
 
 
 def test_callback_exception_does_not_break_the_watcher(monkeypatch):
