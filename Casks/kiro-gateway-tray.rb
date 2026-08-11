@@ -1,12 +1,12 @@
 cask "kiro-gateway-tray" do
-  version "0.4.29"
+  version "0.4.30"
 
   on_arm do
-    sha256 "6b89287becdeb2a768e347f6135f80fc9157da1527d0e0d56d9c53521ae37cb4"
+    sha256 "34598a661a6d9ed9454d7580c871c557b1f5822bc845eb3e8cf412e858b904c1"
     url "https://github.com/zhujunsan/kiro-gateway-deploy/releases/download/v#{version}/KiroGatewayTray-#{version}-macos-arm64.dmg"
   end
   on_intel do
-    sha256 "bb217355595685969533b39a0f05c20ccde04ed1b4c8f8b643be0a9543e0fe72"
+    sha256 "0a2f66ca8809264ff13a950eaf6b9b118f9e3277f5c8715cbc1ef978097fffec"
     url "https://github.com/zhujunsan/kiro-gateway-deploy/releases/download/v#{version}/KiroGatewayTray-#{version}-macos-amd64.dmg"
   end
 
