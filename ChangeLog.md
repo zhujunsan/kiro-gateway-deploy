@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.4.30 (2026-08-11)
+
+**Changed**
+- 升级 Python 依赖：fastapi 0.141.1、uvicorn 0.52.1、starlette 1.6.0、sentry-sdk 2.67.1、pyinstaller 6.22.0、websockets 17.0.1，以及 annotated-doc/types、anyio、certifi、packaging、platformdirs、regex、setuptools、typing-inspection 等小版本；重新生成 `uv.lock`。
+- 遥测更新 skill 补充 Cloudflare 带宽步骤与 `export_user_daily_tokens.py` 提醒。
+
+**Fixed**
+- 修复 supervisor 单测在本机已有 cloudflared（metrics `20241`）时被真实 `readyConnections` 污染：测试 fake 改用独立端口，`_quiesce` 一并清零连接期望值。
+
 ## v0.4.29 (2026-08-07)
 
 **Fixed**

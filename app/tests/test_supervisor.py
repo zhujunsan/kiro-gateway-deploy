@@ -29,7 +29,9 @@ class _FakeTunnel:
 
     @property
     def metrics_port(self):
-        return 20241
+        # Deliberately not cloudflared's common 20241 — a live local tunnel
+        # on that port would leak real readyConnections into unit probes.
+        return 27999
 
 
 def _make_sup(monkeypatch, tmp_path, provisioned=True):
@@ -717,7 +719,9 @@ class _FakeTunnelWithReconnect:
     def __init__(self):
         self.started = False
         self.reconnect_calls = []
-        self._metrics_port = 20241
+        # Same rationale as _FakeTunnel.metrics_port: avoid colliding with a
+        # real cloudflared metrics listener on the developer's machine.
+        self._metrics_port = 27999
 
     def start(self, cfg):
         self.started = True
@@ -1146,6 +1150,8 @@ def _quiesce(s) -> None:
         s._e2e_consecutive_failures = 0
         s._consecutive_ok = 0
         s._consecutive_failures = 0
+        s._tunnel_conns = 0
+        s._tunnel_conns_expected = 0
 
 
 class TestE2EFailureCounter:

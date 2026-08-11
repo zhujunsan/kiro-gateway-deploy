@@ -27,7 +27,9 @@ cd /Users/san/project/kiro-gateway-deploy/local-telemetry
 python3 refresh.py
 ```
 
-会并行：D1→MySQL、Cloudflare Observability、（若有 token）`sentry_errors.py`，再生成 `report-latest.*`。
+会并行：D1→MySQL、Cloudflare Observability、（若有 token）`sentry_errors.py`；随后串行跑 `cloudflare_bandwidth.py`（二·补·四 流量表 + canvas `CF_BANDWIDTH`），再生成 `report-latest.*`。
+
+`[warn] CF 带宽 skipped: ...` 表示 wrangler OAuth 失效（该节需要 `zone.analytics.read`，作用域 API token 没有）→ `cd worker && wrangler login` 后单独重跑 `python3 cloudflare_bandwidth.py`。不阻塞其余流程。
 
 **不要**因为日志出现 `[warn] Sentry skipped: missing worker/.sentry-auth-token` 就停——这是预期；下一步用 MCP 补 Sentry。
 
@@ -53,6 +55,12 @@ Token 文件路径仅作 **CI/无头脚本** 可选增强：有则 `refresh.py` 
 ```bash
 python3 update_observations.py
 # 可选：--dry-run / --md-only / --canvas-only
+```
+
+另外别忘了 **`export_user_daily_tokens.py`**（user-daily-tokens canvas，不在 `refresh.py` 里）：
+
+```bash
+python3 export_user_daily_tokens.py
 ```
 
 脚本从 `report-latest.json` + CF/Sentry 报告自动：
