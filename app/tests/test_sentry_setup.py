@@ -2,6 +2,8 @@
 """Tests for Sentry init helpers: DSN resolution, scrubbing, verify middleware."""
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from kiro_gateway_tray import sentry_setup as ss
@@ -400,6 +402,8 @@ def test_init_sentry_noop_without_dsn(monkeypatch):
 
 def test_init_sentry_idempotent(monkeypatch):
     calls: list[dict] = []
+    logging_kwargs: list[dict] = []
+    loguru_kwargs: list[dict] = []
 
     class _FakeSdk:
         @staticmethod
@@ -414,9 +418,13 @@ def test_init_sentry_idempotent(monkeypatch):
         def set_user(user):
             pass
 
+    class _FakeLogging:
+        def __init__(self, **kwargs):
+            logging_kwargs.append(kwargs)
+
     class _FakeLoguru:
         def __init__(self, **kwargs):
-            pass
+            loguru_kwargs.append(kwargs)
 
     class _FakeScrubber:
         def __init__(self, **kwargs):
@@ -424,6 +432,11 @@ def test_init_sentry_idempotent(monkeypatch):
 
     monkeypatch.setenv("SENTRY_DSN", "https://key@o1.ingest.sentry.io/99")
     monkeypatch.setitem(__import__("sys").modules, "sentry_sdk", _FakeSdk)
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "sentry_sdk.integrations.logging",
+        type("m", (), {"LoggingIntegration": _FakeLogging})(),
+    )
     monkeypatch.setitem(
         __import__("sys").modules,
         "sentry_sdk.integrations.loguru",
@@ -442,6 +455,58 @@ def test_init_sentry_idempotent(monkeypatch):
     assert calls[0]["send_default_pii"] is False
     assert calls[0]["max_request_body_size"] == "always"
     assert calls[0]["before_send"] is ss.before_send
+    assert calls[0]["before_send_log"] is ss.before_send_log
+    assert calls[0]["enable_logs"] is True
+    assert logging_kwargs == [{
+        "level": logging.INFO,
+        "event_level": logging.ERROR,
+        "sentry_logs_level": logging.WARNING,
+    }]
+    assert loguru_kwargs == [{
+        "level": "INFO",
+        "event_level": None,
+        "sentry_logs_level": logging.WARNING,
+    }]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"severity_text": "trace"},
+        {"severity_text": "DEBUG"},
+        {"severity_text": "info"},
+        {"severity_text": " INFO "},
+        {"severity_number": 9},
+        {"severity_text": "info", "severity_number": 9},
+        {"severity_text": "warning", "severity_number": 11},
+    ],
+)
+def test_before_send_log_drops_below_warn(payload):
+    assert ss.before_send_log(payload, {}) is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"severity_text": "warning"},
+        {"severity_text": "WARN"},
+        {"severity_text": "error"},
+        {"severity_text": "fatal"},
+        {"severity_number": 13},
+        {"severity_text": "warning", "severity_number": 13},
+        {"severity_text": "error", "severity_number": 17},
+        {},
+    ],
+)
+def test_before_send_log_keeps_warn_and_above(payload):
+    assert ss.before_send_log(payload, {"ignored": True}) is payload
+
+
+def test_before_send_log_does_not_mutate_kept_log():
+    log = {"severity_text": "error", "body": "gateway failed"}
+    kept = ss.before_send_log(log, {})
+    assert kept is log
+    assert log["body"] == "gateway failed"
 
 def test_traces_sampler_drops_health():
     assert ss._traces_sampler({

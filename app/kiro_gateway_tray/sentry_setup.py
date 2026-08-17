@@ -12,11 +12,15 @@ metadata as tags/context, request/response bodies as attachments.
 Auth headers and secret-looking frame locals are still scrubbed. Request and
 response bodies are intentionally retained — they are the primary debugging
 signal for gateway incidents.
+
+Sentry Logs (the byte-quota product) only receive ``warning`` and above.
+INFO access lines and update-check chatter previously exhausted the free 5 GB.
 """
 from __future__ import annotations
 
 import errno
 import json
+import logging
 import os
 import sys
 from typing import Any, Literal
@@ -61,6 +65,13 @@ _SENSITIVE_VAR_NAMES = frozenset({
 
 _READY = False
 _SNAPSHOT_BRIDGE_INSTALLED = False
+
+# OpenTelemetry SeverityNumber: warn starts at 13. INFO/SUCCESS sit at 9–11.
+_OTEL_SEVERITY_WARN = 13
+_SENTRY_LOGS_DROP_TEXT = frozenset({"trace", "debug", "info"})
+# Breadcrumbs stay at INFO so error events still have request context.
+# Structured Logs and stdlib capture start at WARNING.
+_SENTRY_LOGS_LEVEL = logging.WARNING
 
 
 def resolve_dsn(env: dict[str, str] | None = None) -> str:
@@ -485,6 +496,34 @@ def _traces_sampler(sampling_context: dict[str, Any]) -> float:
     return 0.05
 
 
+def before_send_log(
+    log: dict[str, Any],
+    hint: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Drop info/debug/trace so Sentry Logs only keep warn+error.
+
+    Integrations already filter at WARNING, but uvicorn access logs and
+    loguru INFO can arrive via more than one path. This is the last gate
+    before ingest, independent of which integration captured the record.
+
+    Args:
+        log: Sentry structured log payload (severity_text / severity_number).
+        hint: SDK hint dict; unused, required by the callback signature.
+
+    Returns:
+        The original ``log`` when severity is warning or higher, otherwise
+        ``None`` to discard.
+    """
+    del hint
+    text = str(log.get("severity_text") or "").strip().lower()
+    if text in _SENTRY_LOGS_DROP_TEXT:
+        return None
+    number = log.get("severity_number")
+    if isinstance(number, int) and number < _OTEL_SEVERITY_WARN:
+        return None
+    return log
+
+
 def init_sentry(*, process: ProcessKind) -> bool:
     """Initialize the Sentry SDK for this process.
 
@@ -508,6 +547,7 @@ def init_sentry(*, process: ProcessKind) -> bool:
 
     try:
         import sentry_sdk
+        from sentry_sdk.integrations.logging import LoggingIntegration
         from sentry_sdk.integrations.loguru import LoguruIntegration
         from sentry_sdk.scrubber import DEFAULT_DENYLIST, EventScrubber
     except ImportError:
@@ -527,11 +567,23 @@ def init_sentry(*, process: ProcessKind) -> bool:
             traces_sampler=_traces_sampler,
             enable_logs=True,
             before_send=before_send,
+            before_send_log=before_send_log,
             event_scrubber=EventScrubber(denylist=denylist, recursive=True),
             integrations=[
-                # Breadcrumbs only — ERROR log lines must not become duplicate
-                # Issues alongside capture_exception / framework handlers.
-                LoguruIntegration(level="INFO", event_level=None),
+                # Default LoggingIntegration ships INFO into Sentry Logs
+                # (uvicorn.access via callHandlers even when propagate=False).
+                LoggingIntegration(
+                    level=logging.INFO,
+                    event_level=logging.ERROR,
+                    sentry_logs_level=_SENTRY_LOGS_LEVEL,
+                ),
+                # Breadcrumbs at INFO; do not turn ERROR log lines into Issues
+                # (those already go through capture_exception / snapshots).
+                LoguruIntegration(
+                    level="INFO",
+                    event_level=None,
+                    sentry_logs_level=_SENTRY_LOGS_LEVEL,
+                ),
             ],
             in_app_include=["kiro_gateway_tray", "kiro"],
         )
@@ -794,6 +846,7 @@ def install_gateway_verify_route(app: Any) -> Any:
 __all__ = [
     "DEFAULT_DSN",
     "before_send",
+    "before_send_log",
     "capture_exception",
     "flush",
     "init_sentry",

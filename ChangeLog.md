@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.4.31 (2026-08-17)
+
+**Changed**
+- Sentry Logs 只上报 warning 及以上：uvicorn 访问日志、升级检查等 INFO 不再计入 Logs 额度。此前一个账期就把免费 5 GB 打满，导致后半段监控被丢。错误事件（Issues）与 error 上的 INFO breadcrumb 仍保留。
+
 ## v0.4.30 (2026-08-11)
 
 **Changed**
