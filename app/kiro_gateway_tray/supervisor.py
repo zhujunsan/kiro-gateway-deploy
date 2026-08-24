@@ -2,10 +2,16 @@
 """Orchestrate gateway + cloudflared and handle first-run provisioning."""
 from __future__ import annotations
 
+import re
+import socket
+import ssl
 import sys
 import threading
 import time
-from typing import Callable
+from dataclasses import dataclass
+from typing import Callable, Iterator
+
+import httpx
 
 from . import appconfig
 from . import gateway
@@ -14,6 +20,158 @@ from .httpclient import local_client, resolve_proxy
 from .appconfig import AppCfg
 from .gateway import GatewayProcess
 from .cloudflared import CloudflaredProcess
+
+_E2E_DETAIL_MAX_LEN = 200
+_E2E_QUERYSTRING_RE = re.compile(r"\?[^ \t\r\n]*")
+_E2E_SECRET_KV_RE = re.compile(
+    r"(?i)(authorization|api[_-]?key|token|secret|bearer)\s*[:=]\s*\S+"
+)
+_E2E_SECRET_WORD_RE = re.compile(
+    r"(?i)\b(authorization|api[_-]?key|token|secret|bearer)\b"
+)
+_E2E_RECOVERABLE_KINDS = frozenset({"timeout", "connect", "unexpected"})
+_E2E_KIND_REASONS: dict[str, str] = {
+    "dns": "DNS 解析失败",
+    "tls": "TLS 失败",
+    "proxy": "代理失败",
+    "timeout": "连接超时",
+    "connect": "连接失败",
+}
+
+
+@dataclass(frozen=True)
+class E2EProbeResult:
+    """Structured result of one public-edge health probe.
+
+    Attributes:
+        ok: True when the probe succeeded or was skipped.
+        kind: ``ok`` / ``dns`` / ``proxy`` / ``timeout`` / ``tls`` /
+            ``connect`` / ``http_status`` / ``unexpected``.
+        status_code: HTTP status when the request completed; otherwise None.
+        detail: Sanitized, truncated failure text (never credentials / body).
+        skipped: True when throttled or no hostname is configured. A skip is
+            success-shaped (``ok=True``) but must not move the failure streak.
+    """
+
+    ok: bool
+    kind: str = "ok"
+    status_code: int | None = None
+    detail: str | None = None
+    skipped: bool = False
+
+    def __bool__(self) -> bool:
+        return self.ok
+
+
+def _iter_exception_chain(exc: BaseException) -> Iterator[BaseException]:
+    """Yield ``exc`` and every ``__cause__`` / ``__context__``, de-duplicated."""
+    seen: set[int] = set()
+    stack: list[BaseException] = [exc]
+    while stack:
+        current = stack.pop()
+        ident = id(current)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        yield current
+        if current.__cause__ is not None:
+            stack.append(current.__cause__)
+        if (
+            current.__context__ is not None
+            and current.__context__ is not current.__cause__
+        ):
+            stack.append(current.__context__)
+
+
+def _classify_e2e_exception(exc: BaseException) -> str:
+    """Classify an e2e probe exception by the most specific type in its chain.
+
+    Priority (most specific first): ``dns`` (``socket.gaierror``), ``tls``
+    (``ssl.SSLError``), ``proxy`` (``httpx.ProxyError``), ``timeout``
+    (``httpx.TimeoutException``), ``connect`` (``httpx.ConnectError``).
+    Anything else is ``unexpected``.
+
+    Args:
+        exc: The exception raised by the probe (possibly wrapped).
+
+    Returns:
+        One of ``dns``, ``tls``, ``proxy``, ``timeout``, ``connect``,
+        ``unexpected``.
+    """
+    found: set[str] = set()
+    for item in _iter_exception_chain(exc):
+        if isinstance(item, socket.gaierror):
+            found.add("dns")
+        elif isinstance(item, ssl.SSLError):
+            found.add("tls")
+        elif isinstance(item, httpx.ProxyError):
+            found.add("proxy")
+        elif isinstance(item, httpx.TimeoutException):
+            found.add("timeout")
+        elif isinstance(item, httpx.ConnectError):
+            found.add("connect")
+    for kind in ("dns", "tls", "proxy", "timeout", "connect"):
+        if kind in found:
+            return kind
+    return "unexpected"
+
+
+def _sanitize_e2e_detail(text: str, *, max_len: int = _E2E_DETAIL_MAX_LEN) -> str:
+    """Strip querystrings, redact secret-like tokens, and truncate.
+
+    Args:
+        text: Raw exception or status text.
+        max_len: Maximum characters to keep after sanitizing.
+
+    Returns:
+        A log-safe detail string.
+    """
+    stripped = _E2E_QUERYSTRING_RE.sub("", text)
+    stripped = _E2E_SECRET_KV_RE.sub(r"\1=[redacted]", stripped)
+    stripped = _E2E_SECRET_WORD_RE.sub("[redacted]", stripped)
+    if len(stripped) > max_len:
+        return stripped[:max_len] + "..."
+    return stripped
+
+
+def _e2e_is_recoverable(result: E2EProbeResult) -> bool:
+    """True when this failure is worth a one-shot cloudflared reconnect."""
+    if result.ok or result.skipped:
+        return False
+    if result.kind in _E2E_RECOVERABLE_KINDS:
+        return True
+    if result.kind == "http_status":
+        return result.status_code is not None and result.status_code >= 500
+    return False
+
+
+def _as_e2e_result(result: E2EProbeResult | bool) -> E2EProbeResult:
+    """Normalize a probe return value, including test monkeypatches of True/False.
+
+    Args:
+        result: Real ``E2EProbeResult`` or a bool from a test stub.
+
+    Returns:
+        An ``E2EProbeResult``. A bare ``False`` is treated as ``unexpected``
+        (recoverable), matching the pre-structured ``except Exception`` path.
+    """
+    if isinstance(result, E2EProbeResult):
+        return result
+    ok = bool(result)
+    return E2EProbeResult(
+        ok=ok,
+        kind="ok" if ok else "unexpected",
+        skipped=False,
+    )
+
+
+def _e2e_degraded_reason_text(kind: str | None, status_code: int | None) -> str:
+    """User-facing degraded reason for an e2e failure kind."""
+    if kind == "http_status":
+        if status_code is not None:
+            return f"HTTP {status_code}"
+        return "边缘不可达"
+    return _E2E_KIND_REASONS.get(kind or "", "边缘不可达")
 
 
 class Supervisor:
@@ -73,6 +231,8 @@ class Supervisor:
         self._tunnel_conns: int = 0
         self._tunnel_conns_expected: int = 0
         self._tunnel_e2e_ok: bool | None = None
+        self._tunnel_e2e_kind: str | None = None
+        self._tunnel_e2e_status_code: int | None = None
         self._tunnel_degraded_reason: str = ""
         self._last_e2e_success_ts: float = 0.0
         self._last_tunnel_reconnect_ts: float = 0.0
@@ -80,6 +240,10 @@ class Supervisor:
         # the "edge unreachable but cloudflared thinks it is connected" recovery
         # path; only real probe results move it (a throttled skip does not).
         self._e2e_consecutive_failures: int = 0
+        # One-shot latch: after an e2e soft reconnect is actually sent/restarted,
+        # further failures in the same incident must not reconnect again until
+        # a success, start/stop, or request_tunnel_reconnect clears it.
+        self._e2e_recovery_attempted: bool = False
         # Fired whenever gateway health or tunnel connectivity changes, so the
         # tray can redraw the menu the moment the tunnel comes up (instead of
         # waiting for the next time the user opens the menu).
@@ -330,6 +494,10 @@ class Supervisor:
         with self._state_lock:
             self._gw_health = "starting"
             self._last_error = None
+            self._e2e_recovery_attempted = False
+            self._e2e_consecutive_failures = 0
+            self._tunnel_e2e_kind = None
+            self._tunnel_e2e_status_code = None
         # Orphan cleanup may have just signalled a leftover child; give the OS a
         # short window to release the port. If something else still holds it,
         # fail fast with a clear message — never auto-change the port.
@@ -365,8 +533,11 @@ class Supervisor:
             self._tunnel_conns = 0
             self._tunnel_conns_expected = 0
             self._tunnel_e2e_ok = None
+            self._tunnel_e2e_kind = None
+            self._tunnel_e2e_status_code = None
             self._tunnel_degraded_reason = ""
             self._e2e_consecutive_failures = 0
+            self._e2e_recovery_attempted = False
 
     def restart(self) -> bool:
         self.stop()
@@ -471,6 +642,8 @@ class Supervisor:
                 self._tunnel_conns,
                 self._tunnel_conns_expected,
                 self._tunnel_e2e_ok,
+                self._tunnel_e2e_kind,
+                self._tunnel_e2e_status_code,
             )
 
     def _run_probe_cycle(self) -> bool:
@@ -514,13 +687,19 @@ class Supervisor:
             # here are their own trigger for recovery.
             should_soft_reconnect_e2e = False
             if tunnel_connected:
-                e2e_result = self._probe_tunnel_e2e()
+                e2e_result = _as_e2e_result(self._probe_tunnel_e2e())
                 with self._state_lock:
-                    self._tunnel_e2e_ok = e2e_result
-                    if self._e2e_consecutive_failures >= self._E2E_FAILURE_THRESHOLD:
-                        # Reset on action so the counter always means "real
-                        # failures observed since the last recovery attempt".
-                        self._e2e_consecutive_failures = 0
+                    self._tunnel_e2e_ok = e2e_result.ok
+                    if not e2e_result.skipped:
+                        self._tunnel_e2e_kind = e2e_result.kind
+                        self._tunnel_e2e_status_code = e2e_result.status_code
+                    if (
+                        not e2e_result.skipped
+                        and not e2e_result.ok
+                        and self._e2e_consecutive_failures >= self._E2E_FAILURE_THRESHOLD
+                        and _e2e_is_recoverable(e2e_result)
+                        and not self._e2e_recovery_attempted
+                    ):
                         should_soft_reconnect_e2e = True
 
             tunnel_restarted = False
@@ -530,7 +709,12 @@ class Supervisor:
                     "end-to-end probes; requesting soft reconnect",
                     self._E2E_FAILURE_THRESHOLD,
                 )
-                if self._issue_soft_reconnect("tunnel_e2e_failed") == "restarted":
+                reconnect_result = self._issue_soft_reconnect("tunnel_e2e_failed")
+                if reconnect_result in ("sent", "restarted"):
+                    with self._state_lock:
+                        self._e2e_recovery_attempted = True
+                        self._e2e_consecutive_failures = 0
+                if reconnect_result == "restarted":
                     # Soft path unavailable, so the process was restarted: the
                     # connection count read above belongs to the dead child. Go
                     # back to a clean "connecting" state and leave the zero-conn
@@ -638,6 +822,8 @@ class Supervisor:
             self._tunnel_conns,
             self._tunnel_conns_expected,
             self._tunnel_e2e_ok,
+            self._tunnel_e2e_kind,
+            self._tunnel_e2e_status_code,
         )
 
     def _restart_tunnel_process(self, reason: str) -> None:
@@ -663,6 +849,8 @@ class Supervisor:
             # The new process gets a clean slate: a streak inherited from the
             # old one would make the very next failure escalate prematurely.
             self._e2e_consecutive_failures = 0
+            # Do not clear _e2e_recovery_attempted: stdin-unavailable restarts
+            # must not reopen the e2e reconnect loop.
 
     def _issue_soft_reconnect(self, reason: str) -> str:
         """Ask cloudflared to rebuild edge connections without killing the process.
@@ -717,6 +905,8 @@ class Supervisor:
         Args:
             reason: Human-readable reason for the reconnect attempt.
         """
+        with self._state_lock:
+            self._e2e_recovery_attempted = False
         result = self._issue_soft_reconnect(reason)
         if result != "sent":
             return
@@ -734,11 +924,16 @@ class Supervisor:
                                 self._tunnel_conns_expected, conns
                             )
                     if conns > 0:
-                        e2e_ok = self._probe_tunnel_e2e(ignore_throttle=True)
+                        e2e_result = _as_e2e_result(
+                            self._probe_tunnel_e2e(ignore_throttle=True)
+                        )
                         with self._state_lock:
-                            self._tunnel_e2e_ok = e2e_ok
+                            self._tunnel_e2e_ok = e2e_result.ok
+                            if not e2e_result.skipped:
+                                self._tunnel_e2e_kind = e2e_result.kind
+                                self._tunnel_e2e_status_code = e2e_result.status_code
                             self._tunnel_connected = True
-                        if e2e_ok:
+                        if e2e_result.ok:
                             self._fire_status_change()
                             return
                 # Verification window expired without recovery
@@ -778,58 +973,78 @@ class Supervisor:
         """
         return self._probe_tunnel_conns() > 0
 
-    def _probe_tunnel_e2e(self, *, ignore_throttle: bool = False) -> bool:
+    def _probe_tunnel_e2e(self, *, ignore_throttle: bool = False) -> E2EProbeResult:
         """End-to-end probe through the public tunnel to verify the full path.
 
         Performs GET https://<hostname>/health through the real edge->cloudflared
         ->local chain. Throttled to once per _E2E_PROBE_INTERVAL after the last
-        success unless ignore_throttle is set. Returns True when no hostname is
-        configured (skip probe for unregistered tunnels).
+        success unless ignore_throttle is set. Returns a skipped-ok result when
+        no hostname is configured (skip probe for unregistered tunnels).
 
         Side effect: maintains ``_e2e_consecutive_failures``, but only for
         requests that actually hit the network. A throttled or unconfigured
-        skip also returns True, so counting on the return value alone would
-        silently clear a real failure streak; the two cases are separated here
-        instead of at the call site.
+        skip also looks like success (``ok=True``), so counting on ``ok``
+        alone would silently clear a real failure streak; callers must check
+        ``skipped``.
 
         Args:
             ignore_throttle: When True, skip the 60s cooldown (used for post-
                 reconnect verification).
 
         Returns:
-            True if the probe succeeded or was skipped, False on failure.
+            Structured probe result. ``ok`` is True on success or skip.
         """
         cfg = self._get_cfg()
         hostname = cfg.cloudflare.hostname
         if not hostname:
-            return True
+            return E2EProbeResult(ok=True, kind="ok", skipped=True)
         if not ignore_throttle:
             now = time.time()
             with self._state_lock:
                 if now - self._last_e2e_success_ts < self._E2E_PROBE_INTERVAL:
-                    return True
-        import httpx
+                    return E2EProbeResult(ok=True, kind="ok", skipped=True)
         proxy_url = resolve_proxy()
+        result: E2EProbeResult
         try:
             with httpx.Client(
                 timeout=5.0,
                 proxy=proxy_url,
             ) as client:
                 resp = client.get(f"https://{hostname}/health")
-                ok = resp.status_code == 200
-        except Exception:
-            ok = False
+                if resp.status_code == 200:
+                    result = E2EProbeResult(ok=True, kind="ok")
+                else:
+                    result = E2EProbeResult(
+                        ok=False,
+                        kind="http_status",
+                        status_code=resp.status_code,
+                        detail=_sanitize_e2e_detail(f"HTTP {resp.status_code}"),
+                    )
+        except Exception as exc:
+            kind = _classify_e2e_exception(exc)
+            result = E2EProbeResult(
+                ok=False,
+                kind=kind,
+                detail=_sanitize_e2e_detail(str(exc)),
+            )
         with self._state_lock:
-            if ok:
+            if result.ok:
                 self._last_e2e_success_ts = time.time()
                 self._e2e_consecutive_failures = 0
+                self._e2e_recovery_attempted = False
             else:
                 self._e2e_consecutive_failures += 1
-                logger.debug(
-                    "tunnel end-to-end probe failed ({} consecutive)",
-                    self._e2e_consecutive_failures,
-                )
-        return ok
+                if result.kind == "http_status":
+                    logger.debug(
+                        "tunnel e2e probe failed: kind=http_status status={}",
+                        result.status_code,
+                    )
+                else:
+                    logger.debug(
+                        "tunnel e2e probe failed: kind={}",
+                        result.kind,
+                    )
+        return result
 
     def _fire_status_change(self) -> None:
         cb = self.on_status_change
@@ -866,11 +1081,13 @@ class Supervisor:
             conns = self._tunnel_conns
             expected = self._tunnel_conns_expected
             e2e_ok = self._tunnel_e2e_ok
+            kind = self._tunnel_e2e_kind
+            status_code = self._tunnel_e2e_status_code
         if e2e_ok is False:
-            return "边缘不可达"
+            return _e2e_degraded_reason_text(kind, status_code)
         effective_expected = expected if expected > 0 else 1
         if conns < effective_expected:
-            return f"{conns}/{expected} 连接"
+            return f"{conns}/{effective_expected} 连接"
         return ""
 
     def _tunnel_detail(self) -> str:
@@ -882,15 +1099,11 @@ class Supervisor:
         status = self._tunnel_status()
         if status in ("stopped", "connecting"):
             return ""
+        if status == "degraded":
+            return self._compute_tunnel_degraded_reason()
         with self._state_lock:
             conns = self._tunnel_conns
             expected = self._tunnel_conns_expected
-            e2e_ok = self._tunnel_e2e_ok
-        if status == "degraded":
-            if e2e_ok is False:
-                return "边缘不可达"
-            effective_expected = expected if expected > 0 else 1
-            return f"{conns}/{effective_expected} 连接"
         # status == "running"
         if expected > 0:
             return f"{conns}/{expected} 连接"

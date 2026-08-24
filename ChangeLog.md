@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.4.32 (2026-08-24)
+
+**Fixed**
+- 修复隧道端到端探活失败后反复软重连：此前任意失败（含 DNS / TLS / 4xx）连续两次就会重连，且计数在动作后清零，同一故障会循环重连。现按失败类型分类，仅 timeout / connect / unexpected / HTTP 5xx 触发一次恢复；DNS、TLS、代理、4xx 只标降级不重连。成功发出或升级重启后用 latch 锁住，直到探活成功、start/stop 或用户手动重连才允许下一轮。
+- 降级菜单文案按失败类型区分（如「DNS 解析失败」「TLS 失败」「HTTP 502」），不再一律显示「边缘不可达」。
+- 探活日志与 detail 去掉 querystring、脱敏密钥类字段并截断，避免把凭据或响应体打进日志。
+
+**Changed**
+- 刷新 `uv.lock`：uvicorn 0.52.4、sentry-sdk 2.68.0、pyinstaller 6.22.2、tiktoken 0.14.0，以及 charset-normalizer、idna、platformdirs、pygments、pyobjc、python-dotenv、typing-inspection 等小版本。
+
 ## v0.4.31 (2026-08-17)
 
 **Changed**

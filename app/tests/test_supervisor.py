@@ -1,4 +1,8 @@
+import socket
+import ssl
 import time
+
+import httpx
 from kiro_gateway_tray import supervisor, appconfig
 
 
@@ -902,7 +906,8 @@ class TestEndToEndProbe:
             s._last_e2e_success_ts = time.time()
         # Should return True immediately due to throttle
         result = s._probe_tunnel_e2e()
-        assert result is True
+        assert result.ok is True
+        assert result.skipped is True
 
     def test_e2e_no_hostname_returns_true(self, monkeypatch, tmp_path):
         """Unregistered tunnel (no hostname) should not make network requests."""
@@ -915,7 +920,8 @@ class TestEndToEndProbe:
         )
         # If it tries to make a request, httpx would fail because we didn't mock it
         result = s._probe_tunnel_e2e()
-        assert result is True
+        assert result.ok is True
+        assert result.skipped is True
 
     def test_e2e_ignore_throttle(self, monkeypatch, tmp_path):
         """ignore_throttle=True should probe even within the cooldown."""
@@ -939,10 +945,11 @@ class TestEndToEndProbe:
                     status_code = 200
                 return _R()
 
-        import httpx
         monkeypatch.setattr(httpx, "Client", lambda **kw: _FakeClient())
+        monkeypatch.setattr(supervisor.httpx, "Client", lambda **kw: _FakeClient())
         result = s._probe_tunnel_e2e(ignore_throttle=True)
-        assert result is True
+        assert result.ok is True
+        assert result.skipped is False
         assert probe_called["n"] == 1
 
 
@@ -1100,11 +1107,20 @@ class _StubE2EClient:
 
     Args:
         statuses: Status codes to return in order; the last one repeats. Use
-            ``None`` to raise instead, simulating a transport failure.
+            ``None`` to raise ``RuntimeError`` (kind=unexpected) if no
+            ``error_factory`` is set.
+        error_factory: If set, each ``get`` raises a fresh exception from this
+            callable (supports ``__cause__`` chains).
     """
 
-    def __init__(self, statuses: list[int | None]) -> None:
-        self._statuses = list(statuses)
+    def __init__(
+        self,
+        statuses: list[int | None] | None = None,
+        *,
+        error_factory=None,
+    ) -> None:
+        self._statuses = list(statuses) if statuses is not None else []
+        self._error_factory = error_factory
         self.calls = 0
 
     def __call__(self, **_kw) -> "_StubE2EClient":
@@ -1118,6 +1134,10 @@ class _StubE2EClient:
 
     def get(self, _url: str, **_kw):
         self.calls += 1
+        if self._error_factory is not None:
+            raise self._error_factory()
+        if not self._statuses:
+            raise RuntimeError("edge unreachable")
         status = self._statuses[0] if len(self._statuses) == 1 else self._statuses.pop(0)
         if status is None:
             raise RuntimeError("edge unreachable")
@@ -1127,11 +1147,16 @@ class _StubE2EClient:
         return _Resp()
 
 
-def _install_e2e_stub(monkeypatch, statuses: list[int | None]) -> _StubE2EClient:
+def _install_e2e_stub(
+    monkeypatch,
+    statuses: list[int | None] | None = None,
+    *,
+    error_factory=None,
+) -> _StubE2EClient:
     """Point httpx.Client at a stub so e2e probes never touch the network."""
-    import httpx
-    stub = _StubE2EClient(statuses)
+    stub = _StubE2EClient(statuses, error_factory=error_factory)
     monkeypatch.setattr(httpx, "Client", stub)
+    monkeypatch.setattr(supervisor.httpx, "Client", stub)
     return stub
 
 
@@ -1148,6 +1173,9 @@ def _quiesce(s) -> None:
         s._last_tunnel_reconnect_ts = 0.0
         s._last_e2e_success_ts = 0.0
         s._e2e_consecutive_failures = 0
+        s._e2e_recovery_attempted = False
+        s._tunnel_e2e_kind = None
+        s._tunnel_e2e_status_code = None
         s._consecutive_ok = 0
         s._consecutive_failures = 0
         s._tunnel_conns = 0
@@ -1161,11 +1189,11 @@ class TestE2EFailureCounter:
         s = _make_sup_v2(monkeypatch, tmp_path)
         _install_e2e_stub(monkeypatch, [None, 502, 200])
 
-        assert s._probe_tunnel_e2e(ignore_throttle=True) is False
+        assert s._probe_tunnel_e2e(ignore_throttle=True).ok is False
         assert s._e2e_consecutive_failures == 1
-        assert s._probe_tunnel_e2e(ignore_throttle=True) is False
+        assert s._probe_tunnel_e2e(ignore_throttle=True).ok is False
         assert s._e2e_consecutive_failures == 2
-        assert s._probe_tunnel_e2e(ignore_throttle=True) is True
+        assert s._probe_tunnel_e2e(ignore_throttle=True).ok is True
         assert s._e2e_consecutive_failures == 0
 
     def test_success_records_the_throttle_timestamp(self, monkeypatch, tmp_path):
@@ -1174,7 +1202,7 @@ class TestE2EFailureCounter:
         with s._state_lock:
             s._last_e2e_success_ts = 0.0
 
-        assert s._probe_tunnel_e2e() is True
+        assert s._probe_tunnel_e2e().ok is True
         assert s._last_e2e_success_ts > 0
 
     def test_failure_does_not_arm_the_throttle(self, monkeypatch, tmp_path):
@@ -1182,9 +1210,9 @@ class TestE2EFailureCounter:
         s = _make_sup_v2(monkeypatch, tmp_path)
         stub = _install_e2e_stub(monkeypatch, [None])
 
-        assert s._probe_tunnel_e2e() is False
+        assert s._probe_tunnel_e2e().ok is False
         assert s._last_e2e_success_ts == 0.0
-        assert s._probe_tunnel_e2e() is False
+        assert s._probe_tunnel_e2e().ok is False
         assert stub.calls == 2
         assert s._e2e_consecutive_failures == 2
 
@@ -1196,7 +1224,9 @@ class TestE2EFailureCounter:
             s._e2e_consecutive_failures = 1
             s._last_e2e_success_ts = time.time()
 
-        assert s._probe_tunnel_e2e() is True
+        result = s._probe_tunnel_e2e()
+        assert result.ok is True
+        assert result.skipped is True
         assert stub.calls == 0
         assert s._e2e_consecutive_failures == 1
 
@@ -1211,7 +1241,9 @@ class TestE2EFailureCounter:
         with s._state_lock:
             s._e2e_consecutive_failures = 2
 
-        assert s._probe_tunnel_e2e() is True
+        result = s._probe_tunnel_e2e()
+        assert result.ok is True
+        assert result.skipped is True
         assert s._e2e_consecutive_failures == 2
 
     def test_ignore_throttle_failure_still_counts(self, monkeypatch, tmp_path):
@@ -1221,25 +1253,29 @@ class TestE2EFailureCounter:
         with s._state_lock:
             s._last_e2e_success_ts = time.time()
 
-        assert s._probe_tunnel_e2e(ignore_throttle=True) is False
+        assert s._probe_tunnel_e2e(ignore_throttle=True).ok is False
         assert s._e2e_consecutive_failures == 1
 
-    def test_tunnel_restart_clears_the_streak(self, monkeypatch, tmp_path):
+    def test_tunnel_restart_clears_the_streak_but_not_the_latch(self, monkeypatch, tmp_path):
         s = _make_sup_v2(monkeypatch, tmp_path)
         monkeypatch.setattr(s, "_reprovision_if_deleted", lambda: False)
         with s._state_lock:
             s._e2e_consecutive_failures = 2
+            s._e2e_recovery_attempted = True
 
         s._restart_tunnel_process("test")
         assert s._e2e_consecutive_failures == 0
+        assert s._e2e_recovery_attempted is True
 
     def test_stop_clears_the_streak(self, monkeypatch, tmp_path):
         s = _make_sup_v2(monkeypatch, tmp_path)
         with s._state_lock:
             s._e2e_consecutive_failures = 2
+            s._e2e_recovery_attempted = True
 
         s.stop()
         assert s._e2e_consecutive_failures == 0
+        assert s._e2e_recovery_attempted is False
 
 
 class TestE2ESoftReconnect:
@@ -1275,8 +1311,10 @@ class TestE2ESoftReconnect:
         s._run_probe_cycle()
         # Expected connection count learned from /ready is passed through.
         assert s.tunnel.reconnect_calls == [4]
-        # Counter resets on action, so the next escalation needs 2 fresh failures.
+        # Latch is set after the reconnect; further failures must not reconnect
+        # until success or start/stop/request_tunnel_reconnect.
         assert s._e2e_consecutive_failures == 0
+        assert s._e2e_recovery_attempted is True
         s.close()
 
     def test_recovery_between_failures_resets_the_streak(self, monkeypatch, tmp_path):
@@ -1436,3 +1474,328 @@ class TestProbeCadence:
         monkeypatch.setattr(s, "_probe_gateway_once", lambda: False)
 
         assert s._run_probe_cycle() is False
+
+
+def _chained(outer: BaseException, inner: BaseException) -> BaseException:
+    outer.__cause__ = inner
+    return outer
+
+
+def _dns_error() -> BaseException:
+    return _chained(
+        httpx.ConnectError("Failed to resolve host"),
+        socket.gaierror(8, "nodename nor servname provided, or not known"),
+    )
+
+
+def _tls_error() -> BaseException:
+    return _chained(
+        httpx.ConnectError("TLS handshake failed"),
+        ssl.SSLError("CERTIFICATE_VERIFY_FAILED"),
+    )
+
+
+class TestE2EClassification:
+    """Module-level exception-chain classification, no network involved."""
+
+    def test_gaierror_cause_is_dns(self):
+        assert supervisor._classify_e2e_exception(_dns_error()) == "dns"
+
+    def test_sslerror_cause_is_tls(self):
+        assert supervisor._classify_e2e_exception(_tls_error()) == "tls"
+
+    def test_sslerror_context_is_tls(self):
+        outer = httpx.ConnectError("failed")
+        inner = ssl.SSLError("CERTIFICATE_VERIFY_FAILED")
+        outer.__context__ = inner
+        assert supervisor._classify_e2e_exception(outer) == "tls"
+
+    def test_proxyerror_is_proxy(self):
+        assert supervisor._classify_e2e_exception(httpx.ProxyError("proxy failed")) == "proxy"
+
+    def test_timeout_is_timeout(self):
+        assert supervisor._classify_e2e_exception(httpx.TimeoutException("timed out")) == "timeout"
+
+    def test_connect_error_without_cause_is_connect(self):
+        assert supervisor._classify_e2e_exception(httpx.ConnectError("refused")) == "connect"
+
+    def test_runtime_error_is_unexpected(self):
+        assert supervisor._classify_e2e_exception(RuntimeError("edge unreachable")) == "unexpected"
+
+    def test_dns_wins_over_connect_in_the_same_chain(self):
+        assert supervisor._classify_e2e_exception(_dns_error()) == "dns"
+
+    def test_http_5xx_is_recoverable(self):
+        result = supervisor.E2EProbeResult(
+            ok=False, kind="http_status", status_code=502
+        )
+        assert supervisor._e2e_is_recoverable(result) is True
+
+    def test_http_4xx_is_not_recoverable(self):
+        result = supervisor.E2EProbeResult(
+            ok=False, kind="http_status", status_code=404
+        )
+        assert supervisor._e2e_is_recoverable(result) is False
+
+    def test_dns_is_not_recoverable(self):
+        result = supervisor.E2EProbeResult(ok=False, kind="dns")
+        assert supervisor._e2e_is_recoverable(result) is False
+
+    def test_sanitize_strips_query_and_secrets_and_truncates(self):
+        raw = (
+            "GET https://x.example/health?token=abc123 "
+            "Authorization: Bearer secret-value " + ("B" * 400)
+        )
+        out = supervisor._sanitize_e2e_detail(raw)
+        assert "abc123" not in out
+        assert "secret-value" not in out
+        assert "Bearer" not in out
+        assert len(out) <= supervisor._E2E_DETAIL_MAX_LEN + 3
+
+
+class TestE2EKindReconnectPolicy:
+    """Recoverable kinds reconnect once; local/config failures never do."""
+
+    def _prepare(self, monkeypatch, tmp_path):
+        s = _make_sup_v2(monkeypatch, tmp_path)
+        s.start()
+        _quiesce(s)
+        s.gateway.started = True
+        s.tunnel.started = True
+        monkeypatch.setattr(s, "_probe_gateway_once", lambda: True)
+        monkeypatch.setattr(s._client, "get", lambda *a, **k: _ReadyResponse(4))
+        monkeypatch.setattr(s, "_reprovision_if_deleted", lambda: False)
+        return s
+
+    def test_dns_failures_do_not_reconnect(self, monkeypatch, tmp_path):
+        s = self._prepare(monkeypatch, tmp_path)
+        _install_e2e_stub(monkeypatch, error_factory=_dns_error)
+
+        s._run_probe_cycle()
+        s._run_probe_cycle()
+        s._run_probe_cycle()
+        assert s.tunnel.reconnect_calls == []
+        assert s._e2e_recovery_attempted is False
+        assert s._e2e_consecutive_failures >= 2
+        assert s.status()["tunnel"] == "degraded"
+        assert s.status()["tunnel_detail"] == "DNS 解析失败"
+        s.close()
+
+    def test_tls_failures_do_not_reconnect(self, monkeypatch, tmp_path):
+        s = self._prepare(monkeypatch, tmp_path)
+        _install_e2e_stub(monkeypatch, error_factory=_tls_error)
+
+        s._run_probe_cycle()
+        s._run_probe_cycle()
+        assert s.tunnel.reconnect_calls == []
+        assert s._e2e_recovery_attempted is False
+        assert s.status()["tunnel_detail"] == "TLS 失败"
+        s.close()
+
+    def test_http_404_does_not_reconnect(self, monkeypatch, tmp_path):
+        s = self._prepare(monkeypatch, tmp_path)
+        _install_e2e_stub(monkeypatch, [404])
+
+        s._run_probe_cycle()
+        s._run_probe_cycle()
+        assert s.tunnel.reconnect_calls == []
+        assert s._e2e_recovery_attempted is False
+        assert s.status()["tunnel_detail"] == "HTTP 404"
+        s.close()
+
+    def test_two_502s_reconnect_once_then_latch(self, monkeypatch, tmp_path):
+        s = self._prepare(monkeypatch, tmp_path)
+        _install_e2e_stub(monkeypatch, [502])
+
+        s._run_probe_cycle()
+        s._run_probe_cycle()
+        assert s.tunnel.reconnect_calls == [4]
+        assert s._e2e_recovery_attempted is True
+        assert s.status()["tunnel_detail"] == "HTTP 502"
+
+        s._run_probe_cycle()
+        s._run_probe_cycle()
+        s._run_probe_cycle()
+        assert s.tunnel.reconnect_calls == [4]
+        s.close()
+
+    def test_success_clears_latch_and_allows_another_recovery(self, monkeypatch, tmp_path):
+        s = self._prepare(monkeypatch, tmp_path)
+        stub = _install_e2e_stub(monkeypatch, [502, 502, 200, 502, 502])
+
+        s._run_probe_cycle()
+        s._run_probe_cycle()
+        assert s.tunnel.reconnect_calls == [4]
+        assert s._e2e_recovery_attempted is True
+
+        s._run_probe_cycle()
+        assert stub.calls == 3
+        assert s._e2e_recovery_attempted is False
+        with s._state_lock:
+            s._last_e2e_success_ts = 0.0
+            s._last_tunnel_reconnect_ts = 0.0
+
+        s._run_probe_cycle()
+        s._run_probe_cycle()
+        assert s.tunnel.reconnect_calls == [4, 4]
+        assert s._e2e_recovery_attempted is True
+        s.close()
+
+    def test_timeout_consecutive_failures_reconnect_once(self, monkeypatch, tmp_path):
+        s = self._prepare(monkeypatch, tmp_path)
+        _install_e2e_stub(
+            monkeypatch,
+            error_factory=lambda: httpx.TimeoutException("timed out"),
+        )
+
+        s._run_probe_cycle()
+        s._run_probe_cycle()
+        assert s.tunnel.reconnect_calls == [4]
+        assert s.status()["tunnel_detail"] == "连接超时"
+
+        s._run_probe_cycle()
+        s._run_probe_cycle()
+        assert s.tunnel.reconnect_calls == [4]
+        s.close()
+
+    def test_connect_consecutive_failures_reconnect_once(self, monkeypatch, tmp_path):
+        s = self._prepare(monkeypatch, tmp_path)
+        _install_e2e_stub(
+            monkeypatch,
+            error_factory=lambda: httpx.ConnectError("connection refused"),
+        )
+
+        s._run_probe_cycle()
+        s._run_probe_cycle()
+        assert s.tunnel.reconnect_calls == [4]
+        assert s.status()["tunnel_detail"] == "连接失败"
+        s._run_probe_cycle()
+        assert s.tunnel.reconnect_calls == [4]
+        s.close()
+
+    def test_cooldown_skip_does_not_set_latch(self, monkeypatch, tmp_path):
+        s = self._prepare(monkeypatch, tmp_path)
+        _install_e2e_stub(monkeypatch, [502])
+        with s._state_lock:
+            s._last_tunnel_reconnect_ts = time.time()
+
+        s._run_probe_cycle()
+        s._run_probe_cycle()
+        assert s.tunnel.reconnect_calls == []
+        assert s._e2e_recovery_attempted is False
+        assert s._e2e_consecutive_failures >= 2
+
+        with s._state_lock:
+            s._last_tunnel_reconnect_ts = 0.0
+        s._run_probe_cycle()
+        assert s.tunnel.reconnect_calls == [4]
+        assert s._e2e_recovery_attempted is True
+        s.close()
+
+    def test_start_clears_latch_and_failure_count(self, monkeypatch, tmp_path):
+        s = _make_sup_v2(monkeypatch, tmp_path)
+        with s._state_lock:
+            s._e2e_recovery_attempted = True
+            s._e2e_consecutive_failures = 3
+
+        s.start()
+        s._stop_health_loop()
+        assert s._e2e_recovery_attempted is False
+        assert s._e2e_consecutive_failures == 0
+        s.close()
+
+    def test_request_tunnel_reconnect_clears_latch(self, monkeypatch, tmp_path):
+        s = self._prepare(monkeypatch, tmp_path)
+        _install_e2e_stub(monkeypatch, [502])
+        s._run_probe_cycle()
+        s._run_probe_cycle()
+        assert s._e2e_recovery_attempted is True
+
+        class _NoStartThread:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                pass
+
+        monkeypatch.setattr(supervisor.threading, "Thread", _NoStartThread)
+        with s._state_lock:
+            s._last_tunnel_reconnect_ts = 0.0
+        s.request_tunnel_reconnect("network_change")
+        assert s._e2e_recovery_attempted is False
+        with s._state_lock:
+            s._last_tunnel_reconnect_ts = 0.0
+
+        s._run_probe_cycle()
+        s._run_probe_cycle()
+        assert len(s.tunnel.reconnect_calls) >= 3
+        s.close()
+
+
+class TestE2EDegradedReasons:
+    """Menu copy follows e2e kind; unknown kind keeps the legacy fallback."""
+
+    def test_kind_texts(self, monkeypatch, tmp_path):
+        s = _make_sup_v2(monkeypatch, tmp_path)
+        s.tunnel.started = True
+        cases = (
+            ("dns", None, "DNS 解析失败"),
+            ("tls", None, "TLS 失败"),
+            ("proxy", None, "代理失败"),
+            ("timeout", None, "连接超时"),
+            ("connect", None, "连接失败"),
+            ("http_status", 502, "HTTP 502"),
+            ("unexpected", None, "边缘不可达"),
+            (None, None, "边缘不可达"),
+        )
+        for kind, status_code, expected in cases:
+            with s._state_lock:
+                s._tunnel_conns = 4
+                s._tunnel_conns_expected = 4
+                s._tunnel_e2e_ok = False
+                s._tunnel_e2e_kind = kind
+                s._tunnel_e2e_status_code = status_code
+            assert s._tunnel_detail() == expected, kind
+
+    def test_snapshot_includes_kind(self, monkeypatch, tmp_path):
+        s = _make_sup_v2(monkeypatch, tmp_path)
+        with s._state_lock:
+            s._tunnel_e2e_ok = False
+            s._tunnel_e2e_kind = "dns"
+            first = s._tunnel_status_snapshot()
+            s._tunnel_e2e_kind = "tls"
+            second = s._tunnel_status_snapshot()
+        assert first != second
+
+
+class TestE2ELogSanitization:
+    """Probe logs must not contain credentials or response bodies."""
+
+    def test_logs_omit_authorization_and_long_body(self, monkeypatch, tmp_path):
+        secret = "Authorization: Bearer super-secret-token-xyz"
+        body = "<html>" + ("Z" * 400) + "</html>"
+        message = f"GET https://kg-test.example.com/health?api_key=leak {secret} {body}"
+
+        captured: list[str] = []
+
+        def _debug(msg, *args, **kwargs):
+            try:
+                captured.append(str(msg).format(*args) if args else str(msg))
+            except (IndexError, KeyError, ValueError):
+                captured.append(f"{msg} {args}")
+
+        s = _make_sup_v2(monkeypatch, tmp_path)
+        monkeypatch.setattr(supervisor.logger, "debug", _debug)
+        _install_e2e_stub(monkeypatch, error_factory=lambda: RuntimeError(message))
+
+        result = s._probe_tunnel_e2e(ignore_throttle=True)
+        assert result.ok is False
+        joined = "\n".join(captured)
+        assert "tunnel e2e probe failed: kind=unexpected" in joined
+        assert "super-secret-token-xyz" not in joined
+        assert "api_key=leak" not in joined
+        assert body not in joined
+        assert "super-secret-token-xyz" not in (result.detail or "")
+        assert "api_key=leak" not in (result.detail or "")
+        assert body not in (result.detail or "")
+
