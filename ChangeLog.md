@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.4.33 (2026-08-25)
+
+**Changed**
+- 隧道用户名改为按本机系统安装指纹签发（macOS `IOPlatformUUID` / Windows `MachineGuid` / Linux `/etc/machine-id`）。同一台电脑重新登录 Kiro 不再换域名；读不到设备 ID 时仍回退原来的 clientId 哈希。
+- 升级后若本地已存域名与新指纹不一致，启动时自动按新指纹重签。托盘菜单最上方出现「隧道地址已变更」提示；点击后弹出说明（原先使用旧地址的客户端需要改 Base URL），确定后才关闭提示。启动时另有系统通知，避免漏看菜单。
+- `dialogs.alert` 改为三端可用（macOS / Windows / Linux），超时从 30 秒加长到 300 秒，避免用户还没看完就被关掉。
+
 ## v0.4.32 (2026-08-24)
 
 **Fixed**

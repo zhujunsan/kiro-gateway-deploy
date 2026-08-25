@@ -10,6 +10,7 @@ from pathlib import Path
 import httpx
 
 from . import appconfig
+from . import device_id
 from .appconfig import AppCfg
 from .httpclient import resolve_proxy
 
@@ -119,18 +120,28 @@ def _base_url(cfg: AppCfg) -> str:
     return cfg.cloudflare.provision_url.rstrip("/")
 
 
+def username_from_hostname(hostname: str) -> str:
+    """Extract the slug from ``kg-<slug>.example.com``. Empty if not parseable."""
+    host = (hostname or "").strip().split("/")[0].split(":")[0]
+    if "-" not in host or "." not in host:
+        return ""
+    _prefix, rest = host.split("-", 1)
+    return rest.split(".", 1)[0].lower()
+
+
 def _get_username(cfg: AppCfg) -> str:
-    """Return a per-user unique slug for tunnel naming.
+    """Return a stable per-machine slug for tunnel naming.
 
-    Uses the per-user clientId from ~/.aws/sso/cache/<clientIdHash>.json.
-    clientId is unique per Kiro/CodeWhisperer user; clientIdHash (its filename)
-    looks per-user but is actually shared across the whole organisation, and
-    profileArn last segment is also a company-wide profile — both would map
-    every user to the same tunnel name, causing mutual re-provisioning conflicts.
+    Prefers an OS-install fingerprint (macOS IOPlatformUUID, Windows
+    MachineGuid, Linux /etc/machine-id). Same computer + same OS install
+    keeps the same slug across Kiro re-login; OS reinstall may change it.
 
-    clientId may contain base64 characters, so we SHA-1-hash it and use the
-    first _USERNAME_LEN hex digits as a stable, URL-safe slug.
+    Falls back to Kiro clientId hashing only when the device id is missing.
     """
+    fingerprint = device_id.fingerprint()
+    if fingerprint:
+        return fingerprint
+
     data = _read_kiro_token(cfg)  # read once, reused by both lookups below
     client_id = _read_per_user_client_id(cfg, data)
     if client_id:
@@ -141,7 +152,7 @@ def _get_username(cfg: AppCfg) -> str:
     cid = _read_client_id_hash(data)
     if not cid:
         raise RuntimeError(
-            "无法从 Kiro token 文件中读取用户唯一标识（clientIdHash）。\n"
+            "无法读取设备指纹，也无法从 Kiro token 文件中读取用户唯一标识（clientIdHash）。\n"
             "请确认已用 Kiro IDE 登录（~/.aws/sso/cache/kiro-auth-token.json 存在）。"
         )
     return cid[:_USERNAME_LEN].lower()

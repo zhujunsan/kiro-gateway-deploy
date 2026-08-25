@@ -59,6 +59,16 @@ _TUNNEL_PREFIX = "🌐 隧道:"
 # block. pystray builds the menu once, so the slots must exist up front; each
 # one hides itself when there is no announcement to put in it.
 _ANNOUNCEMENT_SLOTS = announcements.MAX_ITEMS
+_URL_CHANGED_TITLE = "⚠️ 隧道地址已变更，请重新配置"
+
+
+def _url_changed_alert_body(url: str) -> str:
+    return (
+        "本机隧道地址已变更。原先使用旧地址的地方需要改成新地址，否则会连不上。\n"
+        "例如 Cursor / 其他客户端里的 Base URL。\n\n"
+        f"新地址：\n{url}\n\n"
+        "确认已了解后，点击确定关闭此提示。"
+    )
 
 
 def _local_url(cfg) -> str:
@@ -1252,10 +1262,36 @@ class TrayApp:
         except Exception:
             logger.debug("update cache peek failed", exc_info=True)
 
+    def _url_changed_visible(self, _item) -> bool:
+        cfg = appconfig.load(use_cache=True)
+        return bool(cfg.cloudflare.url_changed_notice)
+
+    def _url_changed_line(self, _item) -> str:
+        return _URL_CHANGED_TITLE
+
+    def _on_url_changed(self, _icon, _item) -> None:
+        """Show the explanation dialog; dismiss the notice only after it returns."""
+        cfg = appconfig.load(use_cache=True)
+        url = _tunnel_url(cfg) or "（见托盘菜单中的隧道 URL）"
+        try:
+            dialogs.alert("隧道地址已变更", _url_changed_alert_body(url))
+        except Exception:
+            logger.exception("url-changed alert failed")
+            return
+        appconfig.update(lambda latest: setattr(latest.cloudflare, "url_changed_notice", False))
+        self._request_redraw()
+
+    def _notify_url_changed_if_needed(self) -> None:
+        """Tray ping after upgrade; the explanatory dialog waits for a menu click."""
+        cfg = appconfig.load(use_cache=True)
+        if not cfg.cloudflare.url_changed_notice:
+            return
+        self._notify(APP_NAME, "隧道地址已变更，请打开托盘菜单查看并确认")
+
     def _update_visible(self, _item) -> bool:
-        # Evaluated before other menu lines (update item is first). Sync peek
-        # here so the line can appear on the first open without waiting for the
-        # async GitHub fetch kicked off below.
+        # Evaluated just below the URL-change notice. Sync peek here so the
+        # line can appear on the first open without waiting for the async
+        # GitHub fetch kicked off below.
         self._ensure_update_info_sync()
         self._kick_update_check()
         return self._update_info is not None
@@ -1469,6 +1505,11 @@ class TrayApp:
     def _build_menu(self):
         pystray = self._pystray
         return pystray.Menu(
+            pystray.MenuItem(
+                self._url_changed_line,
+                self._on_url_changed,
+                visible=self._url_changed_visible,
+            ),
             pystray.MenuItem(self._update_line, self._on_update, visible=self._update_visible),
             # pystray drops leading and consecutive separators around hidden
             # items, so this stays invisible unless both groups have content.
@@ -1543,6 +1584,7 @@ class TrayApp:
             self._refresh_icon()
             self._request_redraw()
             self._models_cache.refresh(force=True)
+            self._notify_url_changed_if_needed()
 
         self.sup.mark_starting()
         menu = self._build_menu()

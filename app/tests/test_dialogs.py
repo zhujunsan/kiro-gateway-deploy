@@ -79,3 +79,40 @@ def test_prompt_validated_gives_up_after_max_attempts(monkeypatch):
         assert False, "expected RuntimeError"
     except RuntimeError as e:
         assert "校验失败" in str(e)
+
+
+def test_alert_dispatches_to_darwin(monkeypatch):
+    called = []
+    monkeypatch.setattr(dialogs.sys, "platform", "darwin")
+    monkeypatch.setattr(dialogs, "_darwin_alert", lambda t, m: called.append((t, m)))
+    dialogs.alert("标题", "内容")
+    assert called == [("标题", "内容")]
+
+
+def test_alert_dispatches_to_win32(monkeypatch):
+    called = []
+    monkeypatch.setattr(dialogs.sys, "platform", "win32")
+    monkeypatch.setattr(dialogs, "_win32_alert", lambda t, m: called.append((t, m)))
+    dialogs.alert("标题", "内容")
+    assert called == [("标题", "内容")]
+
+
+def test_alert_swallows_backend_errors(monkeypatch):
+    monkeypatch.setattr(dialogs.sys, "platform", "darwin")
+
+    def _boom(t, m):
+        raise OSError("display failed")
+
+    monkeypatch.setattr(dialogs, "_darwin_alert", _boom)
+    dialogs.alert("标题", "内容")  # must not raise
+
+
+def test_linux_alert_uses_zenity_when_present(monkeypatch):
+    cmds = []
+    monkeypatch.setattr(dialogs.shutil, "which", lambda name: name if name == "zenity" else None)
+    monkeypatch.setattr(
+        dialogs.subprocess, "run",
+        lambda cmd, **k: cmds.append(cmd),
+    )
+    dialogs._linux_alert("T", "M")
+    assert cmds and cmds[0][0] == "zenity"

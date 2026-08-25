@@ -388,6 +388,14 @@ class Supervisor:
         self._cached_secret = shared_secret
         from . import provision
         hostname, run_token, telemetry_secret = provision.run(cfg, shared_secret)
+        previous_hostname = cfg.cloudflare.hostname
+        if previous_hostname and hostname != previous_hostname:
+            cfg.cloudflare.url_changed_notice = True
+            logger.warning(
+                "tunnel hostname changed ({} -> {}); showing reconfigure notice",
+                previous_hostname,
+                hostname,
+            )
         cfg.cloudflare.hostname = hostname
         cfg.cloudflare.run_token = run_token
         cfg.cloudflare.registered_port = cfg.gateway.port
@@ -400,6 +408,40 @@ class Supervisor:
         if telemetry_secret:
             cfg.telemetry.secret = telemetry_secret
         appconfig.save(cfg)
+
+    def _migrate_identity_if_needed(self, cfg: AppCfg) -> AppCfg:
+        """Re-provision when the stored hostname slug no longer matches this machine.
+
+        Device-fingerprint identity can diverge from a previously issued
+        clientId-based hostname (app upgrade). Re-issue under the new slug so
+        the public URL matches telemetry, and let register() flag the tray
+        notice. Failures leave the existing tunnel in place.
+        """
+        if not appconfig.is_provisioned(cfg):
+            return cfg
+        secret = self._cached_secret or cfg.cloudflare.shared_secret
+        if not secret:
+            return cfg
+        from . import provision
+        try:
+            new_slug = provision._get_username(cfg)
+        except Exception:
+            logger.debug("identity slug unavailable; skip migrate", exc_info=True)
+            return cfg
+        old_slug = provision.username_from_hostname(cfg.cloudflare.hostname)
+        if not new_slug or new_slug == old_slug:
+            return cfg
+        logger.warning(
+            "tunnel identity changed ({} -> {}); re-provisioning",
+            old_slug,
+            new_slug,
+        )
+        try:
+            self.register(cfg, secret)
+            return self._load()
+        except Exception:
+            logger.exception("identity migration re-provision failed")
+            return cfg
 
     def _sync_telemetry_secret(self, cfg: AppCfg) -> AppCfg:
         """Best-effort parent-side telemetry secret refresh before child launch.
@@ -489,6 +531,7 @@ class Supervisor:
     def start(self) -> bool:
         cfg = self._load()
         self._ensure_provisioned(cfg)
+        cfg = self._migrate_identity_if_needed(cfg)
         self._sync_port_if_changed(cfg)
         cfg = self._sync_telemetry_secret(cfg)
         with self._state_lock:

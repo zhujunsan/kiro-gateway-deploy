@@ -356,12 +356,61 @@ def prompt_validated(
 
 
 def alert(title: str, message: str) -> None:
-    """Show a simple alert dialog (macOS only; no-op elsewhere)."""
-    if sys.platform != "darwin":
+    """Show a blocking OK dialog. Best-effort and never raises.
+
+    Used for the post-upgrade tunnel-URL reminder. Timeouts are long so the
+    user can copy the new address before dismissing. Windows/Linux use native
+    info dialogs; if those tools are missing the call is a no-op (the tray
+    row and system notification still remind).
+    """
+    try:
+        if sys.platform == "darwin":
+            _darwin_alert(title, message)
+        elif sys.platform == "win32":
+            _win32_alert(title, message)
+        else:
+            _linux_alert(title, message)
+    except Exception:
         return
+
+
+def _darwin_alert(title: str, message: str) -> None:
     escaped = escape_applescript(message).replace("\n", "\\n")
     subprocess.run(
         ["osascript", "-e", f'display alert "{escape_applescript(title)}" message "{escaped}"'],
-        capture_output=True, timeout=30,
+        capture_output=True,
+        timeout=300,
     )
+
+
+def _win32_alert(title: str, message: str) -> None:
+    def _ps_quote(s: str) -> str:
+        return "'" + s.replace("'", "''") + "'"
+
+    script = (
+        "Add-Type -AssemblyName System.Windows.Forms; "
+        f"[System.Windows.Forms.MessageBox]::Show({_ps_quote(message)}, {_ps_quote(title)})"
+    )
+    subprocess.run(
+        ["powershell", "-NoProfile", "-STA", "-Command", script],
+        capture_output=True,
+        timeout=300,
+    )
+
+
+def _linux_alert(title: str, message: str) -> None:
+    if shutil.which("zenity"):
+        subprocess.run(
+            ["zenity", "--info", f"--title={title}", f"--text={message}"],
+            capture_output=True,
+            timeout=300,
+        )
+        return
+    if shutil.which("kdialog"):
+        subprocess.run(
+            ["kdialog", "--title", title, "--msgbox", message],
+            capture_output=True,
+            timeout=300,
+        )
+
 

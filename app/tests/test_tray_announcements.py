@@ -10,8 +10,9 @@ import types
 
 import pytest
 
-from kiro_gateway_tray import announcements
+from kiro_gateway_tray import announcements, appconfig
 from kiro_gateway_tray.announcements import Announcement
+from kiro_gateway_tray import tray as tray_mod
 
 
 @pytest.fixture(autouse=True)
@@ -25,6 +26,7 @@ def _stub_pystray(monkeypatch):
 @pytest.fixture(autouse=True)
 def _isolated_home(tmp_path, monkeypatch):
     monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
+    appconfig.invalidate_cache()
 
 
 @pytest.fixture(autouse=True)
@@ -326,3 +328,87 @@ def test_poll_swallows_errors_and_releases_the_gate(monkeypatch, _inline_threads
     monkeypatch.setattr(announcements, "check", lambda *a, **k: ran.append(1) or [])
     app._kick_announcement_check()
     assert ran == [1]
+
+
+def test_url_changed_notice_is_the_first_visible_row():
+    cfg = appconfig.load()
+    cfg.cloudflare.hostname = "kg-new.example.com"
+    cfg.cloudflare.url_changed_notice = True
+    appconfig.save(cfg)
+
+    app = _make_app()
+    items = _built_menu(app)
+    first_visible = next(
+        i for i in items if isinstance(i, _FakeMenuItem) and i.is_visible()
+    )
+    assert first_visible.title() == tray_mod._URL_CHANGED_TITLE
+
+
+def test_url_changed_notice_hidden_by_default():
+    app = _make_app()
+    items = _built_menu(app)
+    warning = next(
+        i for i in items
+        if isinstance(i, _FakeMenuItem) and i.title() == tray_mod._URL_CHANGED_TITLE
+    )
+    assert warning.is_visible() is False
+
+
+def test_clicking_url_changed_notice_alerts_then_dismisses(monkeypatch):
+    cfg = appconfig.load()
+    cfg.cloudflare.hostname = "kg-new.example.com"
+    cfg.cloudflare.url_changed_notice = True
+    appconfig.save(cfg)
+
+    app = _make_app()
+    alerts = []
+    monkeypatch.setattr(
+        tray_mod.dialogs, "alert",
+        lambda title, msg: alerts.append((title, msg)),
+    )
+    monkeypatch.setattr(app, "_request_redraw", lambda: None)
+
+    app._on_url_changed(None, None)
+
+    assert len(alerts) == 1
+    assert alerts[0][0] == "隧道地址已变更"
+    assert "kg-new.example.com" in alerts[0][1]
+    assert "原先使用旧地址" in alerts[0][1]
+    assert appconfig.load().cloudflare.url_changed_notice is False
+
+
+def test_clicking_url_changed_notice_keeps_prompt_if_alert_fails(monkeypatch):
+    cfg = appconfig.load()
+    cfg.cloudflare.hostname = "kg-new.example.com"
+    cfg.cloudflare.url_changed_notice = True
+    appconfig.save(cfg)
+
+    app = _make_app()
+    monkeypatch.setattr(
+        tray_mod.dialogs, "alert",
+        lambda title, msg: (_ for _ in ()).throw(RuntimeError("dialog failed")),
+    )
+    monkeypatch.setattr(app, "_request_redraw", lambda: None)
+
+    app._on_url_changed(None, None)
+
+    assert appconfig.load().cloudflare.url_changed_notice is True
+
+
+def test_startup_url_changed_reminder_notifies_without_alert(monkeypatch):
+    cfg = appconfig.load()
+    cfg.cloudflare.hostname = "kg-new.example.com"
+    cfg.cloudflare.url_changed_notice = True
+    appconfig.save(cfg)
+
+    app = _make_app()
+    notes = []
+    alerts = []
+    monkeypatch.setattr(app, "_notify", lambda title, msg: notes.append((title, msg)))
+    monkeypatch.setattr(tray_mod.dialogs, "alert", lambda title, msg: alerts.append((title, msg)))
+
+    app._notify_url_changed_if_needed()
+
+    assert notes and "隧道地址已变更" in notes[0][1]
+    assert alerts == []
+    assert appconfig.load().cloudflare.url_changed_notice is True

@@ -34,6 +34,7 @@ class CloudflareCfg:
                               # across restarts (config is chmod 0600 on POSIX)
     metrics_port: int = 20241  # cloudflared metrics server; probed at /ready to
                                # detect tunnel connectivity without parsing logs
+    url_changed_notice: bool = False  # tray top-row prompt after hostname change
 
 
 @dataclass

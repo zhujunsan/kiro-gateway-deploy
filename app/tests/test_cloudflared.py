@@ -396,6 +396,7 @@ def test_stop_without_start_is_noop():
 def test_provision_username_from_client_id_hash(monkeypatch):
     from kiro_gateway_tray import provision
     cfg = appconfig.AppCfg()
+    monkeypatch.setattr(provision.device_id, "fingerprint", lambda: "")
     # No profileArn anywhere -> fall back to clientIdHash.
     monkeypatch.setattr(provision, "_read_kiro_token", lambda _cfg: None)
     monkeypatch.setattr(
@@ -408,6 +409,7 @@ def test_provision_username_from_client_id_hash(monkeypatch):
 def test_provision_username_missing_hash_raises(monkeypatch):
     from kiro_gateway_tray import provision
     cfg = appconfig.AppCfg()
+    monkeypatch.setattr(provision.device_id, "fingerprint", lambda: "")
     monkeypatch.setattr(provision, "_read_kiro_token", lambda _cfg: None)
     monkeypatch.setattr(provision, "_read_client_id_hash", lambda _data: None)
     try:
@@ -422,10 +424,28 @@ def test_provision_username_prefers_per_user_client_id(monkeypatch):
     import hashlib
     from kiro_gateway_tray import provision
     cfg = appconfig.AppCfg()
+    monkeypatch.setattr(provision.device_id, "fingerprint", lambda: "")
     monkeypatch.setattr(provision, "_read_per_user_client_id", lambda _cfg, _data: "my-unique-client-id")
     monkeypatch.setattr(provision, "_read_client_id_hash", lambda _data: "ABCDEF0123456789abcdef")
     expected = hashlib.sha1("my-unique-client-id".encode()).hexdigest()[:12]
     assert provision._get_username(cfg) == expected
+
+
+def test_provision_username_prefers_device_fingerprint(monkeypatch):
+    from kiro_gateway_tray import provision
+    cfg = appconfig.AppCfg()
+    monkeypatch.setattr(provision.device_id, "fingerprint", lambda: "device12cafe")
+    monkeypatch.setattr(provision, "_read_per_user_client_id", lambda _cfg, _data: "my-unique-client-id")
+    monkeypatch.setattr(provision, "_read_client_id_hash", lambda _data: "ABCDEF0123456789abcdef")
+    assert provision._get_username(cfg) == "device12cafe"
+
+
+def test_username_from_hostname_extracts_slug():
+    from kiro_gateway_tray import provision
+    assert provision.username_from_hostname("kg-1a1d472aed65.botsonny.top") == "1a1d472aed65"
+    assert provision.username_from_hostname("kg-test.example.com") == "test"
+    assert provision.username_from_hostname("") == ""
+    assert provision.username_from_hostname("example.com") == ""
 
 
 def test_provision_config_profile_arn_overrides_token(monkeypatch):

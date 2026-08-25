@@ -11,6 +11,7 @@ def test_defaults_roundtrip(tmp_path, monkeypatch):
     assert cfg.gateway.port == 64005
     assert cfg.cloudflare.hostname == ""
     assert cfg.cloudflare.run_token == ""
+    assert cfg.cloudflare.url_changed_notice is False
     assert appconfig.path().exists()
 
 

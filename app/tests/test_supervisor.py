@@ -3,7 +3,19 @@ import ssl
 import time
 
 import httpx
+import pytest
 from kiro_gateway_tray import supervisor, appconfig
+
+
+@pytest.fixture(autouse=True)
+def _identity_matches_stored_hostname(monkeypatch):
+    """Keep start() from re-provisioning: slug derived from the stored hostname."""
+    import kiro_gateway_tray.provision as pmod
+
+    def _username(cfg):
+        return pmod.username_from_hostname(cfg.cloudflare.hostname) or "testuser"
+
+    monkeypatch.setattr(pmod, "_get_username", _username)
 
 
 class _FakeGateway:
@@ -1798,4 +1810,79 @@ class TestE2ELogSanitization:
         assert "super-secret-token-xyz" not in (result.detail or "")
         assert "api_key=leak" not in (result.detail or "")
         assert body not in (result.detail or "")
+
+
+def test_register_first_provision_does_not_set_notice(monkeypatch, tmp_path):
+    s = _make_sup(monkeypatch, tmp_path, provisioned=False)
+    import kiro_gateway_tray.provision as pmod
+    monkeypatch.setattr(pmod, "run", lambda cfg, secret: ("kg-new.example.com", "eyJ", ""))
+    cfg = appconfig.load()
+    s.register(cfg, "secret")
+    again = appconfig.load()
+    assert again.cloudflare.hostname == "kg-new.example.com"
+    assert again.cloudflare.url_changed_notice is False
+
+
+def test_register_sets_notice_when_hostname_changes(monkeypatch, tmp_path):
+    s = _make_sup(monkeypatch, tmp_path, provisioned=True)
+    import kiro_gateway_tray.provision as pmod
+    monkeypatch.setattr(pmod, "run", lambda cfg, secret: ("kg-new.example.com", "eyJ_new", ""))
+    cfg = appconfig.load()
+    s.register(cfg, "secret")
+    again = appconfig.load()
+    assert again.cloudflare.hostname == "kg-new.example.com"
+    assert again.cloudflare.url_changed_notice is True
+    assert again.cloudflare.run_token == "eyJ_new"
+
+
+def test_migrate_identity_reprovisions_when_slug_differs(monkeypatch, tmp_path):
+    s = _make_sup(monkeypatch, tmp_path, provisioned=True)
+    cfg = appconfig.load()
+    cfg.cloudflare.shared_secret = "act-code"
+    cfg.cloudflare.provision_url = "https://w.example.com"
+    appconfig.save(cfg)
+
+    import kiro_gateway_tray.provision as pmod
+    monkeypatch.setattr(pmod, "_get_username", lambda cfg: "deviceabcdef")
+    monkeypatch.setattr(
+        pmod, "run",
+        lambda cfg, secret: ("kg-deviceabcdef.example.com", "eyJ_new", ""),
+    )
+    s.start()
+    again = appconfig.load()
+    assert again.cloudflare.hostname == "kg-deviceabcdef.example.com"
+    assert again.cloudflare.url_changed_notice is True
+    assert again.cloudflare.run_token == "eyJ_new"
+
+
+def test_migrate_identity_noop_when_slug_matches(monkeypatch, tmp_path):
+    s = _make_sup(monkeypatch, tmp_path, provisioned=True)
+    cfg = appconfig.load()
+    cfg.cloudflare.shared_secret = "act-code"
+    appconfig.save(cfg)
+    calls = []
+    import kiro_gateway_tray.provision as pmod
+    monkeypatch.setattr(
+        pmod, "run",
+        lambda cfg, secret: calls.append(1) or ("kg-x.example.com", "t", ""),
+    )
+    s.start()
+    assert calls == []
+    again = appconfig.load()
+    assert again.cloudflare.hostname == "kg-test.example.com"
+    assert again.cloudflare.url_changed_notice is False
+
+
+def test_migrate_identity_skipped_without_secret(monkeypatch, tmp_path):
+    s = _make_sup(monkeypatch, tmp_path, provisioned=True)
+    import kiro_gateway_tray.provision as pmod
+    monkeypatch.setattr(pmod, "_get_username", lambda cfg: "deviceabcdef")
+    calls = []
+    monkeypatch.setattr(
+        pmod, "run",
+        lambda cfg, secret: calls.append(1) or ("kg-deviceabcdef.example.com", "t", ""),
+    )
+    s.start()
+    assert calls == []
+    assert appconfig.load().cloudflare.hostname == "kg-test.example.com"
 
