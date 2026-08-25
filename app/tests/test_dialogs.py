@@ -142,7 +142,8 @@ def test_osascript_alert_includes_app_icon(monkeypatch, tmp_path):
     script = cmds[0][cmds[0].index("-e") + 1]
     assert "display dialog" in script
     assert "POSIX file" in script
-    assert str(icon.resolve()) in script
+    assert "icon.icns" in script
+    assert dialogs.escape_applescript(str(icon.resolve())) in script
     assert "确定" in script
 
 
