@@ -11,7 +11,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { normalizeRollupRow } from "../src/index.js";
+import { normalizeRollupRow, utcDayWindow } from "../src/index.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -153,5 +153,32 @@ describe("index.js SQL includes credit and latency columns", () => {
     assert.match(src, /generation_completion_tokens_sum/);
     assert.match(src, /SUM\(ttft_ms_sum\)/);
     assert.match(src, /SUM\(generation_completion_tokens_sum\)/);
+  });
+
+  it("daily rollup filters bucket_start by range so the bucket index can be used", () => {
+    assert.match(src, /WHERE\s+bucket_start >= \? AND bucket_start < \?/i);
+    assert.doesNotMatch(
+      src,
+      /WHERE\s+date\(bucket_start,\s*'unixepoch'\)\s*=/,
+    );
+  });
+});
+
+describe("utcDayWindow", () => {
+  it("returns a 86400-second UTC day range for today and yesterday", () => {
+    const now = new Date("2026-08-25T08:50:00Z");
+    const today = utcDayWindow(now, 0);
+    assert.equal(today.start, Date.UTC(2026, 7, 25) / 1000);
+    assert.equal(today.end, today.start + 86400);
+    const yesterday = utcDayWindow(now, 1);
+    assert.equal(yesterday.start, Date.UTC(2026, 7, 24) / 1000);
+    assert.equal(yesterday.end, today.start);
+  });
+
+  it("crosses month boundaries in UTC", () => {
+    const now = new Date("2026-08-01T00:30:00Z");
+    const yesterday = utcDayWindow(now, 1);
+    assert.equal(yesterday.start, Date.UTC(2026, 6, 31) / 1000);
+    assert.equal(yesterday.end, Date.UTC(2026, 7, 1) / 1000);
   });
 });

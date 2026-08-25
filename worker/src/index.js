@@ -673,6 +673,9 @@ async function handleQuery(request, env, url, json) {
 // 把指定天（默认前一天 + 当天，覆盖跨小时/跨天的边界）的 rollup 桶按
 // 天 × username × model 聚合 SUM，写入 usage_daily。
 // 幂等可重入：用 INSERT ... ON CONFLICT(PK) DO UPDATE 覆盖，重复跑同一天结果一致。
+//
+// WHERE 必须是 bucket_start 的半开区间，不能包 date()：后者会让 idx_rollup_bucket
+// 失效、每小时全表扫描（见 D1 Query Insights）。
 const DAILY_ROLLUP_SQL = `
 INSERT INTO usage_daily (day, username, model,
                          requests, successes, errors,
@@ -690,7 +693,7 @@ SELECT date(bucket_start, 'unixepoch') AS day,
        SUM(generation_ms_sum), SUM(generation_count), SUM(generation_completion_tokens_sum),
        SUM(estimated_credits), SUM(credit_estimate_segments), SUM(credit_estimate_missing_segments)
 FROM usage_rollup
-WHERE date(bucket_start, 'unixepoch') = ?
+WHERE bucket_start >= ? AND bucket_start < ?
 GROUP BY day, username, model
 ON CONFLICT(day, username, model)
 DO UPDATE SET
@@ -711,17 +714,37 @@ DO UPDATE SET
   credit_estimate_segments = excluded.credit_estimate_segments,
   credit_estimate_missing_segments = excluded.credit_estimate_missing_segments`;
 
-async function rollupToDaily(env) {
-  // 覆盖当天与前一天：cron 在 UTC 边界附近触发时，前一天可能还有迟到的桶进来。
-  const now = new Date();
-  const days = [];
-  for (let i = 0; i <= 1; i++) {
-    const d = new Date(now.getTime() - i * 86400000);
-    days.push(d.toISOString().slice(0, 10)); // YYYY-MM-DD (UTC)
-  }
-  const statements = days.map((day) =>
-    env.TELEMETRY_DB.prepare(DAILY_ROLLUP_SQL).bind(day)
+/**
+ * UTC calendar-day window as Unix-second half-open range [start, end).
+ *
+ * Cron must filter `usage_rollup` by raw `bucket_start` so SQLite can use
+ * `idx_rollup_bucket`. Wrapping the column in `date(bucket_start, 'unixepoch')`
+ * forces a full table scan (~24k rows today, growing without bound) on every
+ * hourly run; a range predicate only reads that day's few hundred buckets.
+ *
+ * Args:
+ *   now: Instant whose UTC date is "today".
+ *   daysAgo: 0 = that UTC day, 1 = the previous UTC day, etc.
+ *
+ * Returns:
+ *   `{ start, end }` Unix seconds. `end` is exclusive.
+ */
+function utcDayWindow(now, daysAgo) {
+  const utcMs = Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate() - daysAgo,
   );
+  const start = Math.floor(utcMs / 1000);
+  return { start, end: start + 86400 };
+}
+
+async function rollupToDaily(env, now = new Date()) {
+  // 覆盖当天与前一天：cron 在 UTC 边界附近触发时，前一天可能还有迟到的桶进来。
+  const statements = [0, 1].map((daysAgo) => {
+    const { start, end } = utcDayWindow(now, daysAgo);
+    return env.TELEMETRY_DB.prepare(DAILY_ROLLUP_SQL).bind(start, end);
+  });
   await env.TELEMETRY_DB.batch(statements);
 }
 
@@ -1093,6 +1116,7 @@ export default {
 // Workers 运行时只消费 default export，额外的具名导出没有任何副作用。
 export {
   normalizeRollupRow,
+  utcDayWindow,
   timingSafeEqual,
   cnameContent,
   dnsRecordNeedsRepair,
