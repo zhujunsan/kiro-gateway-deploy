@@ -262,6 +262,51 @@ def tunnel_exists(cfg: AppCfg, shared_secret: str) -> bool | None:
         return None
 
 
+def ensure_dns(cfg: AppCfg, shared_secret: str) -> bool | None:
+    """Ask the Worker to recreate the public proxied CNAME if it is missing.
+
+    Returns True when the Worker confirmed or repaired DNS, False when the
+    tunnel is gone (caller should re-provision), or None when the outcome is
+    unknown (old Worker without ``/ensure-dns``, auth failure, network error).
+    """
+    if not cfg.cloudflare.provision_url or not shared_secret:
+        return None
+    # Repair the hostname currently in config, not the device-fingerprint slug.
+    # After an identity change the two diverge until migrate re-provisions.
+    username = username_from_hostname(cfg.cloudflare.hostname)
+    if not username:
+        try:
+            username = _get_username(cfg)
+        except Exception:
+            return None
+    if not username:
+        return None
+    url = cfg.cloudflare.provision_url.rstrip("/") + "/ensure-dns"
+    try:
+        resp = httpx.post(
+            url,
+            json={"shared_secret": shared_secret, "username": username},
+            timeout=_HTTP_TIMEOUT,
+            proxy=resolve_proxy(),
+        )
+    except httpx.HTTPError:
+        return None
+    if resp.status_code == 404:
+        try:
+            err = resp.json().get("error")
+        except Exception:
+            return None
+        if err == "tunnel not found":
+            return False
+        return None
+    if resp.status_code != 200:
+        return None
+    try:
+        return bool(resp.json().get("ok"))
+    except Exception:
+        return None
+
+
 def update_port(cfg: AppCfg, shared_secret: str) -> int:
     """Tell the Worker to update the tunnel ingress port.
 

@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.4.34 (2026-08-25)
+
+**Fixed**
+- 修复隧道菜单「降级 (TLS 失败)」误报：闲置清理若先删了 CNAME、再删隧道失败，会留下「进程还在、公网域名 NXDOMAIN」。本机 Clash/Surge fake-ip 仍会给这个空名字分配 `198.18.0.0/15`，探活握手被掐掉就显示 TLS 失败。现改为系统 DNS 落到 fake-ip 时走 Cloudflare DoH 看公网记录；NXDOMAIN 显示「DNS 解析失败」，并调用 Worker `/ensure-dns` 补回指向本隧道的 proxied CNAME。
+- 闲置清理误伤在线用户：只跳过 `healthy` 时，`degraded`（HA 不齐）和重连瞬间的 `down` 会落到清理逻辑；闲置时长还用 `created_at` 兜底，于是一台开了很久、只是闪断的网关会被当成「闲置 30 天」先删 CNAME。现改为 `healthy`/`degraded` 都不清理，闲置只认 `conns_inactive_at`；从未跑过的 `inactive` 才用创建时间。清理先删隧道再删 DNS。cron 随后给剩余隧道补 CNAME（也可手动 `POST /reconcile-dns`）。
+
 ## v0.4.33 (2026-08-25)
 
 **Changed**

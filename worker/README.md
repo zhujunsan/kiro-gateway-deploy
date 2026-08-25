@@ -164,9 +164,11 @@ cd worker && node --test    # 无依赖，纯 node:test
 设置 `IDLE_CLEANUP_DAYS`（正整数，单位天）后，每小时 cron 会：
 
 1. 列出账号下所有未删除隧道，过滤出 `HOSTNAME_PREFIX-` 前缀的（本项目签发的）
-2. 跳过 `status=healthy` 或正在有活跃连接的隧道
-3. 闲置时长 = `now - conns_inactive_at`（若无连接记录则用 `created_at`）
-4. 超过阈值的：删除对应 DNS CNAME + 删除 tunnel 本身
+2. 跳过仍在服务的隧道：`status=healthy` **或** `status=degraded`（degraded 仍能打到边缘，只是 HA 不齐）
+3. 闲置时长只用 `conns_inactive_at`。**不会**用 `created_at` 去判断一条曾经上线过的隧道——否则一次 cloudflared 重连闪断（`status=down`）会把开了几个月的在线用户当成「闲置 30 天」并删掉 CNAME
+4. 从未跑过的 `inactive` 隧道才用 `created_at` 作为闲置起点
+5. 超过阈值的：先删 tunnel，成功后再删 DNS
+6. 随后给**剩下的**隧道补 proxied CNAME（`/reconcile-dns`，cron 也会跑），避免再出现「隧道还在、域名没有」
 
 审计日志通过 `console.log` 输出到 Worker Logs（Cloudflare Dashboard → Workers → Logs），每条记录被清理的隧道名和闲置天数。
 

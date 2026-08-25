@@ -2,6 +2,7 @@
 """Orchestrate gateway + cloudflared and handle first-run provisioning."""
 from __future__ import annotations
 
+import ipaddress
 import re
 import socket
 import ssl
@@ -174,6 +175,165 @@ def _e2e_degraded_reason_text(kind: str | None, status_code: int | None) -> str:
     return _E2E_KIND_REASONS.get(kind or "", "边缘不可达")
 
 
+# Clash / Surge TUN fake-ip ranges. System DNS returns these even when the
+# public name is NXDOMAIN, so a local HTTPS probe fails the handshake and
+# the menu shows "TLS 失败" for a missing CNAME.
+_INTERCEPT_NETWORKS = (
+    ipaddress.ip_network("198.18.0.0/15"),
+    ipaddress.ip_network("fdfe:dcba:9876::/48"),
+)
+_DOH_LOOKUP_URL = "https://cloudflare-dns.com/dns-query"
+
+
+def _is_intercept_ip(value: str) -> bool:
+    """True when ``value`` is a Clash/Surge fake-ip, not a public address."""
+    try:
+        addr = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return any(addr in net for net in _INTERCEPT_NETWORKS)
+
+
+def _system_addrs(hostname: str) -> list[str]:
+    """Resolve ``hostname`` via the OS resolver (may be fake-ip)."""
+    addrs: list[str] = []
+    try:
+        for info in socket.getaddrinfo(hostname, 443, type=socket.SOCK_STREAM):
+            addrs.append(str(info[4][0]))
+    except socket.gaierror:
+        return []
+    return addrs
+
+
+def _all_intercept_addrs(hostname: str) -> bool:
+    """True when every OS-resolved address is a local fake-ip."""
+    addrs = _system_addrs(hostname)
+    return bool(addrs) and all(_is_intercept_ip(a) for a in addrs)
+
+
+def _doh_lookup_a(hostname: str, *, timeout: float = 5.0) -> list[str]:
+    """Public A records via Cloudflare DoH, bypassing the OS stub resolver.
+
+    Returns:
+        IPv4 addresses. Empty list means NXDOMAIN / no A records. Raises
+        ``httpx.HTTPError`` when DoH itself is unreachable.
+    """
+    with httpx.Client(timeout=timeout, proxy=resolve_proxy()) as client:
+        resp = client.get(
+            _DOH_LOOKUP_URL,
+            params={"name": hostname, "type": "A"},
+            headers={"accept": "application/dns-json"},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    if int(data.get("Status") or 0) == 3:
+        return []
+    ips: list[str] = []
+    for answer in data.get("Answer") or []:
+        if int(answer.get("type") or 0) == 1 and answer.get("data"):
+            ips.append(str(answer["data"]))
+    return ips
+
+
+def _tls_http_get_status(
+    hostname: str, path: str, ip: str, *, timeout: float = 5.0
+) -> int:
+    """HTTPS GET using ``ip`` for TCP and ``hostname`` for SNI / Host.
+
+    Args:
+        hostname: Public tunnel hostname (certificate / SNI / Host).
+        path: Request path beginning with ``/``.
+        ip: Destination address (typically a Cloudflare anycast IP).
+        timeout: Connect and read timeout in seconds.
+
+    Returns:
+        HTTP status code.
+
+    Raises:
+        ssl.SSLError: TLS handshake failed against the real edge.
+        OSError: Connect / read failed.
+        ConnectionError: Response was not a valid HTTP status line.
+    """
+    ctx = ssl.create_default_context()
+    with socket.create_connection((ip, 443), timeout=timeout) as sock:
+        sock.settimeout(timeout)
+        with ctx.wrap_socket(sock, server_hostname=hostname) as tls:
+            req = (
+                f"GET {path} HTTP/1.1\r\n"
+                f"Host: {hostname}\r\n"
+                "Connection: close\r\n"
+                "User-Agent: kiro-gateway-tray-e2e\r\n"
+                "\r\n"
+            )
+            tls.sendall(req.encode("ascii"))
+            buf = b""
+            while b"\r\n" not in buf:
+                chunk = tls.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+                if len(buf) > 8192:
+                    break
+    first = buf.split(b"\r\n", 1)[0].decode("ascii", "replace")
+    parts = first.split()
+    if len(parts) >= 2 and parts[1].isdigit():
+        return int(parts[1])
+    raise ConnectionError(f"malformed HTTP status: {first[:80]}")
+
+
+def _probe_via_public_dns(hostname: str) -> E2EProbeResult | None:
+    """Re-run the health GET via DoH IPs when OS DNS is a fake-ip.
+
+    Returns:
+        A probe result, or None when DoH itself failed so the caller should
+        keep the original local-handshake error.
+    """
+    try:
+        ips = _doh_lookup_a(hostname)
+    except (httpx.HTTPError, ValueError, TypeError, KeyError):
+        return None
+    if not ips:
+        return E2EProbeResult(
+            ok=False,
+            kind="dns",
+            detail="public DNS NXDOMAIN",
+        )
+    try:
+        status = _tls_http_get_status(hostname, "/health", ips[0])
+    except ssl.SSLError as exc:
+        return E2EProbeResult(
+            ok=False,
+            kind="tls",
+            detail=_sanitize_e2e_detail(str(exc)),
+        )
+    except TimeoutError as exc:
+        return E2EProbeResult(
+            ok=False,
+            kind="timeout",
+            detail=_sanitize_e2e_detail(str(exc)),
+        )
+    except OSError as exc:
+        return E2EProbeResult(
+            ok=False,
+            kind="connect",
+            detail=_sanitize_e2e_detail(str(exc)),
+        )
+    except ConnectionError as exc:
+        return E2EProbeResult(
+            ok=False,
+            kind="unexpected",
+            detail=_sanitize_e2e_detail(str(exc)),
+        )
+    if status == 200:
+        return E2EProbeResult(ok=True, kind="ok")
+    return E2EProbeResult(
+        ok=False,
+        kind="http_status",
+        status_code=status,
+        detail=_sanitize_e2e_detail(f"HTTP {status}"),
+    )
+
+
 class Supervisor:
     # consecutive failed /health probes before flipping "starting" -> "error"
     _UNHEALTHY_THRESHOLD = 5
@@ -244,6 +404,8 @@ class Supervisor:
         # further failures in the same incident must not reconnect again until
         # a success, start/stop, or request_tunnel_reconnect clears it.
         self._e2e_recovery_attempted: bool = False
+        # One-shot latch for public CNAME repair via Worker /ensure-dns.
+        self._e2e_dns_repair_attempted: bool = False
         # Fired whenever gateway health or tunnel connectivity changes, so the
         # tray can redraw the menu the moment the tunnel comes up (instead of
         # waiting for the next time the user opens the menu).
@@ -538,6 +700,7 @@ class Supervisor:
             self._gw_health = "starting"
             self._last_error = None
             self._e2e_recovery_attempted = False
+            self._e2e_dns_repair_attempted = False
             self._e2e_consecutive_failures = 0
             self._tunnel_e2e_kind = None
             self._tunnel_e2e_status_code = None
@@ -581,6 +744,7 @@ class Supervisor:
             self._tunnel_degraded_reason = ""
             self._e2e_consecutive_failures = 0
             self._e2e_recovery_attempted = False
+            self._e2e_dns_repair_attempted = False
 
     def restart(self) -> bool:
         self.stop()
@@ -731,6 +895,10 @@ class Supervisor:
             should_soft_reconnect_e2e = False
             if tunnel_connected:
                 e2e_result = _as_e2e_result(self._probe_tunnel_e2e())
+                if self._maybe_repair_public_dns(e2e_result):
+                    e2e_result = _as_e2e_result(
+                        self._probe_tunnel_e2e(ignore_throttle=True)
+                    )
                 with self._state_lock:
                     self._tunnel_e2e_ok = e2e_result.ok
                     if not e2e_result.skipped:
@@ -950,6 +1118,7 @@ class Supervisor:
         """
         with self._state_lock:
             self._e2e_recovery_attempted = False
+            self._e2e_dns_repair_attempted = False
         result = self._issue_soft_reconnect(reason)
         if result != "sent":
             return
@@ -1007,6 +1176,46 @@ class Supervisor:
             return 0
         except Exception:
             return 0
+
+    def _maybe_repair_public_dns(self, result: E2EProbeResult) -> bool:
+        """Once per incident, ask the Worker to recreate a missing CNAME.
+
+        Args:
+            result: The e2e probe that just ran.
+
+        Returns:
+            True when the Worker reported success so the caller should probe
+            again immediately. False when nothing was attempted or the tunnel
+            is gone (in which case ``_reprovision_if_deleted`` owns recovery).
+        """
+        if result.ok or result.skipped:
+            return False
+        if result.kind not in ("dns", "tls"):
+            return False
+        cfg = self._get_cfg()
+        secret = self._cached_secret or cfg.cloudflare.shared_secret
+        if not secret:
+            return False
+        with self._state_lock:
+            if self._e2e_dns_repair_attempted:
+                return False
+            self._e2e_dns_repair_attempted = True
+        from . import provision
+        try:
+            repaired = provision.ensure_dns(cfg, secret)
+        except Exception:
+            logger.debug("ensure-dns request failed", exc_info=True)
+            return False
+        if repaired is False:
+            logger.warning("ensure-dns: cloud tunnel missing; will re-provision")
+            return False
+        if repaired is None:
+            logger.debug("ensure-dns unavailable; leaving public DNS as-is")
+            return False
+        logger.info("ensure-dns confirmed public CNAME for {}", cfg.cloudflare.hostname)
+        with self._state_lock:
+            self._last_e2e_success_ts = 0.0
+        return True
 
     def _probe_tunnel_ready(self) -> bool:
         """True if cloudflared reports at least one live edge connection.
@@ -1070,11 +1279,18 @@ class Supervisor:
                 kind=kind,
                 detail=_sanitize_e2e_detail(str(exc)),
             )
+            if kind in ("tls", "connect", "timeout") and _all_intercept_addrs(
+                hostname
+            ):
+                public = _probe_via_public_dns(hostname)
+                if public is not None:
+                    result = public
         with self._state_lock:
             if result.ok:
                 self._last_e2e_success_ts = time.time()
                 self._e2e_consecutive_failures = 0
                 self._e2e_recovery_attempted = False
+                self._e2e_dns_repair_attempted = False
             else:
                 self._e2e_consecutive_failures += 1
                 if result.kind == "http_status":
@@ -1084,8 +1300,9 @@ class Supervisor:
                     )
                 else:
                     logger.debug(
-                        "tunnel e2e probe failed: kind={}",
+                        "tunnel e2e probe failed: kind={} detail={}",
                         result.kind,
+                        result.detail or "",
                     )
         return result
 

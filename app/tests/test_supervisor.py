@@ -1186,6 +1186,7 @@ def _quiesce(s) -> None:
         s._last_e2e_success_ts = 0.0
         s._e2e_consecutive_failures = 0
         s._e2e_recovery_attempted = False
+        s._e2e_dns_repair_attempted = False
         s._tunnel_e2e_kind = None
         s._tunnel_e2e_status_code = None
         s._consecutive_ok = 0
@@ -1708,11 +1709,13 @@ class TestE2EKindReconnectPolicy:
         s = _make_sup_v2(monkeypatch, tmp_path)
         with s._state_lock:
             s._e2e_recovery_attempted = True
+            s._e2e_dns_repair_attempted = True
             s._e2e_consecutive_failures = 3
 
         s.start()
         s._stop_health_loop()
         assert s._e2e_recovery_attempted is False
+        assert s._e2e_dns_repair_attempted is False
         assert s._e2e_consecutive_failures == 0
         s.close()
 
@@ -1885,4 +1888,132 @@ def test_migrate_identity_skipped_without_secret(monkeypatch, tmp_path):
     s.start()
     assert calls == []
     assert appconfig.load().cloudflare.hostname == "kg-test.example.com"
+
+
+class TestInterceptIp:
+    """Clash/Surge fake-ip must not be treated as a public edge address."""
+
+    def test_rfc2544_and_clash_v6(self):
+        assert supervisor._is_intercept_ip("198.18.0.75") is True
+        assert supervisor._is_intercept_ip("198.19.255.255") is True
+        assert supervisor._is_intercept_ip("fdfe:dcba:9876::4a") is True
+        assert supervisor._is_intercept_ip("1.1.1.1") is False
+        assert supervisor._is_intercept_ip("not-an-ip") is False
+
+    def test_all_intercept_requires_every_addr(self, monkeypatch):
+        monkeypatch.setattr(
+            supervisor, "_system_addrs", lambda _h: ["198.18.0.75", "1.1.1.1"]
+        )
+        assert supervisor._all_intercept_addrs("kg-test.example.com") is False
+        monkeypatch.setattr(
+            supervisor, "_system_addrs", lambda _h: ["198.18.0.75"]
+        )
+        assert supervisor._all_intercept_addrs("kg-test.example.com") is True
+        monkeypatch.setattr(supervisor, "_system_addrs", lambda _h: [])
+        assert supervisor._all_intercept_addrs("kg-test.example.com") is False
+
+
+class TestE2EFakeIpFallback:
+    """Local TUN fake-ip TLS failures are reclassified via DoH."""
+
+    def test_nxdomain_over_fake_ip_is_dns(self, monkeypatch, tmp_path):
+        s = _make_sup_v2(monkeypatch, tmp_path)
+        _install_e2e_stub(monkeypatch, error_factory=_tls_error)
+        monkeypatch.setattr(supervisor, "_system_addrs", lambda _h: ["198.18.0.75"])
+        monkeypatch.setattr(supervisor, "_doh_lookup_a", lambda _h: [])
+        result = s._probe_tunnel_e2e(ignore_throttle=True)
+        assert result.ok is False
+        assert result.kind == "dns"
+        assert result.detail == "public DNS NXDOMAIN"
+        s.close()
+
+    def test_public_ip_retry_succeeds(self, monkeypatch, tmp_path):
+        s = _make_sup_v2(monkeypatch, tmp_path)
+        _install_e2e_stub(monkeypatch, error_factory=_tls_error)
+        monkeypatch.setattr(supervisor, "_system_addrs", lambda _h: ["198.18.0.75"])
+        monkeypatch.setattr(supervisor, "_doh_lookup_a", lambda _h: ["104.16.1.1"])
+        monkeypatch.setattr(
+            supervisor, "_tls_http_get_status", lambda *a, **k: 200
+        )
+        result = s._probe_tunnel_e2e(ignore_throttle=True)
+        assert result.ok is True
+        assert result.kind == "ok"
+        s.close()
+
+    def test_doh_unreachable_keeps_tls(self, monkeypatch, tmp_path):
+        s = _make_sup_v2(monkeypatch, tmp_path)
+        _install_e2e_stub(monkeypatch, error_factory=_tls_error)
+        monkeypatch.setattr(supervisor, "_system_addrs", lambda _h: ["198.18.0.75"])
+
+        def _boom(_h):
+            raise httpx.ConnectError("doh down")
+
+        monkeypatch.setattr(supervisor, "_doh_lookup_a", _boom)
+        result = s._probe_tunnel_e2e(ignore_throttle=True)
+        assert result.ok is False
+        assert result.kind == "tls"
+        s.close()
+
+    def test_real_tls_without_fake_ip_stays_tls(self, monkeypatch, tmp_path):
+        s = _make_sup_v2(monkeypatch, tmp_path)
+        _install_e2e_stub(monkeypatch, error_factory=_tls_error)
+        monkeypatch.setattr(supervisor, "_system_addrs", lambda _h: ["104.16.1.1"])
+        result = s._probe_tunnel_e2e(ignore_throttle=True)
+        assert result.kind == "tls"
+        s.close()
+
+
+class TestEnsureDnsRepair:
+    """Missing public CNAME is repaired once per incident, then latched."""
+
+    def _prepare_with_secret(self, monkeypatch, tmp_path):
+        s = _make_sup_v2(monkeypatch, tmp_path)
+        s.start()
+        _quiesce(s)
+        s.gateway.started = True
+        s.tunnel.started = True
+        cfg = appconfig.load()
+        cfg.cloudflare.shared_secret = "act-code"
+        appconfig.save(cfg)
+        s._cached_secret = "act-code"
+        monkeypatch.setattr(s, "_probe_gateway_once", lambda: True)
+        monkeypatch.setattr(s._client, "get", lambda *a, **k: _ReadyResponse(4))
+        monkeypatch.setattr(s, "_reprovision_if_deleted", lambda: False)
+        monkeypatch.setattr(supervisor, "_system_addrs", lambda _h: ["198.18.0.75"])
+        monkeypatch.setattr(supervisor, "_doh_lookup_a", lambda _h: [])
+        return s
+
+    def test_repairs_once_then_latches(self, monkeypatch, tmp_path):
+        s = self._prepare_with_secret(monkeypatch, tmp_path)
+        _install_e2e_stub(monkeypatch, error_factory=_tls_error)
+        import kiro_gateway_tray.provision as pmod
+        calls = []
+        monkeypatch.setattr(pmod, "ensure_dns", lambda *a, **k: calls.append(1) or True)
+        # First cycle: classify as dns, repair, then probe again (still dns).
+        s._run_probe_cycle()
+        assert calls == [1]
+        assert s._e2e_dns_repair_attempted is True
+        assert s.status()["tunnel_detail"] == "DNS 解析失败"
+        s._run_probe_cycle()
+        assert calls == [1]
+        s.close()
+
+    def test_no_secret_skips_repair(self, monkeypatch, tmp_path):
+        s = _make_sup_v2(monkeypatch, tmp_path)
+        s.start()
+        _quiesce(s)
+        s.gateway.started = True
+        s.tunnel.started = True
+        monkeypatch.setattr(s, "_probe_gateway_once", lambda: True)
+        monkeypatch.setattr(s._client, "get", lambda *a, **k: _ReadyResponse(4))
+        monkeypatch.setattr(s, "_reprovision_if_deleted", lambda: False)
+        monkeypatch.setattr(supervisor, "_system_addrs", lambda _h: ["198.18.0.75"])
+        monkeypatch.setattr(supervisor, "_doh_lookup_a", lambda _h: [])
+        _install_e2e_stub(monkeypatch, error_factory=_tls_error)
+        import kiro_gateway_tray.provision as pmod
+        calls = []
+        monkeypatch.setattr(pmod, "ensure_dns", lambda *a, **k: calls.append(1) or True)
+        s._run_probe_cycle()
+        assert calls == []
+        s.close()
 

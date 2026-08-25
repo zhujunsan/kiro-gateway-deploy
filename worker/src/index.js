@@ -18,6 +18,17 @@
 //   → 200 { exists: boolean }            ← 只读查询，绝不修改 tunnel/DNS
 //   → 401 { error: "unauthorized" }
 //
+// POST /ensure-dns
+//   body: { shared_secret, username }
+//   → 200 { ok: true, hostname, repaired: boolean }
+//   → 404 { error: "tunnel not found" }  ← 隧道已不在，客户端应走完整 re-provision
+//   幂等：CNAME 已正确则不动；缺失 / 未代理 / 指错隧道则删掉重建。
+//
+// POST /reconcile-dns
+//   body: { shared_secret }
+//   → 200 { ok, checked, unchanged, repaired, repaired_hostnames, errors }
+//   给账号下所有 kg-* 隧道补 proxied CNAME。不删隧道。
+//
 // POST /telemetry-secret
 //   body: { shared_secret, username }    ← 用激活码鉴权（同 /provision），不用 TELEMETRY_SECRET
 //   → 200 { telemetry_secret }           ← 只回当前密钥，绝不重建隧道
@@ -46,7 +57,7 @@
 //   Worker 侧只做：白名单查询 + 仅 SELECT + 结果缓存（TTL 60 分钟）。
 //
 // scheduled(): cron 触发，把 usage_rollup 卷成 usage_daily 日聚合（幂等可重入）；
-//   同时执行闲置隧道清理（仅当 IDLE_CLEANUP_DAYS 配置时）。
+//   同时执行闲置隧道清理（仅当 IDLE_CLEANUP_DAYS 配置时），再给剩余隧道补 DNS。
 //
 // Required Worker Secrets (set via wrangler secret put):
 //   SHARED_SECRET   — the secret distributed to users out-of-band
@@ -108,6 +119,57 @@ function tunnelMeta(env, username) {
     hostname: `${prefix}-${username}.${env.DOMAIN_SUFFIX}`,
     tunnelName: `${prefix}-${username}`,
   };
+}
+
+function cnameContent(tunnelId) {
+  return `${tunnelId}.cfargotunnel.com`;
+}
+
+function tunnelIsServing(t) {
+  // degraded = still on the edge and able to serve; only skip healthy would
+  // let a 2/4 HA tunnel (or a reconnect blip) fall through to idle cleanup.
+  return t.status === "healthy" || t.status === "degraded";
+}
+
+function idleSinceMs(t, nowMs) {
+  // conns_inactive_at is the only real "went idle" signal. Falling back to
+  // created_at is what deleted a live user's CNAME: a months-old tunnel that
+  // briefly showed status=down during cloudflared restart looked 30+ days idle.
+  if (t.conns_inactive_at) {
+    const inactiveAt = new Date(t.conns_inactive_at).getTime();
+    if (!Number.isFinite(inactiveAt)) return 0;
+    if (t.conns_active_at) {
+      const activeAt = new Date(t.conns_active_at).getTime();
+      if (Number.isFinite(activeAt) && activeAt > inactiveAt) return 0;
+    }
+    return Math.max(0, nowMs - inactiveAt);
+  }
+  if (t.status === "inactive" && t.created_at) {
+    const createdAt = new Date(t.created_at).getTime();
+    return Number.isFinite(createdAt) ? Math.max(0, nowMs - createdAt) : 0;
+  }
+  return 0;
+}
+
+function shouldCleanupIdleTunnel(t, nowMs, thresholdMs, prefix) {
+  if (!t || !t.name || !t.name.startsWith(prefix)) return false;
+  if (tunnelIsServing(t)) return false;
+  // Cloudflare: conns_inactive_at === null means the tunnel is currently active.
+  if (t.conns_active_at && !t.conns_inactive_at) return false;
+  return idleSinceMs(t, nowMs) >= thresholdMs;
+}
+
+function dnsRecordNeedsRepair(records, tunnelId) {
+  // A proxied CNAME to this tunnel is the only valid public record. Anything
+  // else (missing, extra A/AAAA, unproxied, or pointing at another tunnel)
+  // makes HTTPS fail at the edge — locally that often shows up as a TLS
+  // handshake EOF because Clash/Surge fake-ip still synthesizes an address.
+  const expected = cnameContent(tunnelId);
+  const list = Array.isArray(records) ? records : [];
+  if (list.length !== 1) return true;
+  const rec = list[0];
+  const content = String(rec.content || "").replace(/\.$/, "").toLowerCase();
+  return rec.type !== "CNAME" || content !== expected.toLowerCase() || !rec.proxied;
 }
 
 async function findTunnelByName(env, name) {
@@ -193,20 +255,7 @@ async function provision(env, username, port) {
   );
 
   await setIngress(env, tunnel.id, hostname, port);
-
-  const cnameBody = {
-    type: "CNAME",
-    name: hostname,
-    content: `${tunnel.id}.cfargotunnel.com`,
-    proxied: true,
-  };
-  try {
-    await cfFetch(env, `/zones/${env.CF_ZONE_ID}/dns_records`, "POST", cnameBody);
-  } catch {
-    // Stale record may still exist; force-clean and retry once.
-    await deleteDnsRecord(env, hostname);
-    await cfFetch(env, `/zones/${env.CF_ZONE_ID}/dns_records`, "POST", cnameBody);
-  }
+  await ensureDnsRecord(env, hostname, tunnel.id);
 
   const result = { hostname, run_token: tunnel.token };
   // 首次下发遥测密钥：provision 成功时附带当前 TELEMETRY_SECRET（设计文档第八节
@@ -245,9 +294,42 @@ async function updatePort(env, username, port) {
   if (changed) {
     await setIngress(env, tunnel.id, hostname, port);
   }
+  // Port sync is a convenient heartbeat: heal a missing CNAME without forcing
+  // the client through a full re-provision (which rotates the run token).
+  try {
+    await ensureDnsRecord(env, hostname, tunnel.id);
+  } catch (err) {
+    console.log(`[ensure-dns] ${hostname}: ${err.message}`);
+  }
   // Echo back the port that is actually in effect so the client can persist
   // the truth (Worker may clamp invalid ports to the default).
   return { ok: true, changed, port };
+}
+
+async function ensureDnsRecord(env, hostname, tunnelId) {
+  const records = await cfFetch(
+    env,
+    `/zones/${env.CF_ZONE_ID}/dns_records?name=${encodeURIComponent(hostname)}`
+  );
+  if (!dnsRecordNeedsRepair(records, tunnelId)) {
+    return { repaired: false };
+  }
+  await deleteDnsRecord(env, hostname);
+  await cfFetch(env, `/zones/${env.CF_ZONE_ID}/dns_records`, "POST", {
+    type: "CNAME",
+    name: hostname,
+    content: cnameContent(tunnelId),
+    proxied: true,
+  });
+  return { repaired: true };
+}
+
+async function handleEnsureDns(env, json, username) {
+  const { hostname, tunnelName } = tunnelMeta(env, username);
+  const tunnel = await findTunnelByName(env, tunnelName);
+  if (!tunnel) return json({ error: "tunnel not found" }, 404);
+  const result = await ensureDnsRecord(env, hostname, tunnel.id);
+  return json({ ok: true, hostname, repaired: result.repaired });
 }
 
 // --- telemetry ---
@@ -649,6 +731,25 @@ async function rollupToDaily(env) {
 // 只清理 name 以 HOSTNAME_PREFIX- 开头的隧道（本项目签发的），跳过正在活跃的。
 // 单个隧道删除失败不影响其余；console.log 记录操作用于审计。
 
+async function listProjectTunnels(env) {
+  const prefix = (env.HOSTNAME_PREFIX || "kg") + "-";
+  const out = [];
+  let page = 1;
+  while (true) {
+    const tunnels = await cfFetch(
+      env,
+      `/accounts/${env.CF_ACCOUNT_ID}/cfd_tunnel?is_deleted=false&per_page=100&page=${page}`
+    );
+    if (!Array.isArray(tunnels) || tunnels.length === 0) break;
+    for (const t of tunnels) {
+      if (t.name && t.name.startsWith(prefix)) out.push(t);
+    }
+    if (tunnels.length < 100) break;
+    page++;
+  }
+  return out;
+}
+
 async function cleanupIdleTunnels(env) {
   const maxDays = parseInt(env.IDLE_CLEANUP_DAYS, 10);
   if (!Number.isFinite(maxDays) || maxDays <= 0) return;
@@ -656,39 +757,85 @@ async function cleanupIdleTunnels(env) {
   const prefix = (env.HOSTNAME_PREFIX || "kg") + "-";
   const nowMs = Date.now();
   const thresholdMs = maxDays * 86400000;
-  let page = 1;
-  let hasMore = true;
 
-  while (hasMore) {
-    const tunnels = await cfFetch(
-      env,
-      `/accounts/${env.CF_ACCOUNT_ID}/cfd_tunnel?is_deleted=false&per_page=100&page=${page}`
-    );
-    if (!Array.isArray(tunnels) || tunnels.length === 0) break;
+  const tunnels = await listProjectTunnels(env);
+  for (const t of tunnels) {
+    if (!shouldCleanupIdleTunnel(t, nowMs, thresholdMs, prefix)) continue;
 
-    for (const t of tunnels) {
-      if (!t.name || !t.name.startsWith(prefix)) continue;
-      if (t.status === "healthy") continue;
-      if (t.conns_active_at && !t.conns_inactive_at) continue;
-
-      const refTime = t.conns_inactive_at || t.created_at;
-      if (!refTime) continue;
-      const idleMs = nowMs - new Date(refTime).getTime();
-      if (idleMs < thresholdMs) continue;
-
-      const hostname = `${t.name}.${env.DOMAIN_SUFFIX}`;
-      try {
-        await deleteDnsRecord(env, hostname);
-        await deleteTunnel(env, t.id);
-        console.log(`[cleanup] deleted idle tunnel "${t.name}" (idle ${Math.floor(idleMs / 86400000)}d)`);
-      } catch (err) {
-        console.log(`[cleanup] failed to delete "${t.name}": ${err.message}`);
-      }
+    const hostname = `${t.name}.${env.DOMAIN_SUFFIX}`;
+    const idleDays = Math.floor(idleSinceMs(t, nowMs) / 86400000);
+    try {
+      // Tunnel first: if delete fails (reconnect raced in), leave DNS alone.
+      await deleteTunnel(env, t.id);
+      await deleteDnsRecord(env, hostname);
+      console.log(`[cleanup] deleted idle tunnel "${t.name}" (idle ${idleDays}d)`);
+    } catch (err) {
+      console.log(`[cleanup] failed to delete "${t.name}": ${err.message}`);
     }
+  }
+}
 
-    hasMore = tunnels.length === 100;
+async function listZoneCnameRecords(env) {
+  const byName = new Map();
+  let page = 1;
+  while (true) {
+    const records = await cfFetch(
+      env,
+      `/zones/${env.CF_ZONE_ID}/dns_records?type=CNAME&per_page=100&page=${page}`
+    );
+    if (!Array.isArray(records) || records.length === 0) break;
+    for (const rec of records) {
+      if (rec && rec.name) byName.set(String(rec.name).toLowerCase(), rec);
+    }
+    if (records.length < 100) break;
     page++;
   }
+  return byName;
+}
+
+async function reconcileAllTunnelDns(env) {
+  // One Worker invocation has a low subrequest cap (~50 on this account).
+  // Scan with bulk lists, then repair a bounded number per call.
+  const repairBudget = 12;
+  const tunnels = await listProjectTunnels(env);
+  const cnames = await listZoneCnameRecords(env);
+  const report = { checked: 0, unchanged: 0, repaired: [], errors: [], pending: 0 };
+  for (const t of tunnels) {
+    report.checked += 1;
+    const hostname = `${t.name}.${env.DOMAIN_SUFFIX}`;
+    const existing = cnames.get(hostname.toLowerCase());
+    const snapshot = existing ? [existing] : [];
+    if (!dnsRecordNeedsRepair(snapshot, t.id)) {
+      report.unchanged += 1;
+      continue;
+    }
+    if (report.repaired.length + report.errors.length >= repairBudget) {
+      report.pending += 1;
+      continue;
+    }
+    try {
+      const result = await ensureDnsRecord(env, hostname, t.id);
+      if (result.repaired) report.repaired.push(hostname);
+      else report.unchanged += 1;
+    } catch (err) {
+      report.errors.push({ hostname, error: String(err.message || err) });
+      console.log(`[reconcile-dns] ${hostname}: ${err.message}`);
+    }
+  }
+  return report;
+}
+
+async function handleReconcileDns(env, json) {
+  const report = await reconcileAllTunnelDns(env);
+  return json({
+    ok: true,
+    checked: report.checked,
+    unchanged: report.unchanged,
+    repaired: report.repaired.length,
+    pending: report.pending,
+    repaired_hostnames: report.repaired,
+    errors: report.errors,
+  });
 }
 
 // --- 隧道存在性只读查询 ---
@@ -883,6 +1030,14 @@ export default {
       return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401 });
     }
 
+    if (url.pathname === "/reconcile-dns") {
+      try {
+        return await handleReconcileDns(env, json);
+      } catch (err) {
+        return json({ error: err.message }, 500);
+      }
+    }
+
     if (!username || !USERNAME_RE.test(username)) {
       return new Response(
         JSON.stringify({ error: "username must be lowercase alphanumeric/hyphen, 1-32 chars" }),
@@ -913,16 +1068,35 @@ export default {
       }
     }
 
+    if (url.pathname === "/ensure-dns") {
+      try {
+        return await handleEnsureDns(env, json, username);
+      } catch (err) {
+        return json({ error: err.message }, 500);
+      }
+    }
+
     return new Response("not found", { status: 404 });
   },
 
   // cron 触发：卷 rollup → daily + 清理闲置隧道。
   async scheduled(event, env, ctx) {
     ctx.waitUntil(rollupToDaily(env));
-    ctx.waitUntil(cleanupIdleTunnels(env));
+    ctx.waitUntil((async () => {
+      await cleanupIdleTunnels(env);
+      await reconcileAllTunnelDns(env);
+    })());
   },
 };
 
 // 供单元测试直接引用真实实现，避免测试里再抄一份逻辑然后悄悄跟源码走偏。
 // Workers 运行时只消费 default export，额外的具名导出没有任何副作用。
-export { normalizeRollupRow, timingSafeEqual };
+export {
+  normalizeRollupRow,
+  timingSafeEqual,
+  cnameContent,
+  dnsRecordNeedsRepair,
+  tunnelIsServing,
+  idleSinceMs,
+  shouldCleanupIdleTunnel,
+};
