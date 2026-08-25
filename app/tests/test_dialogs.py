@@ -1,4 +1,7 @@
 # app/tests/test_dialogs.py
+import sys
+import types
+
 from kiro_gateway_tray import dialogs
 
 
@@ -116,3 +119,144 @@ def test_linux_alert_uses_zenity_when_present(monkeypatch):
     )
     dialogs._linux_alert("T", "M")
     assert cmds and cmds[0][0] == "zenity"
+    assert any(str(a).startswith("--window-icon=") for a in cmds[0])
+
+
+def test_linux_alert_uses_kdialog_icon(monkeypatch, tmp_path):
+    icon = tmp_path / "icon.png"
+    icon.write_bytes(b"png")
+    cmds = []
+    monkeypatch.setattr(dialogs, "_alert_icon_path", lambda *n: icon)
+    monkeypatch.setattr(dialogs.shutil, "which", lambda name: name if name == "kdialog" else None)
+    monkeypatch.setattr(dialogs.subprocess, "run", lambda cmd, **k: cmds.append(cmd))
+    dialogs._linux_alert("T", "M")
+    assert cmds[0][:4] == ["kdialog", "--icon", str(icon), "--title"]
+
+
+def test_osascript_alert_includes_app_icon(monkeypatch, tmp_path):
+    icon = tmp_path / "icon.icns"
+    icon.write_bytes(b"icns")
+    cmds = []
+    monkeypatch.setattr(dialogs.subprocess, "run", lambda cmd, **k: cmds.append(cmd))
+    dialogs._osascript_alert("标题", "第一行\n第二行", icon)
+    script = cmds[0][cmds[0].index("-e") + 1]
+    assert "display dialog" in script
+    assert "POSIX file" in script
+    assert str(icon.resolve()) in script
+    assert "确定" in script
+
+
+def test_darwin_alert_falls_back_to_osascript(monkeypatch, tmp_path):
+    icon = tmp_path / "icon.png"
+    icon.write_bytes(b"png")
+    monkeypatch.setattr(dialogs, "_alert_icon_path", lambda *n: icon)
+    monkeypatch.setattr(
+        dialogs, "_cocoa_alert",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("no AppKit")),
+    )
+    seen = []
+    monkeypatch.setattr(dialogs, "_osascript_alert", lambda t, m, p: seen.append((t, m, p)))
+    dialogs._darwin_alert("T", "M")
+    assert seen == [("T", "M", icon)]
+
+
+def test_win32_alert_embeds_png_icon(monkeypatch, tmp_path):
+    icon = tmp_path / "icon.png"
+    icon.write_bytes(b"png")
+    monkeypatch.setattr(dialogs, "_alert_icon_path", lambda *n: icon)
+    scripts = []
+
+    def _run(cmd, **k):
+        scripts.append(cmd[cmd.index("-Command") + 1])
+
+    monkeypatch.setattr(dialogs.subprocess, "run", _run)
+    dialogs._win32_alert("T", "hello")
+    assert "FromFile" in scripts[0]
+    assert str(icon) in scripts[0]
+
+
+def test_cocoa_alert_sets_icon(monkeypatch, tmp_path):
+    icon = tmp_path / "icon.png"
+    icon.write_bytes(b"png")
+    created = []
+
+    class _Image:
+        @classmethod
+        def alloc(cls):
+            return cls()
+
+        def initWithContentsOfFile_(self, path):
+            self.path = path
+            return self
+
+    class _Alert:
+        @classmethod
+        def alloc(cls):
+            inst = cls.__new__(cls)
+            created.append(inst)
+            return inst
+
+        def init(self):
+            return self
+
+        def setMessageText_(self, title):
+            self.title = title
+
+        def setInformativeText_(self, message):
+            self.message = message
+
+        def addButtonWithTitle_(self, label):
+            self.button = label
+
+        def setIcon_(self, image):
+            self.icon = image
+
+        def runModal(self):
+            self.ran = True
+            return 1000
+
+    class _NSApp:
+        @staticmethod
+        def sharedApplication():
+            return object()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "AppKit",
+        types.SimpleNamespace(NSAlert=_Alert, NSApplication=_NSApp, NSImage=_Image),
+    )
+    monkeypatch.setattr(dialogs, "_run_cocoa_modal", lambda fn: fn())
+    dialogs._cocoa_alert("隧道地址已变更", "请改 Base URL", icon)
+    assert len(created) == 1
+    alert = created[0]
+    assert alert.title == "隧道地址已变更"
+    assert alert.icon.path == str(icon)
+    assert alert.ran is True
+
+
+def test_run_cocoa_modal_runs_inline_on_main_thread(monkeypatch):
+    class _Thread:
+        @staticmethod
+        def isMainThread():
+            return True
+
+    monkeypatch.setitem(sys.modules, "Foundation", types.SimpleNamespace(NSThread=_Thread))
+    ran = []
+    dialogs._run_cocoa_modal(lambda: ran.append(1))
+    assert ran == [1]
+
+
+def test_app_icon_file_finds_bundled_png():
+    from kiro_gateway_tray.icon import app_icon_file
+
+    path = app_icon_file("icon.png")
+    assert path is not None
+    assert path.name == "icon.png"
+    assert path.exists()
+
+
+def test_app_icon_file_returns_none_for_missing():
+    from kiro_gateway_tray.icon import app_icon_file
+
+    assert app_icon_file("definitely-missing-icon.xyz") is None
+

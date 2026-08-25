@@ -330,6 +330,14 @@ def test_poll_swallows_errors_and_releases_the_gate(monkeypatch, _inline_threads
     assert ran == [1]
 
 
+def test_url_changed_alert_body_is_short():
+    body = tray_mod._url_changed_alert_body("https://kg-new.example.com/v1")
+    assert body == (
+        "隧道地址已变更，现为：https://kg-new.example.com/v1，"
+        "请在菜单内复制并更新到例如 Cursor 等工具中"
+    )
+
+
 def test_url_changed_notice_is_the_first_visible_row():
     cfg = appconfig.load()
     cfg.cloudflare.hostname = "kg-new.example.com"
@@ -373,7 +381,7 @@ def test_clicking_url_changed_notice_alerts_then_dismisses(monkeypatch):
     assert len(alerts) == 1
     assert alerts[0][0] == "隧道地址已变更"
     assert "kg-new.example.com" in alerts[0][1]
-    assert "原先使用旧地址" in alerts[0][1]
+    assert "请在菜单内复制" in alerts[0][1]
     assert appconfig.load().cloudflare.url_changed_notice is False
 
 
@@ -395,7 +403,7 @@ def test_clicking_url_changed_notice_keeps_prompt_if_alert_fails(monkeypatch):
     assert appconfig.load().cloudflare.url_changed_notice is True
 
 
-def test_startup_url_changed_reminder_notifies_without_alert(monkeypatch):
+def test_startup_url_changed_reminder_alerts_and_keeps_menu_notice(monkeypatch):
     cfg = appconfig.load()
     cfg.cloudflare.hostname = "kg-new.example.com"
     cfg.cloudflare.url_changed_notice = True
@@ -410,5 +418,7 @@ def test_startup_url_changed_reminder_notifies_without_alert(monkeypatch):
     app._notify_url_changed_if_needed()
 
     assert notes and "隧道地址已变更" in notes[0][1]
-    assert alerts == []
+    assert len(alerts) == 1
+    assert "kg-new.example.com" in alerts[0][1]
+    assert "请在菜单内复制" in alerts[0][1]
     assert appconfig.load().cloudflare.url_changed_notice is True

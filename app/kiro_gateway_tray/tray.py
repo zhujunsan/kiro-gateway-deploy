@@ -64,10 +64,8 @@ _URL_CHANGED_TITLE = "⚠️ 隧道地址已变更，请重新配置"
 
 def _url_changed_alert_body(url: str) -> str:
     return (
-        "本机隧道地址已变更。原先使用旧地址的地方需要改成新地址，否则会连不上。\n"
-        "例如 Cursor / 其他客户端里的 Base URL。\n\n"
-        f"新地址：\n{url}\n\n"
-        "确认已了解后，点击确定关闭此提示。"
+        f"隧道地址已变更，现为：{url}，"
+        "请在菜单内复制并更新到例如 Cursor 等工具中"
     )
 
 
@@ -1269,24 +1267,31 @@ class TrayApp:
     def _url_changed_line(self, _item) -> str:
         return _URL_CHANGED_TITLE
 
-    def _on_url_changed(self, _icon, _item) -> None:
-        """Show the explanation dialog; dismiss the notice only after it returns."""
+    def _show_url_changed_alert(self) -> bool:
+        """Explain the new URL. True if the dialog returned; False on failure."""
         cfg = appconfig.load(use_cache=True)
         url = _tunnel_url(cfg) or "（见托盘菜单中的隧道 URL）"
         try:
             dialogs.alert("隧道地址已变更", _url_changed_alert_body(url))
         except Exception:
             logger.exception("url-changed alert failed")
+            return False
+        return True
+
+    def _on_url_changed(self, _icon, _item) -> None:
+        """Show the explanation dialog; dismiss the notice only after it returns."""
+        if not self._show_url_changed_alert():
             return
         appconfig.update(lambda latest: setattr(latest.cloudflare, "url_changed_notice", False))
         self._request_redraw()
 
     def _notify_url_changed_if_needed(self) -> None:
-        """Tray ping after upgrade; the explanatory dialog waits for a menu click."""
+        """Startup reminder: notify + dialog. The menu row stays until confirmed."""
         cfg = appconfig.load(use_cache=True)
         if not cfg.cloudflare.url_changed_notice:
             return
         self._notify(APP_NAME, "隧道地址已变更，请打开托盘菜单查看并确认")
+        self._show_url_changed_alert()
 
     def _update_visible(self, _item) -> bool:
         # Evaluated just below the URL-change notice. Sync peek here so the

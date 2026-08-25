@@ -41,6 +41,25 @@ def _asset_path(name: str) -> Path:
     return Path(__file__).resolve().parent.parent / "resources" / name
 
 
+def app_icon_file(*names: str) -> Path | None:
+    """Return the first bundled icon asset that exists on disk.
+
+    Used by dialogs so native alerts show the same k→ mark as the tray,
+    instead of the host process's generic folder/script icon.
+
+    Args:
+        *names: Candidate filenames under ``resources/`` (e.g. ``icon.png``).
+
+    Returns:
+        Path of the first existing file, or None if none are present.
+    """
+    for name in names:
+        path = _asset_path(name)
+        if path.exists():
+            return path
+    return None
+
+
 def _load_silhouette():
     """Extract the negative-space silhouette alpha mask from icon-source.png.
 

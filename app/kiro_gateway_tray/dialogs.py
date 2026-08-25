@@ -15,6 +15,8 @@ import shutil
 import string
 import subprocess
 import sys
+import threading
+from pathlib import Path
 from typing import Callable
 
 
@@ -374,23 +376,139 @@ def alert(title: str, message: str) -> None:
         return
 
 
-def _darwin_alert(title: str, message: str) -> None:
-    escaped = escape_applescript(message).replace("\n", "\\n")
+def _alert_icon_path(*names: str) -> Path | None:
+    """Resolve a bundled app icon for native alert dialogs."""
+    from .icon import app_icon_file
+
+    return app_icon_file(*names)
+
+
+def _run_cocoa_modal(fn: Callable[[], None]) -> None:
+    """Run an AppKit modal on the main thread, blocking the caller.
+
+    NSAlert must not be created off the main thread. Menu-click handlers are
+    already on it; the startup reminder is not, so we dispatch and wait.
+    Dispatching while already on the main thread would deadlock if we waited
+    on our own queue item.
+    """
+    from Foundation import NSThread
+
+    if NSThread.isMainThread():
+        fn()
+        return
+
+    from Foundation import NSOperationQueue
+
+    done = threading.Event()
+    errors: list[BaseException] = []
+
+    def _wrap() -> None:
+        try:
+            fn()
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            done.set()
+
+    NSOperationQueue.mainQueue().addOperationWithBlock_(_wrap)
+    if not done.wait(timeout=300):
+        raise TimeoutError("alert timed out")
+    if errors:
+        raise errors[0]
+
+
+def _cocoa_alert(title: str, message: str, icon_path: Path | None) -> None:
+    """Native macOS NSAlert with the tray/app icon on the left."""
+
+    def _show() -> None:
+        from AppKit import NSAlert, NSApplication, NSImage
+
+        NSApplication.sharedApplication()
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_(title)
+        alert.setInformativeText_(message)
+        alert.addButtonWithTitle_("确定")
+        if icon_path is not None:
+            image = NSImage.alloc().initWithContentsOfFile_(str(icon_path))
+            if image is not None:
+                alert.setIcon_(image)
+        alert.runModal()
+
+    _run_cocoa_modal(_show)
+
+
+def _osascript_alert(title: str, message: str, icon_path: Path | None) -> None:
+    """AppleScript fallback. ``display dialog`` accepts a custom icns/png."""
+    escaped_title = escape_applescript(title)
+    escaped_msg = escape_applescript(message).replace("\n", "\\n")
+    icon_clause = ""
+    if icon_path is not None:
+        escaped_icon = escape_applescript(str(icon_path.resolve()))
+        icon_clause = f' with icon (POSIX file "{escaped_icon}")'
+    script = (
+        f'display dialog "{escaped_msg}" '
+        f'with title "{escaped_title}" '
+        f'buttons {{"确定"}} default button 1{icon_clause}'
+    )
     subprocess.run(
-        ["osascript", "-e", f'display alert "{escape_applescript(title)}" message "{escaped}"'],
+        ["osascript", "-e", script],
         capture_output=True,
         timeout=300,
     )
+
+
+def _darwin_alert(title: str, message: str) -> None:
+    icon_path = _alert_icon_path("icon.png", "icon.icns")
+    try:
+        _cocoa_alert(title, message, icon_path)
+        return
+    except Exception:
+        pass
+    _osascript_alert(title, message, _alert_icon_path("icon.icns", "icon.png"))
 
 
 def _win32_alert(title: str, message: str) -> None:
     def _ps_quote(s: str) -> str:
         return "'" + s.replace("'", "''") + "'"
 
-    script = (
-        "Add-Type -AssemblyName System.Windows.Forms; "
-        f"[System.Windows.Forms.MessageBox]::Show({_ps_quote(message)}, {_ps_quote(title)})"
-    )
+    icon = _alert_icon_path("icon.png")
+    if icon is None:
+        script = (
+            "Add-Type -AssemblyName System.Windows.Forms; "
+            f"[System.Windows.Forms.MessageBox]::Show({_ps_quote(message)}, {_ps_quote(title)})"
+        )
+    else:
+        script = (
+            "Add-Type -AssemblyName System.Windows.Forms\n"
+            "Add-Type -AssemblyName System.Drawing\n"
+            "$form = New-Object System.Windows.Forms.Form\n"
+            f"$form.Text = {_ps_quote(title)}\n"
+            "$form.StartPosition = 'CenterScreen'\n"
+            "$form.FormBorderStyle = 'FixedDialog'\n"
+            "$form.MaximizeBox = $false\n"
+            "$form.MinimizeBox = $false\n"
+            "$form.TopMost = $true\n"
+            "$form.ClientSize = New-Object System.Drawing.Size(420, 160)\n"
+            "$pic = New-Object System.Windows.Forms.PictureBox\n"
+            "$pic.Location = New-Object System.Drawing.Point(16, 16)\n"
+            "$pic.Size = New-Object System.Drawing.Size(48, 48)\n"
+            "$pic.SizeMode = 'Zoom'\n"
+            f"$pic.Image = [System.Drawing.Image]::FromFile({_ps_quote(str(icon))})\n"
+            "$form.Controls.Add($pic)\n"
+            "$label = New-Object System.Windows.Forms.Label\n"
+            "$label.Location = New-Object System.Drawing.Point(76, 16)\n"
+            "$label.Size = New-Object System.Drawing.Size(328, 90)\n"
+            f"$label.Text = {_ps_quote(message)}\n"
+            "$form.Controls.Add($label)\n"
+            "$ok = New-Object System.Windows.Forms.Button\n"
+            "$ok.Text = 'OK'\n"
+            "$ok.DialogResult = [System.Windows.Forms.DialogResult]::OK\n"
+            "$ok.Location = New-Object System.Drawing.Point(329, 116)\n"
+            "$ok.Size = New-Object System.Drawing.Size(75, 28)\n"
+            "$form.Controls.Add($ok)\n"
+            "$form.AcceptButton = $ok\n"
+            "[void]$form.ShowDialog()\n"
+        )
     subprocess.run(
         ["powershell", "-NoProfile", "-STA", "-Command", script],
         capture_output=True,
@@ -399,18 +517,18 @@ def _win32_alert(title: str, message: str) -> None:
 
 
 def _linux_alert(title: str, message: str) -> None:
+    icon = _alert_icon_path("icon.png")
     if shutil.which("zenity"):
-        subprocess.run(
-            ["zenity", "--info", f"--title={title}", f"--text={message}"],
-            capture_output=True,
-            timeout=300,
-        )
+        cmd = ["zenity", "--info", f"--title={title}", f"--text={message}"]
+        if icon is not None:
+            cmd.append(f"--window-icon={icon}")
+        subprocess.run(cmd, capture_output=True, timeout=300)
         return
     if shutil.which("kdialog"):
-        subprocess.run(
-            ["kdialog", "--title", title, "--msgbox", message],
-            capture_output=True,
-            timeout=300,
-        )
+        cmd = ["kdialog"]
+        if icon is not None:
+            cmd.extend(["--icon", str(icon)])
+        cmd.extend(["--title", title, "--msgbox", message])
+        subprocess.run(cmd, capture_output=True, timeout=300)
 
 
