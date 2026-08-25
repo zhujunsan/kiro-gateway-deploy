@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.4.35 (2026-08-25)
+
+**Changed**
+- 同步上游网关至 `main-c5c7028`：web_search 调用 Kiro MCP 时补上 `profileArn`（优先账号 ARN，否则回退 `PROFILE_ARN`）。两者皆空时不再发无效请求。docker-compose 镜像 pin 至 `ghcr.io/zhujunsan/kiro-gateway:main-c5c7028`。
+
 ## v0.4.34 (2026-08-25)
 
 **Fixed**
