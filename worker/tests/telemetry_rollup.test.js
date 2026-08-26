@@ -11,7 +11,12 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { normalizeRollupRow, utcDayWindow } from "../src/index.js";
+import {
+  normalizeRollupRow,
+  utcDayWindow,
+  shouldRollupDaily,
+  DAILY_ROLLUP_DAYS_AGO,
+} from "../src/index.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -180,5 +185,21 @@ describe("utcDayWindow", () => {
     const yesterday = utcDayWindow(now, 1);
     assert.equal(yesterday.start, Date.UTC(2026, 6, 31) / 1000);
     assert.equal(yesterday.end, Date.UTC(2026, 7, 1) / 1000);
+  });
+});
+
+describe("shouldRollupDaily", () => {
+  it("runs only on the 00:xx UTC cron tick", () => {
+    assert.equal(shouldRollupDaily(new Date("2026-08-26T00:07:00Z")), true);
+    assert.equal(shouldRollupDaily(new Date("2026-08-26T00:59:00Z")), true);
+    assert.equal(shouldRollupDaily(new Date("2026-08-26T01:07:00Z")), false);
+    assert.equal(shouldRollupDaily(new Date("2026-08-26T08:07:00Z")), false);
+    assert.equal(shouldRollupDaily(new Date("2026-08-25T23:07:00Z")), false);
+  });
+});
+
+describe("DAILY_ROLLUP_DAYS_AGO", () => {
+  it("rolls completed UTC days only, not the in-progress day", () => {
+    assert.deepEqual(DAILY_ROLLUP_DAYS_AGO, [1, 2]);
   });
 });

@@ -39,7 +39,7 @@ wrangler deploy
 
 - `POST /telemetry`：用 `Authorization: Bearer <TELEMETRY_SECRET>` 鉴权（恒定时间比较），把上报的桶写入 D1 `usage_rollup`（`ON CONFLICT DO UPDATE` 覆盖，last-write-wins）。返回 `{ ok, accepted }`。行内可选 `estimated_credits` / `credit_estimate_*`（旧客户端缺省为 `NULL`=未知；显式 `0`=测得零消耗）；可选 `ttft_*` / `generation_*`（旧客户端缺省为 `0`；平均 TTFT = sum/count，token/s = generation_completion_tokens_sum / (generation_ms_sum/1000)，生成窗仅流式）。
 - `GET|POST /q/<name>`：只读查询，仅开放写死的参数化固定查询（`daily-by-user` / `model-distribution` / `active-users` / `user-totals`），默认查 `usage_daily`，结果缓存 60 分钟。**`/q/*` 不在 worker 内校验密钥，由 Cloudflare Access 在边缘保护**。
-- `scheduled()`（cron）：每小时把 `usage_rollup` 卷成 `usage_daily`（按天 × user × model 聚合，含 `estimated_credits` SUM，幂等可重入）。
+- `scheduled()`（cron 每小时）：闲置隧道清理 + 补 DNS。`usage_daily` 只在 UTC 0:07 把已结束的自然日（昨天 + 前天，补迟到桶）从 `usage_rollup` 卷进去（按天 × user × model 聚合，含 `estimated_credits` SUM，幂等可重入）。当天数据直接查 `usage_rollup`。
 
 > 网关失败请求的 debug 抓包（请求体 / 响应流等）已改走 Sentry，不再经本 Worker 的 `/telemetry/errors`。
 

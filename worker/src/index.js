@@ -61,8 +61,8 @@
 //   注意：/q/* 不自校验密钥 —— 由 Cloudflare Access 在边缘挡（见设计文档第十二/十三节）。
 //   Worker 侧只做：白名单查询 + 仅 SELECT + 结果缓存（TTL 60 分钟）。
 //
-// scheduled(): cron 触发，把 usage_rollup 卷成 usage_daily 日聚合（幂等可重入）；
-//   同时执行闲置隧道清理（仅当 IDLE_CLEANUP_DAYS 配置时），再给剩余隧道补 DNS。
+// scheduled(): cron 每小时跑（闲置隧道清理 + 补 DNS）；usage_daily 只在 UTC 0 点那一拍
+//   卷已结束的自然日（当天明细仍看 usage_rollup）。幂等可重入。
 //
 // Required Worker Secrets (set via wrangler secret put):
 //   SHARED_SECRET   — the secret distributed to users out-of-band
@@ -705,12 +705,13 @@ async function handleQuery(request, env, url, json) {
 
 // --- cron 卷动：usage_rollup → usage_daily ---
 //
-// 把指定天（默认前一天 + 当天，覆盖跨小时/跨天的边界）的 rollup 桶按
+// 只卷已经结束的 UTC 自然日：昨天（刚闭合）+ 前天（补迟到上报）。
+// 当天桶留在 usage_rollup，看板/观测若要看「正在进行的今天」直接查明细表。
 // 天 × username × model 聚合 SUM，写入 usage_daily。
 // 幂等可重入：用 INSERT ... ON CONFLICT(PK) DO UPDATE 覆盖，重复跑同一天结果一致。
 //
 // WHERE 必须是 bucket_start 的半开区间，不能包 date()：后者会让 idx_rollup_bucket
-// 失效、每小时全表扫描（见 D1 Query Insights）。
+// 失效、全表扫描（见 D1 Query Insights）。
 const DAILY_ROLLUP_SQL = `
 INSERT INTO usage_daily (day, username, model,
                          requests, successes, errors,
@@ -754,8 +755,8 @@ DO UPDATE SET
  *
  * Cron must filter `usage_rollup` by raw `bucket_start` so SQLite can use
  * `idx_rollup_bucket`. Wrapping the column in `date(bucket_start, 'unixepoch')`
- * forces a full table scan (~24k rows today, growing without bound) on every
- * hourly run; a range predicate only reads that day's few hundred buckets.
+ * forces a full table scan (~24k rows today, growing without bound); a range
+ * predicate only reads that day's few hundred buckets.
  *
  * Args:
  *   now: Instant whose UTC date is "today".
@@ -774,9 +775,28 @@ function utcDayWindow(now, daysAgo) {
   return { start, end: start + 86400 };
 }
 
+// 昨天（刚闭合的完整 UTC 日）+ 前天（给迟到桶 24h 窗口）。不卷当天。
+const DAILY_ROLLUP_DAYS_AGO = [1, 2];
+
+/**
+ * Daily rollup is gated to the 00:07 UTC cron tick.
+ *
+ * The Worker cron stays hourly for idle-tunnel cleanup / DNS repair.
+ * usage_daily only needs one write after the UTC day closes; the in-progress
+ * day is read from usage_rollup.
+ *
+ * Args:
+ *   now: Instant of this cron invocation (typically `event.scheduledTime`).
+ *
+ * Returns:
+ *   true iff this tick should run the usage_daily upsert.
+ */
+function shouldRollupDaily(now = new Date()) {
+  return now.getUTCHours() === 0;
+}
+
 async function rollupToDaily(env, now = new Date()) {
-  // 覆盖当天与前一天：cron 在 UTC 边界附近触发时，前一天可能还有迟到的桶进来。
-  const statements = [0, 1].map((daysAgo) => {
+  const statements = DAILY_ROLLUP_DAYS_AGO.map((daysAgo) => {
     const { start, end } = utcDayWindow(now, daysAgo);
     return env.TELEMETRY_DB.prepare(DAILY_ROLLUP_SQL).bind(start, end);
   });
@@ -1143,9 +1163,12 @@ export default {
     return new Response("not found", { status: 404 });
   },
 
-  // cron 触发：卷 rollup → daily + 清理闲置隧道。
+  // cron 每小时：清理闲置隧道 + 补 DNS。usage_daily 只在 UTC 0 点那一拍卷已结束的天。
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(rollupToDaily(env));
+    const now = new Date(event.scheduledTime);
+    if (shouldRollupDaily(now)) {
+      ctx.waitUntil(rollupToDaily(env, now));
+    }
     ctx.waitUntil((async () => {
       await cleanupIdleTunnels(env);
       await reconcileAllTunnelDns(env);
@@ -1158,6 +1181,8 @@ export default {
 export {
   normalizeRollupRow,
   utcDayWindow,
+  shouldRollupDaily,
+  DAILY_ROLLUP_DAYS_AGO,
   timingSafeEqual,
   cnameContent,
   dnsRecordNeedsRepair,

@@ -499,7 +499,7 @@ database_name = "kiro-telemetry"
 database_id = "<上一步输出的 id>"
 
 [triggers]
-crons = ["7 * * * *"]   # 每小时把 usage_rollup 卷成 usage_daily（错峰到第 7 分钟）
+crons = ["7 * * * *"]   # 每小时：清理闲置隧道 + 补 DNS；usage_daily 只在 UTC 0:07 卷已结束的天
 ```
 
 **3) 设置上报密钥**

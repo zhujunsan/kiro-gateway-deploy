@@ -16,8 +16,8 @@ binding = "TELEMETRY_DB"
 database_name = "kiro-telemetry"
 database_id = "<wrangler d1 create 输出的 id>"
 
-# Cron Trigger：每小时把 usage_rollup 卷成 usage_daily（错峰到第 7 分钟）；
-# 同时执行闲置隧道清理（仅当 IDLE_CLEANUP_DAYS 配置时生效）。
+# Cron Trigger：每小时第 7 分钟跑闲置隧道清理 + 补 DNS（仅当 IDLE_CLEANUP_DAYS 配置时清理）。
+# usage_daily 只在 UTC 0:07 那一拍卷已结束的自然日；当天明细仍看 usage_rollup。
 [triggers]
 crons = ["7 * * * *"]
 

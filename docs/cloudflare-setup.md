@@ -247,7 +247,7 @@ database_name = "kiro-telemetry"
 database_id = "0799e47a-3a75-47f6-8606-895b959569f2"
 
 [triggers]
-crons = ["7 * * * *"]   # 每小时把 usage_rollup 卷成 usage_daily（错峰到第 7 分钟）
+crons = ["7 * * * *"]   # 每小时：清理闲置隧道 + 补 DNS；usage_daily 只在 UTC 0:07 卷已结束的天
 ```
 
 **3) 在远端 D1 建表**
@@ -256,7 +256,7 @@ crons = ["7 * * * *"]   # 每小时把 usage_rollup 卷成 usage_daily（错峰�
 wrangler d1 execute kiro-telemetry --remote --file=./schema.sql
 ```
 
-`schema.sql` 建两张表：`usage_rollup`（客户端按 10 分钟桶上报的明细聚合）和 `usage_daily`（cron 每小时把 rollup 卷成「天 × user × model」，供看板默认查询、省读额度）。注意一定要带 `--remote`，否则只会建在本地模拟库里。
+`schema.sql` 建两张表：`usage_rollup`（客户端按 10 分钟桶上报的明细聚合）和 `usage_daily`（UTC 0:07 把已结束的自然日卷成「天 × user × model」，供看板查历史、省读额度；当天看 rollup）。注意一定要带 `--remote`，否则只会建在本地模拟库里。
 
 **4) 部署带新路由的 worker**
 
