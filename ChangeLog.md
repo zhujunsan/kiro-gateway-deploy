@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.4.38 (2026-08-26)
+
+**Changed**
+- Worker `/provision` 改为复用已有隧道（修 ingress/DNS、沿用 `run_token`），不再每次删建；同一用户并发签发由 D1 `provision_lock` 串行化，抢不到租约返回 409。重复重签不再轮换凭据，已在跑的 cloudflared 不会被踢下线。
+
+**Fixed**
+- 修复升级后短时间内「cloudflared 已连接 + DNS 解析失败」：身份迁移与「隧道已删」恢复会并发打两次 `/provision`，互相拆掉刚建的隧道和 CNAME，递归 DNS 缓存 NXDOMAIN。现改为进程内 singleflight，启动完成前健康探测不得重签；`tunnel_exists` 查当前公网 hostname 而非新设备指纹。
+- 新域名 180 秒内显示「DNS 生效中」而非立刻报故障；系统 resolver 负缓存时走 DoH IP 复测。DNS/TLS/4xx 探活按 3→10→30→60 秒退避，避免刷日志；网络切换、域名变化、DNS 修复或手动重启会立即重探。`/ensure-dns` 日志区分 API 记录与权威 DNS。
+
 ## v0.4.37 (2026-08-25)
 
 **Changed**

@@ -43,10 +43,11 @@ wrangler deploy
 
 > 网关失败请求的 debug 抓包（请求体 / 响应流等）已改走 Sentry，不再经本 Worker 的 `/telemetry/errors`。
 
-线上已有库加列：
+线上已有库加列 / 加表：
 
 ```bash
 wrangler d1 execute kiro-telemetry --remote --file=./migrations/2026-07-14-estimated-credits.sql
+wrangler d1 execute kiro-telemetry --remote --file=./migrations/2026-08-26-provision-lock.sql
 ```
 
 部署时请在 `wrangler.toml` 打开 `[observability]`（见 `wrangler.toml.sample`）：`enabled=true`、`head_sampling_rate=1`、`invocation_logs=false`。
@@ -155,7 +156,7 @@ cd worker && node --test    # 无依赖，纯 node:test
 
 ## 注意事项
 
-- run_token 只在 201 响应里返回一次，Worker 本身不存储任何状态（Cloudflare API 是唯一数据源）
+- run_token 在每次 /provision 响应里返回；已有隧道会复用同一 token，不再无谓轮换。Worker 本身不另存隧道状态（Cloudflare API 是隧道数据源；并发签发用 D1 `provision_lock` 串行化）
 - 吊销某用户：在 Zero Trust 控制台删 tunnel + DNS 记录即可；也可配置 `IDLE_CLEANUP_DAYS` 让 cron 自动回收长期不活跃的隧道
 - CF_API_TOKEN 永远不要提交到 git，只通过 `wrangler secret put` 存入
 

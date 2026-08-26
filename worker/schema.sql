@@ -83,3 +83,13 @@ CREATE TABLE IF NOT EXISTS announcements (
 
 CREATE INDEX IF NOT EXISTS idx_announcements_enabled
   ON announcements (enabled, priority DESC);
+
+-- per-username /provision 租约锁。字段含义见
+-- migrations/2026-08-26-provision-lock.sql（两份 DDL 保持一致）。
+CREATE TABLE IF NOT EXISTS provision_lock (
+  username    TEXT    PRIMARY KEY,
+  lease_until INTEGER NOT NULL,
+  generation  INTEGER NOT NULL DEFAULT 0,
+  holder      TEXT,
+  updated_at  INTEGER NOT NULL
+);

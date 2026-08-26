@@ -562,6 +562,7 @@ def test_reprovision_if_deleted_exists_true(monkeypatch, tmp_path):
     appconfig.save(cfg)
 
     s = supervisor.Supervisor(gateway=_FakeGateway(), tunnel=_FakeTunnel())
+    s._startup_ready.set()
     import kiro_gateway_tray.provision as pmod
     monkeypatch.setattr(pmod, "tunnel_exists", lambda cfg, secret: True)
 
@@ -579,6 +580,7 @@ def test_reprovision_if_deleted_exists_none(monkeypatch, tmp_path):
     appconfig.save(cfg)
 
     s = supervisor.Supervisor(gateway=_FakeGateway(), tunnel=_FakeTunnel())
+    s._startup_ready.set()
     import kiro_gateway_tray.provision as pmod
     monkeypatch.setattr(pmod, "tunnel_exists", lambda cfg, secret: None)
 
@@ -596,6 +598,7 @@ def test_reprovision_if_deleted_exists_false(monkeypatch, tmp_path):
     appconfig.save(cfg)
 
     s = supervisor.Supervisor(gateway=_FakeGateway(), tunnel=_FakeTunnel())
+    s._startup_ready.set()
     import kiro_gateway_tray.provision as pmod
     monkeypatch.setattr(pmod, "tunnel_exists", lambda cfg, secret: False)
     monkeypatch.setattr(pmod, "run", lambda cfg, secret: ("kg-test.example.com", "eyJ_new", ""))
@@ -1187,6 +1190,8 @@ def _quiesce(s) -> None:
         s._e2e_consecutive_failures = 0
         s._e2e_recovery_attempted = False
         s._e2e_dns_repair_attempted = False
+        s._e2e_backoff_until = 0.0
+        s._e2e_backoff_step = 0
         s._tunnel_e2e_kind = None
         s._tunnel_e2e_status_code = None
         s._consecutive_ok = 0
@@ -1589,7 +1594,7 @@ class TestE2EKindReconnectPolicy:
         s._run_probe_cycle()
         assert s.tunnel.reconnect_calls == []
         assert s._e2e_recovery_attempted is False
-        assert s._e2e_consecutive_failures >= 2
+        assert s._e2e_consecutive_failures >= 1
         assert s.status()["tunnel"] == "degraded"
         assert s.status()["tunnel_detail"] == "DNS 解析失败"
         s.close()
@@ -1988,7 +1993,14 @@ class TestEnsureDnsRepair:
         _install_e2e_stub(monkeypatch, error_factory=_tls_error)
         import kiro_gateway_tray.provision as pmod
         calls = []
-        monkeypatch.setattr(pmod, "ensure_dns", lambda *a, **k: calls.append(1) or True)
+
+        def _outcome(*_a, **_k):
+            calls.append(1)
+            return pmod.EnsureDnsOutcome(
+                status=True, repaired=True, api_record=True, authoritative=False
+            )
+
+        monkeypatch.setattr(pmod, "ensure_dns_outcome", _outcome)
         # First cycle: classify as dns, repair, then probe again (still dns).
         s._run_probe_cycle()
         assert calls == [1]

@@ -31,6 +31,8 @@ _E2E_SECRET_WORD_RE = re.compile(
     r"(?i)\b(authorization|api[_-]?key|token|secret|bearer)\b"
 )
 _E2E_RECOVERABLE_KINDS = frozenset({"timeout", "connect", "unexpected"})
+_E2E_BACKOFF_KINDS = frozenset({"dns", "tls", "proxy"})
+_E2E_BACKOFF_STEPS = (3, 10, 30, 60)
 _E2E_KIND_REASONS: dict[str, str] = {
     "dns": "DNS 解析失败",
     "tls": "TLS 失败",
@@ -166,8 +168,26 @@ def _as_e2e_result(result: E2EProbeResult | bool) -> E2EProbeResult:
     )
 
 
-def _e2e_degraded_reason_text(kind: str | None, status_code: int | None) -> str:
+def _e2e_should_backoff(result: E2EProbeResult) -> bool:
+    """True when this failure should slow down rather than probe every 3s."""
+    if result.ok or result.skipped:
+        return False
+    if result.kind in _E2E_BACKOFF_KINDS:
+        return True
+    if result.kind == "http_status":
+        return result.status_code is not None and result.status_code < 500
+    return False
+
+
+def _e2e_degraded_reason_text(
+    kind: str | None,
+    status_code: int | None,
+    *,
+    dns_grace: bool = False,
+) -> str:
     """User-facing degraded reason for an e2e failure kind."""
+    if kind == "dns" and dns_grace:
+        return "DNS 生效中"
     if kind == "http_status":
         if status_code is not None:
             return f"HTTP {status_code}"
@@ -290,7 +310,7 @@ def _probe_via_public_dns(hostname: str) -> E2EProbeResult | None:
     """
     try:
         ips = _doh_lookup_a(hostname)
-    except (httpx.HTTPError, ValueError, TypeError, KeyError):
+    except (httpx.HTTPError, ValueError, TypeError, KeyError, OSError, socket.gaierror):
         return None
     if not ips:
         return E2EProbeResult(
@@ -365,6 +385,8 @@ class Supervisor:
     # anything else (connecting / degraded / stopped) means recovery is in
     # progress and the loop must keep probing on the active cadence.
     _TUNNEL_SETTLED_STATUS = "running"
+    # new public hostname: show "DNS 生效中" instead of a hard failure
+    _DNS_PROPAGATION_GRACE = 180
 
     def __init__(self, gateway=None, tunnel=None) -> None:
         self.gateway = gateway or GatewayProcess()
@@ -406,6 +428,18 @@ class Supervisor:
         self._e2e_recovery_attempted: bool = False
         # One-shot latch for public CNAME repair via Worker /ensure-dns.
         self._e2e_dns_repair_attempted: bool = False
+        # Process-wide singleflight for any /provision call. A second caller
+        # skips rather than deleting the tunnel the first caller just created.
+        self._provision_lock = threading.Lock()
+        self._provision_generation: int = 0
+        # Health-loop / probe_now must not re-provision until start() has
+        # finished identity migration, port sync, and credential refresh.
+        self._startup_ready = threading.Event()
+        self._hostname_changed_at: float = 0.0
+        self._e2e_backoff_until: float = 0.0
+        self._e2e_backoff_step: int = 0
+        # api_record / authoritative / system / propagating — last DNS phase.
+        self._dns_phase: str | None = None
         # Fired whenever gateway health or tunnel connectivity changes, so the
         # tray can redraw the menu the moment the tunnel comes up (instead of
         # waiting for the next time the user opens the menu).
@@ -540,13 +574,53 @@ class Supervisor:
                 "然后重新启动 App 完成激活。"
             )
         shared_secret = self.provision_callback(cfg)
-        self.register(cfg, shared_secret)
+        self._provision_once(cfg, shared_secret, "first_run")
 
-    def register(self, cfg: AppCfg, shared_secret: str) -> None:
+    def _provision_once(self, cfg: AppCfg, shared_secret: str, reason: str) -> bool:
+        """Run one Worker /provision under a process-wide singleflight.
+
+        Callers that lose the race skip instead of issuing a second destructive
+        recreate. Returns True iff this caller actually contacted the Worker.
+
+        Args:
+            cfg: Current app config (hostname/port/provision_url).
+            shared_secret: Activation code.
+            reason: Log tag for why provision was requested.
+
+        Returns:
+            True when this caller ran provision; False when another provision
+            was already in flight.
+        """
+        acquired = self._provision_lock.acquire(blocking=False)
+        if not acquired:
+            logger.warning(
+                "provision already in flight; skipping duplicate ({})",
+                reason,
+            )
+            return False
+        try:
+            logger.info("provisioning tunnel (reason: {})", reason)
+            self._register_unlocked(cfg, shared_secret)
+            self._provision_generation += 1
+            return True
+        finally:
+            self._provision_lock.release()
+
+    def register(self, cfg: AppCfg, shared_secret: str) -> bool:
         """Call the Worker with the shared secret, then persist tunnel creds.
 
         Shared by the CLI (via _ensure_provisioned) and the tray, which must run
-        its dialogs on the main thread before the tray loop starts."""
+        its dialogs on the main thread before the tray loop starts. Goes through
+        the same singleflight as recovery/migration so two callers cannot both
+        recreate the tunnel.
+
+        Returns:
+            True if this caller performed provision; False if skipped.
+        """
+        return self._provision_once(cfg, shared_secret, "register")
+
+    def _register_unlocked(self, cfg: AppCfg, shared_secret: str) -> None:
+        """Persist Worker /provision result. Caller must hold ``_provision_lock``."""
         self._cached_secret = shared_secret
         from . import provision
         hostname, run_token, telemetry_secret = provision.run(cfg, shared_secret)
@@ -570,6 +644,19 @@ class Supervisor:
         if telemetry_secret:
             cfg.telemetry.secret = telemetry_secret
         appconfig.save(cfg)
+        with self._state_lock:
+            self._hostname_changed_at = time.time()
+            self._e2e_backoff_until = 0.0
+            self._e2e_backoff_step = 0
+            self._last_e2e_success_ts = 0.0
+            self._dns_phase = None
+
+    def _reset_e2e_backoff(self) -> None:
+        """Clear DNS/TLS probe backoff so the next cycle hits the network."""
+        with self._state_lock:
+            self._e2e_backoff_until = 0.0
+            self._e2e_backoff_step = 0
+            self._last_e2e_success_ts = 0.0
 
     def _migrate_identity_if_needed(self, cfg: AppCfg) -> AppCfg:
         """Re-provision when the stored hostname slug no longer matches this machine.
@@ -599,7 +686,7 @@ class Supervisor:
             new_slug,
         )
         try:
-            self.register(cfg, secret)
+            self._provision_once(cfg, secret, "identity_migration")
             return self._load()
         except Exception:
             logger.exception("identity migration re-provision failed")
@@ -671,6 +758,9 @@ class Supervisor:
         Returns True if a re-provision was performed (tunnel restarted with new
         token), False otherwise (caller should do a plain restart).
         """
+        if not self._startup_ready.is_set():
+            logger.debug("re-provision skipped: startup not ready")
+            return False
         cfg = self._get_cfg()
         secret = self._cached_secret or cfg.cloudflare.shared_secret
         if not secret:
@@ -681,7 +771,9 @@ class Supervisor:
             return False
         logger.warning("cloud tunnel deleted; re-provisioning with stored activation code")
         try:
-            self.register(cfg, secret)
+            did = self._provision_once(cfg, secret, "tunnel_deleted")
+            if not did:
+                return False
             cfg = self._load()
             self.tunnel.stop()
             self.tunnel.start(cfg)
@@ -691,6 +783,7 @@ class Supervisor:
             return False
 
     def start(self) -> bool:
+        self._startup_ready.clear()
         cfg = self._load()
         self._ensure_provisioned(cfg)
         cfg = self._migrate_identity_if_needed(cfg)
@@ -704,6 +797,8 @@ class Supervisor:
             self._e2e_consecutive_failures = 0
             self._tunnel_e2e_kind = None
             self._tunnel_e2e_status_code = None
+            self._e2e_backoff_until = 0.0
+            self._e2e_backoff_step = 0
         # Orphan cleanup may have just signalled a leftover child; give the OS a
         # short window to release the port. If something else still holds it,
         # fail fast with a clear message — never auto-change the port.
@@ -722,10 +817,12 @@ class Supervisor:
         self.tunnel.start(cfg)
         with self._state_lock:
             self._tunnel_conns_expected = 0
+        self._startup_ready.set()
         self._start_health_loop()
         return healthy
 
     def stop(self) -> None:
+        self._startup_ready.clear()
         self._stop_health_loop()
         self.tunnel.stop()
         self.gateway.stop()
@@ -745,6 +842,8 @@ class Supervisor:
             self._e2e_consecutive_failures = 0
             self._e2e_recovery_attempted = False
             self._e2e_dns_repair_attempted = False
+            self._e2e_backoff_until = 0.0
+            self._e2e_backoff_step = 0
 
     def restart(self) -> bool:
         self.stop()
@@ -900,8 +999,8 @@ class Supervisor:
                         self._probe_tunnel_e2e(ignore_throttle=True)
                     )
                 with self._state_lock:
-                    self._tunnel_e2e_ok = e2e_result.ok
                     if not e2e_result.skipped:
+                        self._tunnel_e2e_ok = e2e_result.ok
                         self._tunnel_e2e_kind = e2e_result.kind
                         self._tunnel_e2e_status_code = e2e_result.status_code
                     if (
@@ -1048,7 +1147,9 @@ class Supervisor:
         """
         logger.warning("restarting cloudflared tunnel process (reason: {})", reason)
         try:
-            reprovisioned = self._reprovision_if_deleted()
+            reprovisioned = False
+            if self._startup_ready.is_set():
+                reprovisioned = self._reprovision_if_deleted()
             if not reprovisioned:
                 self.tunnel.stop()
                 cfg = self._get_cfg()
@@ -1119,6 +1220,9 @@ class Supervisor:
         with self._state_lock:
             self._e2e_recovery_attempted = False
             self._e2e_dns_repair_attempted = False
+            self._e2e_backoff_until = 0.0
+            self._e2e_backoff_step = 0
+            self._last_e2e_success_ts = 0.0
         result = self._issue_soft_reconnect(reason)
         if result != "sent":
             return
@@ -1202,19 +1306,28 @@ class Supervisor:
             self._e2e_dns_repair_attempted = True
         from . import provision
         try:
-            repaired = provision.ensure_dns(cfg, secret)
+            outcome = provision.ensure_dns_outcome(cfg, secret)
         except Exception:
             logger.debug("ensure-dns request failed", exc_info=True)
             return False
-        if repaired is False:
+        if outcome.status is False:
             logger.warning("ensure-dns: cloud tunnel missing; will re-provision")
             return False
-        if repaired is None:
+        if outcome.status is None:
             logger.debug("ensure-dns unavailable; leaving public DNS as-is")
             return False
-        logger.info("ensure-dns confirmed public CNAME for {}", cfg.cloudflare.hostname)
+        logger.info(
+            "ensure-dns hostname={} api_record={} authoritative={} repaired={}",
+            outcome.hostname or cfg.cloudflare.hostname,
+            outcome.api_record,
+            outcome.authoritative,
+            outcome.repaired,
+        )
         with self._state_lock:
             self._last_e2e_success_ts = 0.0
+            self._dns_phase = "api_record"
+        if outcome.repaired:
+            self._reset_e2e_backoff()
         return True
 
     def _probe_tunnel_ready(self) -> bool:
@@ -1255,6 +1368,8 @@ class Supervisor:
             with self._state_lock:
                 if now - self._last_e2e_success_ts < self._E2E_PROBE_INTERVAL:
                     return E2EProbeResult(ok=True, kind="ok", skipped=True)
+                if now < self._e2e_backoff_until:
+                    return E2EProbeResult(ok=True, kind="ok", skipped=True)
         proxy_url = resolve_proxy()
         result: E2EProbeResult
         try:
@@ -1279,20 +1394,34 @@ class Supervisor:
                 kind=kind,
                 detail=_sanitize_e2e_detail(str(exc)),
             )
-            if kind in ("tls", "connect", "timeout") and _all_intercept_addrs(
-                hostname
+            if kind == "dns" or (
+                kind in ("tls", "connect", "timeout")
+                and _all_intercept_addrs(hostname)
             ):
                 public = _probe_via_public_dns(hostname)
                 if public is not None:
                     result = public
+        dns_phase = None
+        if result.ok and result.kind == "ok":
+            dns_phase = "system" if _system_addrs(hostname) else "authoritative"
         with self._state_lock:
             if result.ok:
                 self._last_e2e_success_ts = time.time()
                 self._e2e_consecutive_failures = 0
                 self._e2e_recovery_attempted = False
                 self._e2e_dns_repair_attempted = False
+                self._e2e_backoff_until = 0.0
+                self._e2e_backoff_step = 0
+                if dns_phase is not None:
+                    self._dns_phase = dns_phase
             else:
                 self._e2e_consecutive_failures += 1
+                if result.kind == "dns":
+                    self._dns_phase = "propagating"
+                if _e2e_should_backoff(result):
+                    idx = min(self._e2e_backoff_step, len(_E2E_BACKOFF_STEPS) - 1)
+                    self._e2e_backoff_until = time.time() + _E2E_BACKOFF_STEPS[idx]
+                    self._e2e_backoff_step += 1
                 if result.kind == "http_status":
                     logger.debug(
                         "tunnel e2e probe failed: kind=http_status status={}",
@@ -1343,8 +1472,14 @@ class Supervisor:
             e2e_ok = self._tunnel_e2e_ok
             kind = self._tunnel_e2e_kind
             status_code = self._tunnel_e2e_status_code
+            changed_at = self._hostname_changed_at
         if e2e_ok is False:
-            return _e2e_degraded_reason_text(kind, status_code)
+            dns_grace = (
+                kind == "dns"
+                and changed_at > 0
+                and (time.time() - changed_at) < self._DNS_PROPAGATION_GRACE
+            )
+            return _e2e_degraded_reason_text(kind, status_code, dns_grace=dns_grace)
         effective_expected = expected if expected > 0 else 1
         if conns < effective_expected:
             return f"{conns}/{effective_expected} 连接"

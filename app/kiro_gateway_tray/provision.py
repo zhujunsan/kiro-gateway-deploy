@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
@@ -129,6 +130,19 @@ def username_from_hostname(hostname: str) -> str:
     return rest.split(".", 1)[0].lower()
 
 
+def _username_for_existing_tunnel(cfg: AppCfg) -> str:
+    """Slug currently published as the public hostname, not the device fingerprint.
+
+    Identity migration can make the stored hostname and the live device slug
+    diverge until re-provision finishes. Status/DNS repair must target the
+    hostname that is still in DNS, otherwise a new slug looks "deleted".
+    """
+    username = username_from_hostname(cfg.cloudflare.hostname)
+    if username:
+        return username
+    return _get_username(cfg)
+
+
 def _get_username(cfg: AppCfg) -> str:
     """Return a stable per-machine slug for tunnel naming.
 
@@ -179,6 +193,9 @@ def run(cfg: AppCfg, shared_secret: str) -> tuple[str, str, str]:
 
     if resp.status_code == 401:
         raise RuntimeError("共享密钥错误，请确认你输入的激活码正确。")
+
+    if resp.status_code == 409:
+        raise RuntimeError("隧道正在签发中，请稍后重试。")
 
     if resp.status_code not in (200, 201):
         raise RuntimeError(f"Worker 返回错误 {resp.status_code}: {resp.text[:200]}")
@@ -241,8 +258,10 @@ def tunnel_exists(cfg: AppCfg, shared_secret: str) -> bool | None:
     if not cfg.cloudflare.provision_url or not shared_secret:
         return None
     try:
-        username = _get_username(cfg)
+        username = _username_for_existing_tunnel(cfg)
     except Exception:
+        return None
+    if not username:
         return None
     url = cfg.cloudflare.provision_url.rstrip("/") + "/tunnel-status"
     try:
@@ -262,25 +281,37 @@ def tunnel_exists(cfg: AppCfg, shared_secret: str) -> bool | None:
         return None
 
 
-def ensure_dns(cfg: AppCfg, shared_secret: str) -> bool | None:
+@dataclass(frozen=True)
+class EnsureDnsOutcome:
+    """Parsed ``/ensure-dns`` result. ``status`` matches the historical bool|None."""
+
+    status: bool | None
+    repaired: bool = False
+    api_record: bool = False
+    authoritative: bool | None = None
+    hostname: str = ""
+
+
+def ensure_dns_outcome(cfg: AppCfg, shared_secret: str) -> EnsureDnsOutcome:
     """Ask the Worker to recreate the public proxied CNAME if it is missing.
 
-    Returns True when the Worker confirmed or repaired DNS, False when the
+    ``status`` is True when the Worker confirmed the API record, False when the
     tunnel is gone (caller should re-provision), or None when the outcome is
     unknown (old Worker without ``/ensure-dns``, auth failure, network error).
+
+    ``api_record`` means Cloudflare DNS API has the expected CNAME.
+    ``authoritative`` is True/False when the Worker could check public DNS,
+    or None when it could not tell.
     """
+    unknown = EnsureDnsOutcome(status=None)
     if not cfg.cloudflare.provision_url or not shared_secret:
-        return None
-    # Repair the hostname currently in config, not the device-fingerprint slug.
-    # After an identity change the two diverge until migrate re-provisions.
-    username = username_from_hostname(cfg.cloudflare.hostname)
+        return unknown
+    try:
+        username = _username_for_existing_tunnel(cfg)
+    except Exception:
+        return unknown
     if not username:
-        try:
-            username = _get_username(cfg)
-        except Exception:
-            return None
-    if not username:
-        return None
+        return unknown
     url = cfg.cloudflare.provision_url.rstrip("/") + "/ensure-dns"
     try:
         resp = httpx.post(
@@ -290,21 +321,39 @@ def ensure_dns(cfg: AppCfg, shared_secret: str) -> bool | None:
             proxy=resolve_proxy(),
         )
     except httpx.HTTPError:
-        return None
+        return unknown
     if resp.status_code == 404:
         try:
             err = resp.json().get("error")
         except Exception:
-            return None
+            return unknown
         if err == "tunnel not found":
-            return False
-        return None
+            return EnsureDnsOutcome(status=False)
+        return unknown
     if resp.status_code != 200:
-        return None
+        return unknown
     try:
-        return bool(resp.json().get("ok"))
+        data = resp.json()
+        ok = bool(data.get("ok"))
+        return EnsureDnsOutcome(
+            status=ok,
+            repaired=bool(data.get("repaired")),
+            api_record=bool(data.get("api_record", ok)),
+            authoritative=data.get("authoritative"),
+            hostname=str(data.get("hostname") or ""),
+        )
     except Exception:
-        return None
+        return unknown
+
+
+def ensure_dns(cfg: AppCfg, shared_secret: str) -> bool | None:
+    """Ask the Worker to recreate the public proxied CNAME if it is missing.
+
+    Returns True when the Worker confirmed or repaired DNS, False when the
+    tunnel is gone (caller should re-provision), or None when the outcome is
+    unknown (old Worker without ``/ensure-dns``, auth failure, network error).
+    """
+    return ensure_dns_outcome(cfg, shared_secret).status
 
 
 def update_port(cfg: AppCfg, shared_secret: str) -> int:

@@ -71,6 +71,57 @@ def test_ensure_dns_ok_true(monkeypatch):
     assert captured["json"]["username"] == "alice"
 
 
+def test_tunnel_exists_uses_hostname_slug_not_fingerprint(monkeypatch):
+    import kiro_gateway_tray.appconfig as appconfig
+
+    captured = {}
+
+    def fake_post(url, **kwargs):
+        captured["url"] = url
+        captured["json"] = kwargs.get("json")
+        return httpx.Response(
+            200,
+            json={"exists": True},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(provision.httpx, "post", fake_post)
+    cfg = appconfig.AppCfg()
+    cfg.cloudflare.provision_url = "https://w.example.com"
+    cfg.cloudflare.hostname = "kg-oldslug12ab.example.com"
+    monkeypatch.setattr(provision, "_get_username", lambda _c: "newfingerprint")
+    assert provision.tunnel_exists(cfg, "secret") is True
+    assert captured["url"].endswith("/tunnel-status")
+    assert captured["json"]["username"] == "oldslug12ab"
+
+
+def test_ensure_dns_outcome_layers_api_and_authoritative(monkeypatch):
+    import kiro_gateway_tray.appconfig as appconfig
+
+    def fake_post(url, **kwargs):
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "hostname": "kg-alice.example.com",
+                "repaired": False,
+                "api_record": True,
+                "authoritative": False,
+            },
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(provision.httpx, "post", fake_post)
+    cfg = appconfig.AppCfg()
+    cfg.cloudflare.provision_url = "https://w.example.com"
+    cfg.cloudflare.hostname = "kg-alice.example.com"
+    outcome = provision.ensure_dns_outcome(cfg, "secret")
+    assert outcome.status is True
+    assert outcome.repaired is False
+    assert outcome.api_record is True
+    assert outcome.authoritative is False
+
+
 def test_ensure_dns_tunnel_missing_is_false(monkeypatch):
     import kiro_gateway_tray.appconfig as appconfig
 

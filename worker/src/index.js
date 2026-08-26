@@ -1,12 +1,15 @@
 // worker/src/index.js
 // Cloudflare Worker: provision a per-user cloudflared tunnel + usage telemetry.
-// Provision side is stateless — no KV storage. Cloudflare API is the source of truth.
+// Tunnel source of truth is the Cloudflare API. Concurrent /provision for the
+// same username is serialized via D1 provision_lock (see migrations/).
 // Telemetry side persists to D1 (binding TELEMETRY_DB), see docs/2026-06-25-telemetry-design.md.
 //
 // POST /provision
 //   body: { shared_secret, username, port? }
 //   → 201 { hostname, run_token, telemetry_secret? }
-//   Idempotent: if tunnel already exists, deletes and recreates it.
+//   Idempotent: existing tunnel is reused (ingress/DNS repaired, run_token reused).
+//   Concurrent requests for the same username are serialized via D1 provision_lock;
+//   the waiter gets 409 { error, retry_after } and must not delete anything.
 //   telemetry_secret 仅当 TELEMETRY_SECRET 已配置时附带（首次下发）。
 //
 // POST /update-port
@@ -20,9 +23,11 @@
 //
 // POST /ensure-dns
 //   body: { shared_secret, username }
-//   → 200 { ok: true, hostname, repaired: boolean }
+//   → 200 { ok: true, hostname, repaired, api_record, authoritative }
 //   → 404 { error: "tunnel not found" }  ← 隧道已不在，客户端应走完整 re-provision
 //   幂等：CNAME 已正确则不动；缺失 / 未代理 / 指错隧道则删掉重建。
+//   api_record = Cloudflare DNS API 中记录正确；authoritative = 公网 DoH 能解析 CNAME
+//   （无法探测时为 null）。二者同时为 true 才表示公网已可解析，不只是 API 写成功。
 //
 // POST /reconcile-dns
 //   body: { shared_secret }
@@ -80,6 +85,14 @@ import {
   clientContextFromRequest,
   selectAnnouncements,
 } from "./announcements.js";
+import {
+  ProvisionConflictError,
+  StaleGenerationError,
+  createD1LockStore,
+  createMemoryLockStore,
+  lookupAuthoritativeCname,
+  provisionTunnel,
+} from "./provision.js";
 
 const CF_API = "https://api.cloudflare.com/client/v4";
 const DEFAULT_PORT = 64005;
@@ -236,34 +249,44 @@ async function setIngress(env, tunnelId, hostname, port) {
   );
 }
 
+async function getTunnelToken(env, tunnelId) {
+  const result = await cfFetch(
+    env,
+    `/accounts/${env.CF_ACCOUNT_ID}/cfd_tunnel/${tunnelId}/token`,
+  );
+  if (typeof result === "string" && result) return result;
+  if (result && typeof result.token === "string" && result.token) return result.token;
+  throw new Error("tunnel token missing");
+}
+
+function cfBindings(env) {
+  return {
+    findTunnelByName: (name) => findTunnelByName(env, name),
+    createTunnel: (name) =>
+      cfFetch(env, `/accounts/${env.CF_ACCOUNT_ID}/cfd_tunnel`, "POST", {
+        name,
+        config_src: "cloudflare",
+      }),
+    deleteTunnel: (id) => deleteTunnel(env, id),
+    deleteDnsRecord: (hostname) => deleteDnsRecord(env, hostname),
+    setIngress: (id, hostname, port) => setIngress(env, id, hostname, port),
+    ensureDnsRecord: (hostname, id) => ensureDnsRecord(env, hostname, id),
+    getTunnelToken: (id) => getTunnelToken(env, id),
+    lookupAuthoritative: (hostname) => lookupAuthoritativeCname(hostname),
+  };
+}
+
 async function provision(env, username, port) {
   const { hostname, tunnelName } = tunnelMeta(env, username);
-
-  // Clean up any existing tunnel + DNS (idempotent recreate)
-  const existing = await findTunnelByName(env, tunnelName);
-  if (existing) {
-    await deleteDnsRecord(env, hostname);
-    await deleteTunnel(env, existing.id);
-  }
-
-  // Create fresh tunnel
-  const tunnel = await cfFetch(
+  return provisionTunnel({
     env,
-    `/accounts/${env.CF_ACCOUNT_ID}/cfd_tunnel`,
-    "POST",
-    { name: tunnelName, config_src: "cloudflare" }
-  );
-
-  await setIngress(env, tunnel.id, hostname, port);
-  await ensureDnsRecord(env, hostname, tunnel.id);
-
-  const result = { hostname, run_token: tunnel.token };
-  // 首次下发遥测密钥：provision 成功时附带当前 TELEMETRY_SECRET（设计文档第八节
-  // "密钥分发与轮换"）。未配置该 secret 时省略该字段、不报错。
-  if (env.TELEMETRY_SECRET) {
-    result.telemetry_secret = env.TELEMETRY_SECRET;
-  }
-  return result;
+    username,
+    port,
+    hostname,
+    tunnelName,
+    cf: cfBindings(env),
+    locks: createD1LockStore(env.TELEMETRY_DB),
+  });
 }
 
 async function getIngressPort(env, tunnelId) {
@@ -329,7 +352,19 @@ async function handleEnsureDns(env, json, username) {
   const tunnel = await findTunnelByName(env, tunnelName);
   if (!tunnel) return json({ error: "tunnel not found" }, 404);
   const result = await ensureDnsRecord(env, hostname, tunnel.id);
-  return json({ ok: true, hostname, repaired: result.repaired });
+  let authoritative = null;
+  try {
+    authoritative = await lookupAuthoritativeCname(hostname);
+  } catch {
+    authoritative = null;
+  }
+  return json({
+    ok: true,
+    hostname,
+    repaired: result.repaired,
+    api_record: true,
+    authoritative,
+  });
 }
 
 // --- telemetry ---
@@ -1074,6 +1109,12 @@ export default {
         const result = await provision(env, username, port);
         return json(result, 201);
       } catch (err) {
+        if (err instanceof ProvisionConflictError || err.status === 409) {
+          return json(
+            { error: err.message, retry_after: err.retryAfter },
+            409,
+          );
+        }
         return json({ error: err.message }, 500);
       }
     }
@@ -1123,4 +1164,9 @@ export {
   tunnelIsServing,
   idleSinceMs,
   shouldCleanupIdleTunnel,
+  provisionTunnel,
+  createMemoryLockStore,
+  createD1LockStore,
+  ProvisionConflictError,
+  StaleGenerationError,
 };

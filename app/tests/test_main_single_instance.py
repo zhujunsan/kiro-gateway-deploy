@@ -20,6 +20,27 @@ def test_complete_instance_is_not_cleaned_up(monkeypatch):
     assert cleaned == []
 
 
+def test_lock_failure_never_starts_tray(monkeypatch):
+    """Single-instance lock is acquired before any network recovery or start."""
+    events = []
+    monkeypatch.setattr(sys, "argv", ["kiro-gateway-tray"])
+    monkeypatch.setattr(entry, "_setup_logging", lambda: None)
+    monkeypatch.setattr(entry, "_acquire_lock", lambda: False)
+    monkeypatch.setattr(entry, "_show_already_running", lambda: events.append("shown"))
+    monkeypatch.setattr(
+        entry.proc_guard, "cleanup_orphans", lambda: events.append("cleanup")
+    )
+
+    class _Boom:
+        def run(self):
+            events.append("tray")
+            raise AssertionError("tray must not start")
+
+    monkeypatch.setitem(sys.modules, "kiro_gateway_tray.tray", _Boom())
+    assert entry.main() == 1
+    assert events == ["shown"]
+
+
 def test_orphans_are_cleaned_after_lock_before_cli_start(monkeypatch):
     events = []
     monkeypatch.setattr(sys, "argv", ["kiro-gateway-tray", "--cli"])
