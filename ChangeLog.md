@@ -11,6 +11,7 @@
 
 **Changed**
 - 同步上游网关至 `main-eb0d073`，docker-compose 镜像同步 pin。
+- Worker 的 `usage_daily` 日聚合改为 UTC 日切后只卷一次，降低 D1 读量；当天明细直接看 `usage_rollup`，小时 cron 仍只做隧道清理与补 DNS。
 
 ## v0.4.38 (2026-08-26)
 
