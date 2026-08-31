@@ -164,6 +164,26 @@ _EXPECTED_UPSTREAM_CODES = frozenset({
     "INVALID_MODEL_ID",
 })
 
+# Gateway codes meaning "the user must sign in to Kiro again". Kept as literals
+# rather than imported from login_state so this filter also matches events from
+# gateway versions that predate those constants.
+_SIGNED_OUT_CODES = frozenset({
+    "usage_auth_required",
+    "account_auth_required",
+    "account_not_configured",
+})
+
+# Client-error markers that, combined with the AWS SSO OIDC token endpoint, mean
+# our refresh token was rejected. 4xx only: a 5xx or a connect failure against
+# the same host is a real outage and must still report.
+_OIDC_REJECT_MARKERS = (
+    "400 bad request",
+    "401 unauthorized",
+    "403 forbidden",
+    "invalid_grant",
+    "invalid_client",
+)
+
 # Incident sources that describe the caller's request, not the gateway. The
 # client sent something the gateway correctly rejected (malformed body, missing
 # fields), so there is nothing for us to fix and every misconfigured client
@@ -372,6 +392,72 @@ def _is_duplicate_startup_log_event(event: dict[str, Any], hint: dict[str, Any])
     return False
 
 
+def _is_signed_out_event(event: dict[str, Any], hint: dict[str, Any]) -> bool:
+    """Drop events that only mean "the user is signed out of Kiro".
+
+    Being signed out is user state, not an application fault: the tray now shows
+    an actionable menu prompt and stops polling, so a Sentry Issue adds nothing.
+    Sentry KIRO-GATEWAY-TRAY-D was 1195 events / 36 users of exactly this, and
+    one account alone reached ``consecutive=6883`` because each poll re-reported.
+
+    Matched in three ways, newest first:
+
+    1. tags/contexts carrying the gateway's stable auth codes;
+    2. ``usage_outage`` events whose text is an OIDC token 400 — the shape older
+       gateways produced before credential failures were classified apart;
+    3. bare ``invalid_grant`` text.
+
+    Keep genuine outages (DNS/TLS/timeout/proxy): those are actionable.
+    """
+    tags = _tag_map(event)
+    for key in ("incident.code", "error.code", "code", "usage_auth_reason"):
+        if tags.get(key, "") in _SIGNED_OUT_CODES:
+            return True
+    if tags.get("login_required", "").lower() == "true":
+        return True
+
+    contexts = event.get("contexts")
+    if isinstance(contexts, dict):
+        for section in contexts.values():
+            if not isinstance(section, dict):
+                continue
+            if str(section.get("code") or "") in _SIGNED_OUT_CODES:
+                return True
+            if section.get("login_required") is True:
+                return True
+
+    blob = _event_text_blob(event)
+    if any(code in blob for code in _SIGNED_OUT_CODES):
+        return True
+    if "invalid_grant" in blob:
+        return True
+
+    # Legacy shape: released gateways report a signed-out account as an
+    # "upstream unreachable" outage whose error is a 400 from the OIDC token
+    # endpoint. Those clients cannot be fixed by a gateway change, so filter the
+    # pattern rather than wait for everyone to upgrade.
+    if _looks_like_oidc_token_rejection(blob):
+        return True
+    return False
+
+
+def _looks_like_oidc_token_rejection(blob: str) -> bool:
+    """True when text describes an OIDC token endpoint rejecting our credentials.
+
+    Deliberately narrow: it must mention the token endpoint *and* a client-error
+    status, so a 500 or a connect failure against the same host still reports.
+
+    Args:
+        blob: Lowercased event text.
+
+    Returns:
+        Whether the text is a credential rejection from AWS SSO OIDC.
+    """
+    if "oidc." not in blob or "amazonaws.com/token" not in blob:
+        return False
+    return any(marker in blob for marker in _OIDC_REJECT_MARKERS)
+
+
 def _is_environment_noise_event(event: dict[str, Any], hint: dict[str, Any]) -> bool:
     """Drop desktop / local-setup failures that are not application bugs.
 
@@ -471,6 +557,8 @@ def before_send(event: dict[str, Any], hint: dict[str, Any]) -> dict[str, Any] |
     if _is_noisy_incident_event(event):
         return None
     if _is_duplicate_startup_log_event(event, hint):
+        return None
+    if _is_signed_out_event(event, hint):
         return None
     if _is_environment_noise_event(event, hint):
         return None

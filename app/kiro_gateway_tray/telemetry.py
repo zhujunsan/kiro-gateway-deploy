@@ -41,6 +41,7 @@ import httpx
 
 from .httpclient import local_client, resolve_proxy
 from .log import logger
+from .login_state import LoginGate, parse_login_required
 
 # --- constants ---------------------------------------------------------------
 
@@ -440,9 +441,25 @@ def fetch_credits_used(
     port: int,
     api_key: str,
     timeout: float = 10.0,
+    gate: LoginGate | None = None,
 ) -> CreditReading | None:
-    """Probe localhost GET /usage and return the Credit reading, or None."""
+    """Probe localhost GET /usage and return the Credit reading, or None.
+
+    Args:
+        port: Local gateway port.
+        api_key: Proxy API key for the authenticated probe.
+        timeout: Per-request timeout in seconds.
+        gate: Optional login gate. While Kiro is signed out this skips the
+            request entirely except for the gate's periodic probe — Credit
+            sampling must not keep a signed-out account under load, which is a
+            second polling path behind Sentry KIRO-GATEWAY-TRAY-D.
+
+    Returns:
+        The Credit reading, or None when unavailable.
+    """
     if not api_key or port <= 0:
+        return None
+    if gate is not None and not gate.should_poll():
         return None
     url = f"http://127.0.0.1:{int(port)}/usage"
     headers = {"Authorization": f"Bearer {api_key}"}
@@ -451,11 +468,29 @@ def fetch_credits_used(
             resp = client.get(url, headers=headers)
         if resp.status_code != 200:
             logger.debug("telemetry: /usage returned {}", resp.status_code)
+            if gate is not None:
+                _note_credit_login_state(gate, resp)
             return None
+        if gate is not None:
+            gate.note_signed_in()
         return parse_credits_used(resp.json())
     except Exception:
         logger.debug("telemetry: /usage credit sample failed", exc_info=True)
         return None
+
+
+def _note_credit_login_state(gate: LoginGate, resp: Any) -> None:
+    """Record a signed-out state from a non-200 Credit probe. Never raises."""
+    try:
+        state = parse_login_required(resp.json())
+    except Exception:
+        return
+    if state.login_required:
+        logger.warning(
+            "telemetry: Credit sampling paused, Kiro needs re-login ({})",
+            state.code,
+        )
+        gate.note_login_required(state)
 
 
 class CreditTracker:
@@ -1406,9 +1441,12 @@ def build_reporter(config: TelemetryConfig, data_dir: Path) -> Reporter:
     if config.can_sample_credits:
         port = config.gateway_port
         api_key = config.proxy_api_key
+        # This runs inside the gateway process, so it needs its own gate; the
+        # tray's gate lives in a different process.
+        credit_gate = LoginGate()
 
         def _sample() -> CreditReading | None:
-            return fetch_credits_used(port=port, api_key=api_key)
+            return fetch_credits_used(port=port, api_key=api_key, gate=credit_gate)
 
         credit_tracker = CreditTracker(
             aggregator,

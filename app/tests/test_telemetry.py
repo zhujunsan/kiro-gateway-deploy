@@ -968,6 +968,137 @@ def test_parse_credits_used_empty():
     assert telemetry.parse_credits_used({"breakdowns": []}) is None
 
 
+# --- Credit sampling must also stop while Kiro is signed out ----------------
+#
+# Credit sampling is a *second* /usage poller alongside the tray menu; gating
+# only the menu would leave a signed-out account under load (KIRO-GATEWAY-TRAY-D).
+
+class _CreditProbeResponse:
+    def __init__(self, status_code, payload):
+        self.status_code = status_code
+        self._payload = payload
+
+    def json(self):
+        if self._payload is None:
+            raise ValueError("no json")
+        return self._payload
+
+
+def _patch_credit_client(monkeypatch, response):
+    """Stub telemetry's local_client so the probe never touches the network."""
+    import contextlib
+
+    calls = {"n": 0}
+
+    class _Client:
+        def get(self, _url, **_kwargs):
+            calls["n"] += 1
+            return response
+
+    @contextlib.contextmanager
+    def _local_client(**_kwargs):
+        yield _Client()
+
+    monkeypatch.setattr(telemetry, "local_client", _local_client)
+    return calls
+
+
+def test_fetch_credits_used_latches_gate_on_login_required(monkeypatch):
+    from kiro_gateway_tray.login_state import LoginGate
+
+    calls = _patch_credit_client(monkeypatch, _CreditProbeResponse(401, {
+        "error": {"code": "usage_auth_required", "login_required": True}
+    }))
+    gate = LoginGate(recheck_interval=600.0)
+
+    assert telemetry.fetch_credits_used(port=1, api_key="k", gate=gate) is None
+    assert gate.login_required is True
+    assert calls["n"] == 1
+
+    # Subsequent samples inside the window must not issue a request at all.
+    for _ in range(5):
+        assert telemetry.fetch_credits_used(port=1, api_key="k", gate=gate) is None
+    assert calls["n"] == 1
+
+
+def test_fetch_credits_used_clears_gate_when_probe_succeeds(monkeypatch):
+    """The periodic probe is what notices the user signing back in."""
+    from kiro_gateway_tray.login_state import LoginGate, LoginState
+
+    _patch_credit_client(monkeypatch, _CreditProbeResponse(200, {
+        "breakdowns": [{"used": 10}], "nextDateReset": "2026-09-01",
+    }))
+    gate = LoginGate()
+    gate.note_login_required(
+        LoginState(login_required=True, code="usage_auth_required")
+    )
+    # Simulate the recheck window elapsing rather than sleeping 10 minutes.
+    gate.force_recheck()
+
+    reading = telemetry.fetch_credits_used(port=1, api_key="k", gate=gate)
+
+    assert reading is not None
+    assert reading.credits_used == 10.0
+    assert gate.login_required is False
+
+
+def test_fetch_credits_used_suppressed_inside_recheck_window(monkeypatch):
+    """Right after latching, no request may go out at all."""
+    from kiro_gateway_tray.login_state import LoginGate, LoginState
+
+    calls = _patch_credit_client(monkeypatch, _CreditProbeResponse(200, {
+        "breakdowns": [{"used": 10}],
+    }))
+    gate = LoginGate(recheck_interval=600.0)
+    gate.note_login_required(
+        LoginState(login_required=True, code="usage_auth_required")
+    )
+
+    assert telemetry.fetch_credits_used(port=1, api_key="k", gate=gate) is None
+    assert calls["n"] == 0
+
+
+def test_fetch_credits_used_ignores_non_auth_failures(monkeypatch):
+    """A 503 must keep sampling enabled so recovery is immediate."""
+    from kiro_gateway_tray.login_state import LoginGate
+
+    calls = _patch_credit_client(monkeypatch, _CreditProbeResponse(503, {
+        "error": {"code": "usage_upstream_unreachable"}
+    }))
+    gate = LoginGate()
+
+    assert telemetry.fetch_credits_used(port=1, api_key="k", gate=gate) is None
+    assert gate.login_required is False
+    assert telemetry.fetch_credits_used(port=1, api_key="k", gate=gate) is None
+    assert calls["n"] == 2
+
+
+def test_fetch_credits_used_tolerates_non_json_error_body(monkeypatch):
+    from kiro_gateway_tray.login_state import LoginGate
+
+    _patch_credit_client(monkeypatch, _CreditProbeResponse(500, None))
+    gate = LoginGate()
+
+    assert telemetry.fetch_credits_used(port=1, api_key="k", gate=gate) is None
+    assert gate.login_required is False
+
+
+def test_fetch_credits_used_without_gate_still_works(monkeypatch):
+    """Gate is optional so existing call sites keep working."""
+    _patch_credit_client(monkeypatch, _CreditProbeResponse(200, {
+        "breakdowns": [{"used": 7}]
+    }))
+    reading = telemetry.fetch_credits_used(port=1, api_key="k")
+    assert reading is not None and reading.credits_used == 7.0
+
+
+def test_fetch_credits_used_skips_without_credentials(monkeypatch):
+    calls = _patch_credit_client(monkeypatch, _CreditProbeResponse(200, {}))
+    assert telemetry.fetch_credits_used(port=0, api_key="k") is None
+    assert telemetry.fetch_credits_used(port=1, api_key="") is None
+    assert calls["n"] == 0
+
+
 def test_credit_tracker_a_to_b_then_checkpoint(tmp_path):
     """First model sets baseline only; switch settles A; checkpoint settles B."""
     readings = iter([

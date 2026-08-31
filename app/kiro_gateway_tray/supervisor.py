@@ -21,6 +21,7 @@ from .httpclient import local_client, resolve_proxy
 from .appconfig import AppCfg
 from .gateway import GatewayProcess
 from .cloudflared import CloudflaredProcess
+from .login_state import LoginState, parse_login_required
 
 _E2E_DETAIL_MAX_LEN = 200
 _E2E_QUERYSTRING_RE = re.compile(r"\?[^ \t\r\n]*")
@@ -540,6 +541,30 @@ class Supervisor:
             "网关未能在时限内就绪（健康检查失败）。"
             "请查看日志目录或尝试重新启动。"
         )
+
+    def login_state(self, *, timeout: float = 3.0) -> LoginState:
+        """Return the Kiro credential state the gateway reports on /health.
+
+        Newer gateways start in degraded mode instead of exiting when no account
+        can be initialized, so a signed-out user shows up here as a reachable
+        gateway with ``account.login_required``. Older gateways omit the field
+        and yield a signed-in state.
+
+        Args:
+            timeout: Per-request timeout in seconds.
+
+        Returns:
+            Parsed LoginState; a signed-in state whenever /health is unreachable
+            or its body is unexpected (never guess a login prompt from failure).
+        """
+        cfg = self._get_cfg()
+        url = f"{appconfig.gateway_origin(cfg)}/health"
+        try:
+            resp = self._client.get(url, timeout=timeout)
+            return parse_login_required(resp.json())
+        except Exception:
+            logger.debug("supervisor login-state probe failed", exc_info=True)
+            return LoginState()
 
     def _ensure_port_free_or_raise(self, cfg: AppCfg, *, timeout: float) -> None:
         """Wait briefly for the listen port; raise PortBusyError if still taken.

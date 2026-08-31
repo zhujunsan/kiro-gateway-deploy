@@ -8,6 +8,7 @@ import httpx
 
 from . import appconfig
 from .httpclient import local_client
+from .login_state import LoginState, parse_login_required
 
 # Reused connection pool for localhost gateway calls (usage + models). Avoids
 # building a fresh client/connection on every menu refresh. Released at process
@@ -18,20 +19,90 @@ _client = local_client(timeout=30.0)
 atexit.register(_client.close)
 
 
+class LoginRequiredError(RuntimeError):
+    """Kiro credentials are expired or absent; only the user can fix this.
+
+    Raised instead of a generic RuntimeError so callers can stop polling and
+    prompt for re-login rather than retrying a state that cannot recover on its
+    own (see :mod:`login_state`).
+    """
+
+    def __init__(self, state: LoginState) -> None:
+        """
+        Args:
+            state: Parsed credential state from the gateway response.
+        """
+        super().__init__(state.message or "Kiro 登录已过期，请重新登录。")
+        self.state = state
+
+
 def _authed_get(path: str, timeout: float) -> httpx.Response:
-    """GET a localhost gateway endpoint with the proxy API key. Raises on non-200,
-    including the status code and the start of the response body for diagnosis."""
+    """GET a localhost gateway endpoint with the proxy API key.
+
+    Args:
+        path: Gateway path, e.g. ``/usage``.
+        timeout: Per-request timeout in seconds.
+
+    Returns:
+        The 200 response.
+
+    Raises:
+        LoginRequiredError: Gateway reported that Kiro needs a re-login.
+        RuntimeError: Any other non-200, including status code and body prefix
+            for diagnosis.
+    """
     cfg = appconfig.load()
     url = f"{appconfig.gateway_origin(cfg)}{path}"
     headers = {"Authorization": f"Bearer {cfg.gateway.proxy_api_key}"}
     resp = _client.get(url, headers=headers, timeout=timeout)
     if resp.status_code != 200:
+        state = _login_state_from_response(resp)
+        if state.login_required:
+            raise LoginRequiredError(state)
         raise RuntimeError(f"{path} returned {resp.status_code}: {resp.text[:200]}")
     return resp
 
 
+def _login_state_from_response(resp: httpx.Response) -> LoginState:
+    """Parse credential state from a non-200 body, tolerating non-JSON."""
+    try:
+        payload = resp.json()
+    except ValueError:
+        return LoginState()
+    return parse_login_required(payload)
+
+
 def fetch(timeout: float = 30.0) -> dict:
+    """Return the gateway's parsed /usage payload.
+
+    Raises:
+        LoginRequiredError: Kiro credentials need renewing.
+        RuntimeError: Other gateway failures.
+    """
     return _authed_get("/usage", timeout).json()
+
+
+def fetch_health(timeout: float = 5.0) -> LoginState:
+    """Probe GET /health and return the credential state it reports.
+
+    /health is unauthenticated and never touches the Kiro upstream, so this is
+    the cheap way to learn whether the user is signed out — including when the
+    gateway started in degraded mode and ``/usage`` would only say "no account".
+
+    Args:
+        timeout: Per-request timeout in seconds.
+
+    Returns:
+        Parsed LoginState; a signed-in state when /health is unreachable or
+        gives an unexpected body (never guess a login prompt from a failure).
+    """
+    cfg = appconfig.load()
+    url = f"{appconfig.gateway_origin(cfg)}/health"
+    try:
+        resp = _client.get(url, timeout=timeout)
+        return parse_login_required(resp.json())
+    except (httpx.HTTPError, ValueError):
+        return LoginState()
 
 
 def format_summary(data: dict) -> str:

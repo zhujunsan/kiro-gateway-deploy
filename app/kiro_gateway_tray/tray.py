@@ -15,6 +15,7 @@ from . import (
     appconfig,
     autostart,
     dialogs,
+    login_state,
     macos_menu,
     notify as _notify_mod,
     paths,
@@ -223,15 +224,35 @@ class _UsageCache:
 
     Refreshes at most once per 60 seconds. The menu line renders instantly
     from the cached value; a background thread fetches fresh data.
+
+    When Kiro is signed out the cache stops fetching entirely: the shared
+    ``LoginGate`` lets one probe through every 10 minutes so signing in is picked
+    up automatically, and nothing else. Polling a signed-out account is what
+    generated thousands of Sentry events (KIRO-GATEWAY-TRAY-D).
     """
     _COOLDOWN = 60  # seconds between refreshes
 
-    def __init__(self, on_update: "Callable[[], None] | None" = None) -> None:
+    def __init__(
+        self,
+        on_update: "Callable[[], None] | None" = None,
+        *,
+        gate: login_state.LoginGate | None = None,
+    ) -> None:
+        self.gate = gate if gate is not None else login_state.LoginGate()
+
         # fetch returns a ready-to-render string and never raises, so the cache
         # value doubles as the menu text.
         def _fetch() -> str:
+            if not self.gate.should_poll():
+                return login_state.menu_hint(self.gate.state)
             try:
-                return usage.format_menu_line(usage.fetch())
+                line = usage.format_menu_line(usage.fetch())
+            except usage.LoginRequiredError as e:
+                # Not a fault: the user is signed out of Kiro. Record it so
+                # subsequent ticks skip the request instead of retrying forever.
+                self.gate.note_login_required(e.state)
+                logger.warning("usage fetch needs Kiro re-login: {}", e)
+                return login_state.menu_hint(e.state)
             except Exception as e:
                 # 网关 /health 通过不代表 /usage 能成功：后者要带 Kiro token
                 # 回源上游，token 失效/上游抖动/启动就绪窗口都会失败。这里把
@@ -242,10 +263,14 @@ class _UsageCache:
                 # exc_info 参数，须用 opt(exception=)）。
                 logger.opt(exception=True).warning("usage fetch failed: {}", e)
                 return "获取失败"
+            self.gate.note_signed_in()
+            return line
 
         self._cache = AsyncRefreshCache(_fetch, cooldown=self._COOLDOWN, on_update=on_update)
 
     def display(self) -> str:
+        if self.gate.login_required:
+            return login_state.menu_hint(self.gate.state)
         if self._cache.inflight and self._cache.get() is None:
             return "获取中…"
         val = self._cache.get()
@@ -253,6 +278,11 @@ class _UsageCache:
 
     def refresh(self, icon=None) -> None:  # icon kept for call-site compatibility
         self._cache.refresh()
+
+    def recheck(self) -> None:
+        """Drop the signed-out latch and fetch immediately (manual menu action)."""
+        self.gate.force_recheck()
+        self._cache.refresh(force=True)
 
 
 
@@ -277,7 +307,12 @@ class TrayApp:
         self.sup.provision_callback = _first_run_setup
         self._icon = None
 
-        self._usage_cache = _UsageCache(on_update=self._request_redraw)
+        # One gate shared by the quota row and the /health probe, so "signed out"
+        # is a single fact rather than per-caller guesswork.
+        self._login_gate = login_state.LoginGate()
+        self._usage_cache = _UsageCache(
+            on_update=self._request_redraw, gate=self._login_gate
+        )
         self._models_cache = AsyncRefreshCache(
             usage.fetch_models, cooldown=14400, on_update=self._request_redraw,
         )
@@ -1079,8 +1114,69 @@ class TrayApp:
         gw = self.sup.status()["gateway"]
         if gw != "running":
             return f"📊 额度: ({_STATUS_ZH.get(gw, gw)})"
+        if self._login_gate.login_required:
+            # Do not call refresh(): a signed-out account must not be polled.
+            return f"🔑 {login_state.menu_hint(self._login_gate.state)}"
         self._usage_cache.refresh()
         return f"📊 额度: {self._usage_cache.display()}"
+
+    def _usage_row_enabled(self, _item) -> bool:
+        """The quota row is only clickable when it offers a re-login re-check."""
+        return self._login_gate.login_required
+
+    def _on_usage_row(self, _icon, _item):
+        """Explain the signed-out state and immediately re-check after sign-in."""
+        state = self._login_gate.state
+        if not state.login_required:
+            return
+        title, body = login_state.login_alert_text(state)
+        try:
+            dialogs.alert(title, body)
+        except Exception:
+            logger.debug("login alert failed", exc_info=True)
+        self._recheck_login()
+
+    def _recheck_login(self) -> None:
+        """Re-probe credential state now, bypassing the signed-out backoff."""
+        self._login_gate.force_recheck()
+        self._usage_cache.recheck()
+        self._request_redraw()
+
+    def _poll_login_state(self) -> None:
+        """Refresh credential state from /health, which never calls upstream.
+
+        /health reports the gateway's own account state, including the degraded
+        start where no account initialized at all. Using it means a signed-out
+        user is detected without a single Kiro request.
+        """
+        if self.sup.status()["gateway"] != "running":
+            return
+        was_required = self._login_gate.login_required
+        try:
+            state = usage.fetch_health()
+        except Exception:
+            logger.debug("health login probe failed", exc_info=True)
+            return
+
+        if state.login_required:
+            self._login_gate.note_login_required(state)
+        elif was_required:
+            # Credentials recovered (user signed in): resume normal polling.
+            self._login_gate.note_signed_in()
+
+        if self._login_gate.login_required != was_required:
+            self._notify_login_change(self._login_gate.state, was_required)
+            self._request_redraw()
+
+    def _notify_login_change(
+        self, state: login_state.LoginState, was_required: bool
+    ) -> None:
+        """Notify once on each signed-out ⇄ signed-in transition."""
+        if state.login_required:
+            title, body = login_state.login_alert_text(state)
+            self._notify(title, body)
+        elif was_required:
+            self._notify(APP_NAME, "Kiro 登录已恢复，额度信息将继续更新。")
 
     def _activity_snapshot(self) -> ActivitySnapshot:
         snap = self._activity_cache.get()
@@ -1460,6 +1556,12 @@ class TrayApp:
                 if self.sup.status()["gateway"] != "running":
                     continue
                 try:
+                    # Cheap, upstream-free credential check first: while signed
+                    # out this is the only request we make, and it is what
+                    # notices the user signing back in.
+                    self._poll_login_state()
+                    if self._login_gate.login_required:
+                        continue
                     self._usage_cache.refresh()
                 except Exception:
                     logger.debug("usage refresh tick failed", exc_info=True)
@@ -1524,7 +1626,11 @@ class TrayApp:
             pystray.MenuItem(self._gateway_line, None, enabled=False),
             pystray.MenuItem(self._tunnel_line, None, enabled=False),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem(self._usage_line, None, enabled=False),
+            pystray.MenuItem(
+                self._usage_line,
+                self._on_usage_row,
+                enabled=self._usage_row_enabled,
+            ),
             pystray.MenuItem(
                 "🤖 模型列表",
                 pystray.Menu(self._models_submenu_items),

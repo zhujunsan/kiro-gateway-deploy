@@ -193,6 +193,117 @@ def test_before_send_keeps_failed_to_initialize_account_exception():
     }) is event
 
 
+class TestSignedOutFiltering:
+    """Being signed out of Kiro is user state, not an application fault.
+
+    Sentry KIRO-GATEWAY-TRAY-D was 1195 events / 36 users of exactly this, with
+    one account reaching ``consecutive=6883``. The tray now shows an actionable
+    menu prompt and stops polling, so these events add nothing — but genuine
+    outages (DNS / TLS / timeout / proxy) must still report.
+    """
+
+    def test_drops_usage_auth_required_message(self):
+        event = {"message": "GET /usage requires Kiro re-login (usage_auth_required)"}
+        assert ss.before_send(event, {}) is None
+
+    def test_drops_account_auth_required_tag(self):
+        event = {
+            "message": "gateway degraded",
+            "tags": {"incident.code": "account_auth_required"},
+        }
+        assert ss.before_send(event, {}) is None
+
+    def test_drops_account_not_configured_context(self):
+        event = {
+            "message": "gateway degraded",
+            "contexts": {"account": {"code": "account_not_configured"}},
+        }
+        assert ss.before_send(event, {}) is None
+
+    def test_drops_login_required_tag(self):
+        event = {"message": "x", "tags": {"login_required": "true"}}
+        assert ss.before_send(event, {}) is None
+
+    def test_drops_login_required_context_flag(self):
+        event = {"message": "x", "contexts": {"account": {"login_required": True}}}
+        assert ss.before_send(event, {}) is None
+
+    def test_drops_invalid_grant_text(self):
+        event = {"message": "token refresh failed: invalid_grant"}
+        assert ss.before_send(event, {}) is None
+
+    def test_drops_legacy_oidc_400_outage_from_old_clients(self):
+        """The exact shape released 0.4.2x/0.4.3x clients still emit.
+
+        Those builds cannot be fixed by a gateway change, so the pattern is
+        filtered rather than waiting for everyone to upgrade.
+        """
+        event = {
+            "message": (
+                "GET /usage upstream unreachable (consecutive=6883): "
+                "HTTPStatusError: Client error '400 Bad Request' for url "
+                "'https://oidc.ap-northeast-1.amazonaws.com/token'"
+            ),
+            "tags": {"usage_outage": "true", "subsystem": "usage_upstream"},
+        }
+        assert ss.before_send(event, {}) is None
+
+    @pytest.mark.parametrize(
+        "detail",
+        [
+            "ConnectError: All connection attempts failed",
+            "ConnectError: [Errno 8] nodename nor servname provided, or not known",
+            "ConnectError: [SSL: SSLV3_ALERT_HANDSHAKE_FAILURE] sslv3 alert",
+            "ReadTimeout:",
+            "ConnectTimeout:",
+        ],
+    )
+    def test_keeps_genuine_usage_outages(self, detail):
+        """Network failures are actionable and must survive the filter."""
+        event = {
+            "message": f"GET /usage upstream unreachable (consecutive=5): {detail}",
+            "tags": {"usage_outage": "true", "subsystem": "usage_upstream"},
+        }
+        assert ss.before_send(event, {}) is event
+
+    def test_keeps_oidc_5xx_outage(self):
+        """A 500 from the token endpoint is an AWS problem, not a bad login."""
+        event = {
+            "message": (
+                "GET /usage upstream unreachable (consecutive=5): HTTPStatusError: "
+                "Server error '503 Service Unavailable' for url "
+                "'https://oidc.ap-northeast-1.amazonaws.com/token'"
+            ),
+            "tags": {"usage_outage": "true"},
+        }
+        assert ss.before_send(event, {}) is event
+
+    def test_keeps_connect_failure_to_oidc_host(self):
+        """Same host, but a transport failure — still a real outage."""
+        event = {
+            "message": (
+                "GET /usage upstream unreachable (consecutive=5): ConnectError: "
+                "connection to https://oidc.ap-northeast-1.amazonaws.com/token failed"
+            ),
+        }
+        assert ss.before_send(event, {}) is event
+
+    def test_keeps_unrelated_400_without_oidc_host(self):
+        event = {"message": "Kiro returned 400 Bad Request for /v1/chat/completions"}
+        assert ss.before_send(event, {}) is event
+
+    def test_tolerates_list_shaped_tags(self):
+        event = {
+            "message": "x",
+            "tags": [["incident.code", "usage_auth_required"]],
+        }
+        assert ss.before_send(event, {}) is None
+
+    def test_tolerates_non_dict_contexts(self):
+        event = {"message": "harmless", "contexts": {"trace": "not-a-dict"}}
+        assert ss.before_send(event, {}) is event
+
+
 def test_before_send_drops_client_validation_error_incident():
     """Empty-body 422 from a misconfigured client is not a gateway bug (TRAY-1X)."""
     event = {

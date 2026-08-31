@@ -683,6 +683,76 @@ def test_stop_health_loop_is_idempotent(monkeypatch, tmp_path):
     s.close()
 
 
+class TestSupervisorLoginState:
+    """Newer gateways report a signed-out account on /health instead of exiting.
+
+    Before that, "no usable Kiro credentials" killed the process and the tray
+    could only say "gateway exited" (Sentry KIRO-GATEWAY-TRAY-W). Reading the
+    state here is what lets the UI say "open Kiro and sign in".
+    """
+
+    @staticmethod
+    def _resp(payload):
+        class _Resp:
+            status_code = 200
+
+            def json(self):
+                if payload is None:
+                    raise ValueError("no json")
+                return payload
+
+        return _Resp()
+
+    def test_reports_login_required_from_degraded_health(self, monkeypatch, tmp_path):
+        s = _make_sup(monkeypatch, tmp_path)
+        monkeypatch.setattr(s._client, "get", lambda *a, **k: self._resp({
+            "status": "degraded",
+            "account": {
+                "code": "account_auth_required",
+                "message": "expired",
+                "login_required": True,
+            },
+        }))
+
+        state = s.login_state()
+
+        assert state.login_required is True
+        assert state.code == "account_auth_required"
+
+    def test_ready_account_is_signed_in(self, monkeypatch, tmp_path):
+        s = _make_sup(monkeypatch, tmp_path)
+        monkeypatch.setattr(s._client, "get", lambda *a, **k: self._resp({
+            "status": "healthy",
+            "account": {"status": "ready", "login_required": False},
+        }))
+
+        assert s.login_state().login_required is False
+
+    def test_old_gateway_without_account_block_is_signed_in(self, monkeypatch, tmp_path):
+        s = _make_sup(monkeypatch, tmp_path)
+        monkeypatch.setattr(
+            s._client, "get", lambda *a, **k: self._resp({"status": "healthy"})
+        )
+
+        assert s.login_state().login_required is False
+
+    def test_unreachable_health_never_claims_signed_out(self, monkeypatch, tmp_path):
+        s = _make_sup(monkeypatch, tmp_path)
+        monkeypatch.setattr(
+            s._client,
+            "get",
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("refused")),
+        )
+
+        assert s.login_state().login_required is False
+
+    def test_non_json_health_never_claims_signed_out(self, monkeypatch, tmp_path):
+        s = _make_sup(monkeypatch, tmp_path)
+        monkeypatch.setattr(s._client, "get", lambda *a, **k: self._resp(None))
+
+        assert s.login_state().login_required is False
+
+
 def test_startup_sync_persists_changed_telemetry_secret(monkeypatch, tmp_path):
     monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
     cfg = appconfig.load()

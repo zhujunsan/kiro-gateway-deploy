@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.4.39 (2026-08-31)
+
+**Fixed**
+- 修复 Kiro 未登录时托盘无限轮询 `/usage` 并刷爆 Sentry：网关此前把 OIDC token 端点的 `400 invalid_grant` 当成「上游不可达」，计入连续失败并每过一个冷却窗口上报一次，单个账号已累计到 `consecutive=6883`（Sentry TRAY-D 共 1195 次 / 36 人）。现在凭证失效与网络故障彻底分开：`/usage` 返回 `401 usage_auth_required`（带 `login_required`），托盘据此**停止轮询**，仅每 10 分钟探一次以便你登录后自动恢复；真实网络故障（DNS / TLS / 超时 / 代理）保留原有阈值与限流上报，并按原因拆分 fingerprint 便于分诊。
+- 菜单栏额度那行在未登录时改为可点击的「Kiro 登录已过期（点此重新检测）」，点击弹窗说明需要打开 Kiro 重新登录，确认后立即重新检测；登录恢复后弹出通知并继续更新额度。遥测的 Credit 采样是第二条 `/usage` 轮询路径，同样跟着暂停。
+- 修复没有可用 Kiro 账号时网关进程直接退出、被托盘反复拉起形成崩溃循环（Sentry TRAY-W）：改为降级启动，`/health` 保持 200 并在 `account` 中报告 `login_required` 与可操作原因，业务请求返回 401 而不是崩溃。用户在 Kiro 里重新登录后，下一次请求即可恢复，无需重启。
+- 「空 `credentials.json`」与「token 失效」不再混为一条：分别报 `account_not_configured` 与 `account_auth_required`，文案不同；因代理/网络导致的初始化失败报 `account_init_failed` 且保持 503（重试可能有用），不会误判成「你没登录」。
+- 未登录相关事件不再上报 Sentry（包含旧版本客户端仍在发的 OIDC 400「上游不可达」形态）；对 AWS SSO OIDC 端点的 5xx 与连接失败仍照常上报。
+
+**Changed**
+- 同步上游网关至 `main-eb0d073`，docker-compose 镜像同步 pin。
+
 ## v0.4.38 (2026-08-26)
 
 **Changed**

@@ -1,5 +1,136 @@
 # app/tests/test_usage.py
+import httpx
+import pytest
+
 from kiro_gateway_tray import usage
+from kiro_gateway_tray.login_state import LoginState
+
+
+class _FakeResponse:
+    """Minimal httpx.Response stand-in for the localhost gateway probes."""
+
+    def __init__(self, status_code: int, payload=None, text: str = "") -> None:
+        self.status_code = status_code
+        self._payload = payload
+        self.text = text
+
+    def json(self):
+        if self._payload is None:
+            raise ValueError("no json")
+        return self._payload
+
+
+def _patch_client(monkeypatch, response=None, *, error: Exception | None = None):
+    """Route usage module HTTP calls to a stub, recording requested paths."""
+    calls: list[str] = []
+
+    def _get(url, **_kwargs):
+        calls.append(url)
+        if error is not None:
+            raise error
+        return response
+
+    monkeypatch.setattr(usage._client, "get", _get)
+    return calls
+
+
+class TestAuthedGetLoginRequired:
+    """A signed-out gateway must raise LoginRequiredError, not a generic error.
+
+    Callers branch on the type to stop polling; a bare RuntimeError would keep
+    the once-per-minute retry loop that flooded Sentry (KIRO-GATEWAY-TRAY-D).
+    """
+
+    def test_401_with_login_required_raises_login_required_error(self, monkeypatch):
+        _patch_client(monkeypatch, _FakeResponse(401, {
+            "error": {
+                "code": "usage_auth_required",
+                "message": "Kiro credentials are expired",
+                "login_required": True,
+            }
+        }))
+
+        with pytest.raises(usage.LoginRequiredError) as excinfo:
+            usage.fetch()
+
+        assert excinfo.value.state.code == "usage_auth_required"
+        assert excinfo.value.state.login_required is True
+
+    def test_account_not_configured_also_raises_login_required(self, monkeypatch):
+        _patch_client(monkeypatch, _FakeResponse(401, {
+            "error": {"code": "account_not_configured", "message": "none"}
+        }))
+
+        with pytest.raises(usage.LoginRequiredError) as excinfo:
+            usage.fetch()
+
+        assert excinfo.value.state.not_configured is True
+
+    def test_503_upstream_unreachable_stays_a_plain_runtime_error(self, monkeypatch):
+        """Real outages must keep retrying, so they must not be LoginRequiredError."""
+        _patch_client(monkeypatch, _FakeResponse(
+            503,
+            {"error": {"code": "usage_upstream_unreachable"}},
+            text="unreachable",
+        ))
+
+        with pytest.raises(RuntimeError) as excinfo:
+            usage.fetch()
+
+        assert not isinstance(excinfo.value, usage.LoginRequiredError)
+
+    def test_non_json_error_body_does_not_become_login_required(self, monkeypatch):
+        _patch_client(monkeypatch, _FakeResponse(500, None, text="<html>oops"))
+
+        with pytest.raises(RuntimeError) as excinfo:
+            usage.fetch()
+
+        assert not isinstance(excinfo.value, usage.LoginRequiredError)
+        assert "500" in str(excinfo.value)
+
+    def test_success_returns_payload(self, monkeypatch):
+        _patch_client(monkeypatch, _FakeResponse(200, {"breakdowns": []}))
+        assert usage.fetch() == {"breakdowns": []}
+
+
+class TestFetchHealth:
+    """/health is the cheap, upstream-free way to learn credential state."""
+
+    def test_reports_login_required_from_account_block(self, monkeypatch):
+        calls = _patch_client(monkeypatch, _FakeResponse(200, {
+            "status": "degraded",
+            "account": {
+                "code": "account_auth_required",
+                "message": "sign in again",
+                "login_required": True,
+            },
+        }))
+
+        state = usage.fetch_health()
+
+        assert state.login_required is True
+        assert state.code == "account_auth_required"
+        assert calls and calls[0].endswith("/health")
+
+    def test_ready_account_is_signed_in(self, monkeypatch):
+        _patch_client(monkeypatch, _FakeResponse(200, {
+            "status": "healthy",
+            "account": {"status": "ready", "login_required": False},
+        }))
+        assert usage.fetch_health() == LoginState()
+
+    def test_old_gateway_without_account_block_is_signed_in(self, monkeypatch):
+        """Must stay compatible with gateways that predate the account field."""
+        _patch_client(monkeypatch, _FakeResponse(200, {"status": "healthy"}))
+        assert usage.fetch_health().login_required is False
+
+    def test_unreachable_gateway_never_claims_signed_out(self, monkeypatch):
+        _patch_client(monkeypatch, None, error=httpx.ConnectError("refused"))
+        assert usage.fetch_health().login_required is False
+
+    def test_non_json_health_body_never_claims_signed_out(self, monkeypatch):
+        _patch_client(monkeypatch, _FakeResponse(200, None, text="nope"))
+        assert usage.fetch_health().login_required is False
 
 
 def test_format_summary_with_overage():
