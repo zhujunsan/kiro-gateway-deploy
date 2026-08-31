@@ -1556,11 +1556,13 @@ class TrayApp:
                 if self.sup.status()["gateway"] != "running":
                     continue
                 try:
-                    # Cheap, upstream-free credential check first: while signed
-                    # out this is the only request we make, and it is what
-                    # notices the user signing back in.
-                    self._poll_login_state()
                     if self._login_gate.login_required:
+                        # Signed out: skip the quota poll entirely. The cheap,
+                        # upstream-free /health probe is the only request we
+                        # make, and it is what notices the user signing in.
+                        # Keeping this off the signed-in path means normal
+                        # operation pays no extra request or latency.
+                        self._poll_login_state()
                         continue
                     self._usage_cache.refresh()
                 except Exception:

@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.4.39 (2026-08-31)
+## v0.4.40 (2026-08-31)
 
 **Fixed**
 - 修复 Kiro 未登录时托盘无限轮询 `/usage` 并刷爆 Sentry：网关此前把 OIDC token 端点的 `400 invalid_grant` 当成「上游不可达」，计入连续失败并每过一个冷却窗口上报一次，单个账号已累计到 `consecutive=6883`（Sentry TRAY-D 共 1195 次 / 36 人）。现在凭证失效与网络故障彻底分开：`/usage` 返回 `401 usage_auth_required`（带 `login_required`），托盘据此**停止轮询**，仅每 10 分钟探一次以便你登录后自动恢复；真实网络故障（DNS / TLS / 超时 / 代理）保留原有阈值与限流上报，并按原因拆分 fingerprint 便于分诊。
@@ -12,6 +12,7 @@
 **Changed**
 - 同步上游网关至 `main-eb0d073`，docker-compose 镜像同步 pin。
 - Worker 的 `usage_daily` 日聚合改为 UTC 日切后只卷一次，降低 D1 读量；当天明细直接看 `usage_rollup`，小时 cron 仍只做隧道清理与补 DNS。
+- 已登录状态下的额度刷新不再额外探测 `/health`：该探测只在未登录时进行，正常使用不增加请求数与延迟（v0.4.39 因此在 Windows CI 上超时，未产出安装包）。
 
 ## v0.4.38 (2026-08-26)
 

@@ -80,6 +80,8 @@ def test_refresh_loop_stops_polling_usage_while_signed_out(monkeypatch):
 
     app = _make_app()
     monkeypatch.setattr(app.sup, "status", lambda: {"gateway": "running"})
+    # Already latched (the usage fetch does the latching; see _UsageCache tests).
+    app._login_gate.note_login_required(_signed_out_state())
     monkeypatch.setattr(usage, "fetch_health", lambda **_k: _signed_out_state())
 
     refreshed = threading.Event()
@@ -96,6 +98,33 @@ def test_refresh_loop_stops_polling_usage_while_signed_out(monkeypatch):
 
     assert not refreshed.wait(timeout=0.5), "polled /usage while signed out"
     assert app._login_gate.login_required is True
+
+
+def test_refresh_loop_does_not_probe_health_while_signed_in(monkeypatch):
+    """Normal operation must not pay an extra request or any added latency.
+
+    A blocking /health probe on the signed-in path delayed the quota refresh
+    enough to fail on slower CI runners.
+    """
+    from kiro_gateway_tray import usage
+
+    app = _make_app()
+    monkeypatch.setattr(app.sup, "status", lambda: {"gateway": "running"})
+    probed = threading.Event()
+    monkeypatch.setattr(usage, "fetch_health", lambda **_k: probed.set())
+
+    refreshed = threading.Event()
+
+    def _refresh_once():
+        refreshed.set()
+        app._usage_refresh_stop.set()
+
+    monkeypatch.setattr(app._usage_cache, "refresh", _refresh_once)
+    monkeypatch.setattr(app._usage_refresh_stop, "wait", lambda _t: False)
+    app._start_usage_refresh_loop()
+
+    assert refreshed.wait(timeout=2.0)
+    assert not probed.is_set(), "probed /health on the signed-in path"
 
 
 def test_refresh_loop_resumes_usage_after_signing_back_in(monkeypatch):
