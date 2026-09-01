@@ -28,6 +28,13 @@ HA_CONNECTIONS_MAX = 4
 # upstream help text), so N connections need N separate commands.
 _RECONNECT_COMMAND = "reconnect\n"
 
+# Hidden `--stdin-control` (and `STDIN_CONTROL`) lets us recycle edge
+# connections without killing the process. cloudflared 2026.8.3 removed it
+# (TUN-10820, "test-only") with no replacement; passing the flag makes the
+# child exit at once. We pin 2026.8.2, which still has the control channel.
+# If this is flipped off, every reconnect caller falls back to a process restart.
+STDIN_CONTROL_SUPPORTED = True
+
 
 def _current_target() -> str:
     sysname = platform.system().lower()
@@ -127,15 +134,16 @@ class CloudflaredProcess:
     port via ``--metrics`` so the probe target is stable. stdout is still
     captured verbatim to a rotating log file for debugging.
 
-    stdin is kept open as a control channel (``--stdin-control``) so a network
-    change can be answered with an immediate, backoff-free edge reconnect
-    instead of killing and respawning the process.
+    When ``STDIN_CONTROL_SUPPORTED`` is True, stdin is kept open as a control
+    channel (``--stdin-control``) so a network change can be answered with an
+    immediate, backoff-free edge reconnect instead of killing the process.
     """
 
     def __init__(self) -> None:
         self._proc: subprocess.Popen | None = None
         self._reader: threading.Thread | None = None
         self._metrics_port: int = 20241
+        self._stdin_control_enabled: bool = False
         # stdin is written from the network-watcher thread while the tray/
         # supervisor threads may be stopping the process; serialize both so
         # commands never interleave mid-line and stdin is not written after
@@ -156,18 +164,16 @@ class CloudflaredProcess:
         protocol = getattr(cfg.cloudflare, "protocol", "") or "http2"
         if protocol:
             cmd += ["--protocol", protocol]
-        # `--stdin-control` is a hidden upstream flag (absent from the public
-        # docs) but has been in cloudflared for years and is safe to rely on:
-        # if it ever disappears the process fails fast at startup, and every
-        # caller of request_reconnect() falls back to a full process restart.
-        cmd += ["--stdin-control"]
+        self._stdin_control_enabled = STDIN_CONTROL_SUPPORTED
+        if self._stdin_control_enabled:
+            cmd += ["--stdin-control"]
         cmd += ["run", "--token", run_token]
         # Force UTF-8: on Windows, text=True alone uses the system ANSI code
         # page (often GBK), which raises UnicodeDecodeError on cloudflared's
         # UTF-8 log lines and kills the reader thread (pipe backpressure risk).
         self._proc = subprocess.Popen(
             cmd,
-            stdin=subprocess.PIPE,
+            stdin=subprocess.PIPE if self._stdin_control_enabled else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -209,10 +215,14 @@ class CloudflaredProcess:
                 Clamped to ``1..HA_CONNECTIONS_MAX``.
 
         Returns:
-            True if all commands were written and flushed. False if the process
-            is gone or the pipe is unusable, in which case the caller should
-            escalate to a full process restart.
+            True if all commands were written and flushed. False if stdin
+            control is unavailable, the process is gone, or the pipe is
+            unusable, in which case the caller should escalate to a full
+            process restart.
         """
+        if not self._stdin_control_enabled:
+            logger.debug("cloudflared reconnect skipped: stdin-control not supported")
+            return False
         target = max(1, min(int(count), HA_CONNECTIONS_MAX))
         with self._stdin_lock:
             proc = self._proc

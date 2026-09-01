@@ -21,7 +21,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DEST_BASE = ROOT / "resources" / "cloudflared"
 
-CLOUDFLARED_VERSION = "2026.8.3"
+# 2026.8.3 dropped hidden `--stdin-control` (TUN-10820) with no replacement.
+# Stay on 8.2 so network-change soft reconnect still works.
+CLOUDFLARED_VERSION = "2026.8.2"
 BASE_URL = (
     "https://github.com/cloudflare/cloudflared/releases/download/"
     f"{CLOUDFLARED_VERSION}"
@@ -29,14 +31,14 @@ BASE_URL = (
 
 # sha256 of each pinned release asset (the downloaded file, before extraction).
 CLOUDFLARED_SHA256 = {
-    # Note: 2026.8.3 release-body checksums for the two darwin .tgz assets are
-    # wrong (same issue as 2026.7.x); values below are sha256 of the actual
-    # GitHub release assets.
-    "cloudflared-darwin-amd64.tgz": "61e1316266a00fd70ce40da011d612badc805367fb65293dd1925f938f704c99",
-    "cloudflared-darwin-arm64.tgz": "40c9144d86df8937c5b43293a1f7d2d2107029aa74725023dd46b1b27154352f",
-    "cloudflared-linux-amd64": "f29324fe934d1e100617484c78deef803c4dc2cd351d645bbde42e96b4fccc5e",
-    "cloudflared-linux-arm64": "4bcfd35521a7cbc545ebfd5d57334a71ee180e2a64874981f374c81472118391",
-    "cloudflared-windows-amd64.exe": "83e726ed18ea78c5ad5213c4c3a3a27051393950d2bc8ed4de69bec12d14eaae",
+    # Note: 2026.8.2 release-body checksums for the two darwin .tgz assets are
+    # wrong (same issue as 2026.7.x / 2026.8.3); values below are sha256 of
+    # the actual GitHub release assets.
+    "cloudflared-darwin-amd64.tgz": "f1727723c586500e2092368ae21871b3df7ddfd2cb097f22d81bee4a9c458bb4",
+    "cloudflared-darwin-arm64.tgz": "9042c2c5d8b2de78e60f313d5fb31b6c5c1cebde787a3caf1f2c9588084ac442",
+    "cloudflared-linux-amd64": "fcfb02b575a52ca1af2e3267af4e1517bcdeb30ac48c834c69abaed3c0576ad2",
+    "cloudflared-linux-arm64": "7747d94570fb390cf47dcb4f9555c193c6355cda9793f0d878d9049e5d6a7790",
+    "cloudflared-windows-amd64.exe": "c29eee2b121f5436a642eed69fd9767da7e7b8c510fa50aaa130337f931357b5",
 }
 
 DOWNLOAD_TIMEOUT = 60  # seconds per attempt

@@ -203,12 +203,12 @@ def _proc_with_stdin(stdin=None, exit_code=None):
 
     proc = cf.CloudflaredProcess()
     proc._proc = _ControlProc(stdin=stdin, exit_code=exit_code)
+    proc._stdin_control_enabled = True
     return proc
 
 
-def test_start_enables_stdin_control(monkeypatch):
-    # The stdin control channel must be requested at spawn time: it is the only
-    # way to trigger a backoff-free edge reconnect without killing the process.
+def _fake_popen_start(monkeypatch, stdin_control_supported=None):
+    """Start CloudflaredProcess with Popen captured; return (cmd, kwargs)."""
     import kiro_gateway_tray.cloudflared as cf
 
     monkeypatch.setattr(cf, "binary_path", lambda: Path("/fake/cloudflared"))
@@ -216,6 +216,8 @@ def test_start_enables_stdin_control(monkeypatch):
     monkeypatch.setattr(cf.proc_guard, "kill_orphan", lambda: False)
     monkeypatch.setattr(cf.proc_guard, "after_spawn", lambda _p: None)
     monkeypatch.setattr(cf.proc_guard, "record_pid", lambda _pid: None)
+    if stdin_control_supported is not None:
+        monkeypatch.setattr(cf, "STDIN_CONTROL_SUPPORTED", stdin_control_supported)
 
     captured = {}
 
@@ -229,13 +231,41 @@ def test_start_enables_stdin_control(monkeypatch):
     cfg = appconfig.AppCfg()
     cfg.cloudflare.run_token = "eyJ_test"
     cf.CloudflaredProcess().start(cfg)
+    return captured["cmd"], captured["kwargs"]
 
-    cmd = captured["cmd"]
-    assert "--stdin-control" in cmd
+
+def test_start_enables_stdin_control(monkeypatch):
+    # The stdin control channel must be requested at spawn time: it is the only
+    # way to trigger a backoff-free edge reconnect without killing the process.
     # It is a global flag: cloudflared rejects it after the `run` subcommand.
+    import kiro_gateway_tray.cloudflared as cf
+
+    cmd, kwargs = _fake_popen_start(monkeypatch)
+    assert "--stdin-control" in cmd
     assert cmd.index("--stdin-control") < cmd.index("run")
     assert cmd.index("--stdin-control") > cmd.index("tunnel")
-    assert captured["kwargs"]["stdin"] is cf.subprocess.PIPE
+    assert kwargs["stdin"] is cf.subprocess.PIPE
+
+
+def test_start_omits_stdin_control_when_disabled(monkeypatch):
+    # cloudflared 2026.8.3 dropped --stdin-control; if we pin that build the
+    # flag must not be passed or the child exits immediately.
+    import kiro_gateway_tray.cloudflared as cf
+
+    cmd, kwargs = _fake_popen_start(monkeypatch, stdin_control_supported=False)
+    assert "--stdin-control" not in cmd
+    assert "run" in cmd
+    assert kwargs["stdin"] is cf.subprocess.DEVNULL
+
+
+def test_request_reconnect_false_when_stdin_control_disabled():
+    # Without the flag the pipe is unused; claiming success would delay the
+    # supervisor's process-restart fallback.
+    stdin = _FakeStdin()
+    proc = _proc_with_stdin(stdin)
+    proc._stdin_control_enabled = False
+    assert proc.request_reconnect(4) is False
+    assert stdin.writes() == []
 
 
 def test_request_reconnect_writes_one_command_per_connection():
