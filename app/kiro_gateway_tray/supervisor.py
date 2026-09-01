@@ -842,6 +842,7 @@ class Supervisor:
         self.tunnel.start(cfg)
         with self._state_lock:
             self._tunnel_conns_expected = 0
+            self._tunnel_disconnected_since = None
         self._startup_ready.set()
         self._start_health_loop()
         return healthy
@@ -1064,10 +1065,16 @@ class Supervisor:
             # own backoff), then escalate to process restart if still zero after
             # _TUNNEL_RECONNECT_TIMEOUT. Soft reconnect is impossible when the
             # process is dead / stdin is gone — escalate right away in that case.
+            # Skip recovery until start() finishes: a probe during identity
+            # migration would arm the 5s timer and the health loop's first
+            # cycle would treat the tunnel as deleted (Windows CI flake).
             should_restart_tunnel = False
             should_soft_reconnect = False
+            startup_ready = self._startup_ready.is_set()
             with self._state_lock:
-                if tunnel_connected:
+                if not startup_ready:
+                    self._tunnel_disconnected_since = None
+                elif tunnel_connected:
                     self._tunnel_disconnected_since = None
                 elif tunnel_restarted:
                     pass  # just restarted above; nothing left to escalate

@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.4.42 (2026-09-01)
+
+**Fixed**
+- 修复 Windows CI：`start()` 尚未完成时的探活会提前点上隧道断连计时器，健康循环第一拍就会把 stub 的 `tunnel_exists=False` 当成「隧道已删」再次 `/provision`，导致 `test_health_loop_cannot_provision_until_start_finishes` 失败、安装包发不出来。未就绪时不再做隧道恢复，`start()` 结束时清掉断连时钟。
+
 ## v0.4.41 (2026-09-01)
 
 **Changed**

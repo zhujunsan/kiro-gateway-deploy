@@ -345,6 +345,10 @@ def test_health_loop_cannot_provision_until_start_finishes(monkeypatch, tmp_path
     monkeypatch.setattr(pmod, "_get_username", lambda cfg: "deviceabcdef")
     monkeypatch.setattr(pmod, "tunnel_exists", lambda *_a, **_k: False)
     monkeypatch.setattr(pmod, "run", slow_run)
+    # Avoid racing the post-start health loop: tunnel_exists is stubbed False,
+    # so a first probe after ready would look like "tunnel deleted".
+    monkeypatch.setattr(s, "_start_health_loop", lambda: True)
+    monkeypatch.setattr(s, "_probe_tunnel_conns", lambda: 0)
 
     t = threading.Thread(target=s.start, daemon=True)
     t.start()
@@ -352,6 +356,8 @@ def test_health_loop_cannot_provision_until_start_finishes(monkeypatch, tmp_path
     # start() has not set _startup_ready yet
     assert s._startup_ready.is_set() is False
     s._run_probe_cycle()
+    assert s._tunnel_disconnected_since is None
+    assert calls == ["run"]
     finish_register.set()
     t.join(timeout=2)
     assert calls == ["run"]
