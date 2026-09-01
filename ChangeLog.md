@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.4.44 (2026-09-01)
+
+**Fixed**
+- 修复 v0.4.43 隧道一启动就「已停止」：探活在第一条边缘连接建上之前就发 stdin `reconnect`，cloudflared 会把首次握手当成失败并退出（`initial tunnel connection failed error="reconnect signal"`）。现在这个子进程还没成功过一条连接时只显示「连接中」并等待；曾经连上再掉到 0 才软重连。
+
 ## v0.4.43 (2026-09-01)
 
 **Fixed**

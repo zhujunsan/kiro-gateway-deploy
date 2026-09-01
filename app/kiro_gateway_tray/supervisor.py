@@ -404,6 +404,10 @@ class Supervisor:
         self._tunnel_connected: bool = False
         # Timestamp since when the tunnel has been disconnected while running
         self._tunnel_disconnected_since: float | None = None
+        # True once this cloudflared child has reported readyConnections > 0.
+        # Stdin `reconnect` before that aborts the first HA handshake and the
+        # daemon exits (`initial tunnel connection failed error="reconnect signal"`).
+        self._tunnel_seen_ready: bool = False
         # Failure/success run-lengths feeding the health state machine. Kept on
         # the instance (not as loop-locals) so the on-demand probe_now() and the
         # background loop drive ONE shared state machine instead of two that
@@ -843,6 +847,7 @@ class Supervisor:
         with self._state_lock:
             self._tunnel_conns_expected = 0
             self._tunnel_disconnected_since = None
+            self._tunnel_seen_ready = False
         self._startup_ready.set()
         self._start_health_loop()
         return healthy
@@ -859,6 +864,7 @@ class Supervisor:
             self._consecutive_failures = 0
             self._consecutive_ok = 0
             self._tunnel_disconnected_since = None
+            self._tunnel_seen_ready = False
             self._tunnel_conns = 0
             self._tunnel_conns_expected = 0
             self._tunnel_e2e_ok = None
@@ -1012,6 +1018,7 @@ class Supervisor:
                     self._tunnel_conns_expected = max(
                         self._tunnel_conns_expected, conns
                     )
+                    self._tunnel_seen_ready = True
 
             # End-to-end probe (throttled to 60s intervals). cloudflared can
             # report healthy edge connections while the public path is broken
@@ -1061,17 +1068,18 @@ class Supervisor:
                         self._tunnel_conns = 0
                         self._tunnel_disconnected_since = None
 
-            # Zero connections: soft-reconnect immediately (skip cloudflared's
-            # own backoff), then escalate to process restart if still zero after
-            # _TUNNEL_RECONNECT_TIMEOUT. Soft reconnect is impossible when the
-            # process is dead / stdin is gone — escalate right away in that case.
-            # Skip recovery until start() finishes: a probe during identity
-            # migration would arm the 5s timer and the health loop's first
-            # cycle would treat the tunnel as deleted (Windows CI flake).
+            # Zero connections: if this child has already been ready, stdin
+            # reconnect immediately (skip cloudflared's own backoff). Before the
+            # first HA handshake, stdin reconnect aborts the daemon — only start
+            # the timeout clock and wait. Dead process / broken stdin still
+            # escalate right away. Skip recovery until start() finishes: a probe
+            # during identity migration would arm the 5s timer and the health
+            # loop's first cycle would treat the tunnel as deleted (Windows CI).
             should_restart_tunnel = False
             should_soft_reconnect = False
             startup_ready = self._startup_ready.is_set()
             with self._state_lock:
+                seen_ready = self._tunnel_seen_ready
                 if not startup_ready:
                     self._tunnel_disconnected_since = None
                 elif tunnel_connected:
@@ -1080,7 +1088,7 @@ class Supervisor:
                     pass  # just restarted above; nothing left to escalate
                 elif self._tunnel_disconnected_since is None:
                     self._tunnel_disconnected_since = time.time()
-                    should_soft_reconnect = True
+                    should_soft_reconnect = (not tunnel_alive) or seen_ready
                 elif time.time() - self._tunnel_disconnected_since > self._TUNNEL_RECONNECT_TIMEOUT:
                     should_restart_tunnel = True
                     self._tunnel_disconnected_since = None
@@ -1190,6 +1198,7 @@ class Supervisor:
             logger.exception("Failed to restart cloudflared tunnel")
         with self._state_lock:
             self._tunnel_conns_expected = 0
+            self._tunnel_seen_ready = False
             # The new process gets a clean slate: a streak inherited from the
             # old one would make the very next failure escalate prematurely.
             self._e2e_consecutive_failures = 0
@@ -1213,6 +1222,14 @@ class Supervisor:
             ``"restarted"`` if soft reconnect was impossible and a process
             restart was triggered instead.
         """
+        if self.tunnel.is_alive():
+            with self._state_lock:
+                seen_ready = self._tunnel_seen_ready
+            if not seen_ready:
+                logger.debug(
+                    "tunnel reconnect skipped: first edge connection not established"
+                )
+                return "skipped"
         now = time.time()
         with self._state_lock:
             elapsed = now - self._last_tunnel_reconnect_ts
@@ -1271,6 +1288,7 @@ class Supervisor:
                             self._tunnel_conns_expected = max(
                                 self._tunnel_conns_expected, conns
                             )
+                            self._tunnel_seen_ready = True
                     if conns > 0:
                         e2e_result = _as_e2e_result(
                             self._probe_tunnel_e2e(ignore_throttle=True)

@@ -247,8 +247,11 @@ def test_mark_starting(monkeypatch, tmp_path):
     assert s.status()["gateway"] == "starting"
 
 
-def test_run_probe_cycle_soft_reconnects_on_zero_conns(monkeypatch, tmp_path):
-    """First zero-conn probe must soft-reconnect immediately, not wait."""
+def test_run_probe_cycle_waits_for_first_edge_before_soft_reconnect(monkeypatch, tmp_path):
+    """Stdin reconnect before the first HA handshake kills cloudflared.
+
+    The first zero-conn probe must only start the timeout clock.
+    """
     s = _make_sup(monkeypatch, tmp_path)
     s.start()
     s._stop_health_loop()
@@ -258,6 +261,45 @@ def test_run_probe_cycle_soft_reconnects_on_zero_conns(monkeypatch, tmp_path):
     with s._state_lock:
         s._tunnel_disconnected_since = None
         s._last_tunnel_reconnect_ts = 0.0
+        s._tunnel_seen_ready = False
+
+    class _Resp:
+        status_code = 200
+
+        def json(self):
+            return {"readyConnections": 0}
+
+    monkeypatch.setattr(s._client, "get", lambda *a, **k: _Resp())
+    monkeypatch.setattr(s, "_probe_gateway_once", lambda: True)
+    monkeypatch.setattr(s, "_probe_tunnel_e2e", lambda **kw: True)
+    monkeypatch.setattr(s, "_reprovision_if_deleted", lambda: False)
+
+    restarted = []
+    monkeypatch.setattr(
+        s, "_restart_tunnel_process",
+        lambda reason: restarted.append(reason),
+    )
+
+    s._run_probe_cycle()
+    assert s._tunnel_disconnected_since is not None
+    assert s.tunnel.reconnect_calls == []
+    assert not restarted
+    assert s.status()["tunnel"] == "connecting"
+    s.close()
+
+
+def test_run_probe_cycle_soft_reconnects_after_ready_drops_to_zero(monkeypatch, tmp_path):
+    """Once this child has been ready, a drop to zero stdin-reconnects immediately."""
+    s = _make_sup(monkeypatch, tmp_path)
+    s.start()
+    s._stop_health_loop()
+    s.gateway.started = True
+    s.tunnel.started = True
+    s.tunnel.reconnect_calls.clear()
+    with s._state_lock:
+        s._tunnel_disconnected_since = None
+        s._last_tunnel_reconnect_ts = 0.0
+        s._tunnel_seen_ready = True
 
     class _Resp:
         status_code = 200
@@ -309,11 +351,12 @@ def test_run_probe_cycle_auto_restarts_tunnel_on_timeout(monkeypatch, tmp_path):
     # Mock _reprovision_if_deleted to return False (tunnel exists, just restart)
     monkeypatch.setattr(s, "_reprovision_if_deleted", lambda: False)
 
-    # First probe: soft reconnect + sets the disconnected timestamp
+    # First probe: sets the disconnected timestamp without stdin reconnect
+    # (this child has never been ready).
     s._run_probe_cycle()
     assert s._tunnel_disconnected_since is not None
     initial_ts = s._tunnel_disconnected_since
-    assert s.tunnel.reconnect_calls  # soft reconnect fired
+    assert s.tunnel.reconnect_calls == []
 
     # Check that it didn't process-restart yet
     restarted = []
@@ -1046,6 +1089,7 @@ class TestSoftReconnect:
         s.tunnel.started = True
         with s._state_lock:
             s._tunnel_conns_expected = 4
+            s._tunnel_seen_ready = True
 
         s.request_tunnel_reconnect("network_change")
         assert s.tunnel.reconnect_calls == [4]
@@ -1058,6 +1102,8 @@ class TestSoftReconnect:
         s = _make_sup_v2(monkeypatch, tmp_path, tunnel=tun)
         s.tunnel.started = True
         monkeypatch.setattr(s, "_reprovision_if_deleted", lambda: False)
+        with s._state_lock:
+            s._tunnel_seen_ready = True
 
         restart_calls = []
         original_restart = s._restart_tunnel_process
@@ -1075,6 +1121,7 @@ class TestSoftReconnect:
         s.tunnel.started = True
         with s._state_lock:
             s._tunnel_conns_expected = 2
+            s._tunnel_seen_ready = True
 
         s.request_tunnel_reconnect("test1")
         assert len(s.tunnel.reconnect_calls) == 1
@@ -1087,10 +1134,22 @@ class TestSoftReconnect:
         s.tunnel.started = True
         with s._state_lock:
             s._tunnel_conns_expected = 2
+            s._tunnel_seen_ready = True
             s._last_tunnel_reconnect_ts = time.time() - 20
 
         s.request_tunnel_reconnect("test")
         assert len(s.tunnel.reconnect_calls) == 1
+
+
+    def test_soft_reconnect_skipped_before_first_edge(self, monkeypatch, tmp_path):
+        s = _make_sup_v2(monkeypatch, tmp_path)
+        s.tunnel.started = True
+        with s._state_lock:
+            s._tunnel_seen_ready = False
+
+        s.request_tunnel_reconnect("network_change")
+        assert s.tunnel.reconnect_calls == []
+        assert s.tunnel.started is True
 
 
 class TestTunnelTimeoutBehavior:
@@ -1112,11 +1171,11 @@ class TestTunnelTimeoutBehavior:
         monkeypatch.setattr(s, "_probe_tunnel_e2e", lambda **kw: True)
         monkeypatch.setattr(s, "_reprovision_if_deleted", lambda: False)
 
-        # First probe: soft reconnect + sets disconnected_since
+        # First probe: sets disconnected_since; no stdin reconnect yet
         s._run_probe_cycle()
         assert s._tunnel_disconnected_since is not None
         initial_ts = s._tunnel_disconnected_since
-        assert s.tunnel.reconnect_calls
+        assert s.tunnel.reconnect_calls == []
 
         restart_calls = []
         monkeypatch.setattr(
@@ -1446,8 +1505,8 @@ class TestE2ESoftReconnect:
         s._run_probe_cycle()
         assert stub.calls == 0
         assert s._e2e_consecutive_failures == 0
-        # The zero-conn branch still soft-reconnects on the first sighting.
-        assert s.tunnel.reconnect_calls == [1]
+        # Never-ready child: wait for the first HA handshake, do not stdin-reconnect.
+        assert s.tunnel.reconnect_calls == []
         s.close()
 
     def test_cooldown_suppresses_the_e2e_reconnect(self, monkeypatch, tmp_path):
