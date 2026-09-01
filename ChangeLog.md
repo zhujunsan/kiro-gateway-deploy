@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.4.41 (2026-09-01)
+
+**Changed**
+- 同步上游网关至 `main-6eca969`，docker-compose 镜像同步 pin。网关连不上 Kiro 上游时改为返回标准 OpenAI / Anthropic 错误结构（连接失败 `502`、超时 `504`），避免 Cursor 把断网显示成 `User API Key Rate limit exceeded`。
+- 升级内嵌 cloudflared 二进制至 2026.8.3；darwin 资产的官方 release 正文 checksum 仍有误，已按实际 GitHub asset 重新计算并 pin。
+- 刷新 `uv.lock`：click 8.5.0、platformdirs 4.11.5、pydantic 2.13.5、sentry-sdk 2.68.1、websockets 17.1、regex 2026.9.3，以及 pydantic-core、pyinstaller-hooks-contrib 等小版本。
+
 ## v0.4.40 (2026-08-31)
 
 **Fixed**
