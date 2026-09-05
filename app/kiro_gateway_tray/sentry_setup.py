@@ -22,6 +22,7 @@ import errno
 import json
 import logging
 import os
+import re
 import sys
 from typing import Any, Literal
 
@@ -160,8 +161,24 @@ _ADDR_IN_USE_ERRNOS = frozenset({
 })
 
 # Client/account feedback from Kiro — not gateway bugs (see kiro_errors).
+#
+# These are upstream *reason* codes: Kiro answered correctly and told the caller
+# what to change. The gateway has nothing to fix, so they must never open an
+# Issue. Extend this set (never add an if-branch) when a new reason code turns
+# out to be normal upstream feedback.
+#
+#   INVALID_MODEL_ID                 model not enabled for this account
+#   CONTENT_LENGTH_EXCEEDS_THRESHOLD conversation exceeds model capacity; the
+#                                    user must trim context (TRAY-21, 8 events)
+#   INSUFFICIENT_MODEL_CAPACITY      upstream temporarily at capacity; retrying
+#                                    later succeeds (TRAY-1Y / TRAY-1P,
+#                                    37 + 113 events)
+#
+# Compared case-insensitively via ``_is_expected_upstream_code``.
 _EXPECTED_UPSTREAM_CODES = frozenset({
     "INVALID_MODEL_ID",
+    "CONTENT_LENGTH_EXCEEDS_THRESHOLD",
+    "INSUFFICIENT_MODEL_CAPACITY",
 })
 
 # Gateway codes meaning "the user must sign in to Kiro again". Kept as literals
@@ -197,9 +214,74 @@ _CLIENT_FAULT_CODES = frozenset({
     "validation_error",
 })
 
-# Gateway statuses that mean "the request was wrong", excluding 429 (rate limit,
-# which is account state worth tracking) and 5xx (our side).
+# Gateway statuses that mean "the request was wrong", excluding 429 (rate limit)
+# and 5xx (our side).
+#
+# 429 stays out of this set on purpose: a gateway-generated 429 reflects account
+# state worth tracking. Upstream 429s carrying ``INSUFFICIENT_MODEL_CAPACITY``
+# are dropped by ``_EXPECTED_UPSTREAM_CODES`` instead — by reason code, not by
+# status — so real rate-limit incidents without that code still report.
 _CLIENT_FAULT_STATUSES = frozenset({400, 401, 403, 404, 405, 413, 415, 422})
+
+# ``source="network"`` codes that describe the transport between the user's
+# machine and Kiro: connect/read timeouts, 502s, and peers closing the socket
+# mid-response. Nothing in the gateway can repair a broken link, and the caller
+# already received an actionable HTTP error, so these must not open an Issue.
+#
+# Sentry TRAY-23 / -24 / -16 / -17 / -1B are entirely this class on /v1/messages
+# and /v1/chat/completions.
+#
+# Deliberately enumerated instead of "drop every 5xx": ``source="gateway"``
+# failures (stream_parse_error, streaming_error, unhandled 500s) are our bugs
+# and keep reporting. ``first_token_timeout`` is also excluded — it is emitted
+# with ``source="network"`` but means the gateway's own first-token retry ladder
+# gave up, which is a gateway defect we track (TRAY-K).
+#
+# Code origins in the vendored gateway:
+#   timeout, timeout_connect, timeout_read  network_errors.ErrorCategory /
+#                                           debug_logger.classify_streaming_exception
+#   bad_gateway                             routes_* status 502 mapping
+#   incomplete_upstream_response            httpx.RemoteProtocolError
+#   connection_error / connection_refused / connection_reset /
+#   network_unreachable / dns_resolution / ssl_error / proxy_error
+#                                           network_errors.classify_network_error
+#
+# Compared case-insensitively via ``_is_transport_fault_incident``.
+_NETWORK_TRANSPORT_FAULT_CODES = frozenset({
+    "bad_gateway",
+    "connection_error",
+    "connection_refused",
+    "connection_reset",
+    "dns_resolution",
+    "incomplete_upstream_response",
+    "network_unreachable",
+    "proxy_error",
+    "ssl_error",
+    "timeout",
+    "timeout_connect",
+    "timeout_read",
+})
+
+# Incident sources whose transport-fault codes are non-actionable. Only the
+# vendored gateway's "network" source qualifies; "gateway" never does.
+_TRANSPORT_FAULT_SOURCES = frozenset({
+    "network",
+})
+
+# Gateway-owned codes that must keep reporting even though they are emitted with
+# ``source="network"``. Checked before the transport-fault set.
+_GATEWAY_OWNED_NETWORK_CODES = frozenset({
+    "first_token_timeout",
+})
+
+# Text shape of the message built by ``report_incident_snapshot``:
+#   "Gateway incident: <code> (<source>) <path> status=<n>: <error>"
+# Matched against the lowercased event blob so events from gateway builds that
+# predate incident tags/contexts get the same verdict as structured ones.
+_INCIDENT_MESSAGE_RE = re.compile(
+    r"gateway incident:\s*([a-z0-9_.\-]+)\s*\(([a-z0-9_.\-]+)\)"
+)
+_INCIDENT_STATUS_RE = re.compile(r"status=(\d{3})")
 
 
 def _exception_text(exc: BaseException) -> str:
@@ -315,23 +397,118 @@ def _is_client_fault_incident(code: str, source: str, status: int | None) -> boo
     return False
 
 
+def _is_expected_upstream_code(code: str) -> bool:
+    """True when ``code`` is a Kiro reason code that means "normal feedback".
+
+    Membership test against :data:`_EXPECTED_UPSTREAM_CODES`, uppercased because
+    older gateway builds and text-only events do not preserve the upstream
+    casing. Adding a new non-actionable reason code means editing that frozenset
+    only — no new branch here.
+
+    Args:
+        code: Incident code from tags, contexts, or a snapshot.
+
+    Returns:
+        Whether the code is expected upstream feedback with no gateway fix.
+    """
+    return code.strip().upper() in _EXPECTED_UPSTREAM_CODES
+
+
+def _is_transport_fault_incident(code: str, source: str) -> bool:
+    """True when an incident is a user-to-Kiro link failure the gateway cannot fix.
+
+    Requires both a transport source (``network``) and membership in
+    :data:`_NETWORK_TRANSPORT_FAULT_CODES`. Gateway-owned codes listed in
+    :data:`_GATEWAY_OWNED_NETWORK_CODES` are rejected first, and any
+    ``source="gateway"`` incident falls through unmatched, so genuine internal
+    errors keep opening Issues.
+
+    Dropped because Sentry TRAY-23 / -24 / -16 / -17 / -1B are pure connect/read
+    timeouts and early upstream disconnects: the caller already received an
+    actionable 502/504 and there is no gateway-side repair.
+
+    Args:
+        code: Incident code (e.g. ``"timeout_read"``).
+        source: Incident source (e.g. ``"network"``).
+
+    Returns:
+        Whether the incident is a non-actionable transport failure.
+    """
+    normalized_code = code.strip().lower()
+    if normalized_code in _GATEWAY_OWNED_NETWORK_CODES:
+        return False
+    if source.strip().lower() not in _TRANSPORT_FAULT_SOURCES:
+        return False
+    return normalized_code in _NETWORK_TRANSPORT_FAULT_CODES
+
+
+def _is_non_actionable_incident(code: str, source: str, status: int | None) -> bool:
+    """Aggregate every "do not open an Issue" rule for one incident triple.
+
+    Single decision function shared by ``_should_skip_incident_snapshot`` (the
+    primary drop) and ``_is_noisy_incident_event`` (the ``before_send`` backstop),
+    so both interception points cannot drift apart.
+
+    Args:
+        code: Incident code.
+        source: Incident source.
+        status: Gateway status code, or ``None`` when unknown.
+
+    Returns:
+        Whether the incident must be dropped before reaching Sentry.
+    """
+    if code == "client_disconnect" or source == "cancelled":
+        return True
+    if source == "expected_upstream" or _is_expected_upstream_code(code):
+        return True
+    if _is_transport_fault_incident(code, source):
+        return True
+    return _is_client_fault_incident(code, source, status)
+
+
+def _parse_incident_message(blob: str) -> tuple[str, str, int | None] | None:
+    """Recover ``(code, source, status)`` from an incident message string.
+
+    Text is the only signal available for events emitted by gateway builds that
+    predate incident tags/contexts, so the same rules must apply to the message
+    produced by ``report_incident_snapshot``:
+    ``"Gateway incident: <code> (<source>) <path> status=<n>: <error>"``.
+
+    Args:
+        blob: Lowercased event text (see :func:`_event_text_blob`).
+
+    Returns:
+        Parsed triple, or ``None`` when the text is not an incident message.
+    """
+    match = _INCIDENT_MESSAGE_RE.search(blob)
+    if match is None:
+        return None
+    status_match = _INCIDENT_STATUS_RE.search(blob, match.end())
+    status = _coerce_status(status_match.group(1)) if status_match else None
+    return match.group(1), match.group(2), status
+
+
 def _is_noisy_incident_event(event: dict[str, Any]) -> bool:
-    """True for client-caused / expected-upstream incidents that must not Issue.
+    """True for non-actionable incidents that must not create a Sentry Issue.
 
     Primary drop is in ``report_incident_snapshot``; this is defense-in-depth for
-    events that already carry incident tags / message text.
+    events that already carry incident tags / contexts / message text. All three
+    paths delegate to :func:`_is_non_actionable_incident`, so a snapshot and the
+    event it produces always receive the same verdict.
+
+    Args:
+        event: Sentry event payload.
+
+    Returns:
+        Whether the event describes a non-actionable incident.
     """
     tags = _tag_map(event)
     if tags.get("incident.client_disconnected", "").lower() == "true":
         return True
-    code = tags.get("incident.code", "")
-    source = tags.get("incident.source", "")
-    if code == "client_disconnect" or source == "cancelled":
-        return True
-    if source == "expected_upstream" or code in _EXPECTED_UPSTREAM_CODES:
-        return True
-    if _is_client_fault_incident(
-        code, source, _coerce_status(tags.get("incident.status_code"))
+    if _is_non_actionable_incident(
+        tags.get("incident.code", ""),
+        tags.get("incident.source", ""),
+        _coerce_status(tags.get("incident.status_code")),
     ):
         return True
 
@@ -341,13 +518,7 @@ def _is_noisy_incident_event(event: dict[str, Any]) -> bool:
         if isinstance(incident, dict):
             if incident.get("client_disconnected"):
                 return True
-            if str(incident.get("code") or "") == "client_disconnect":
-                return True
-            if str(incident.get("source") or "") in ("cancelled", "expected_upstream"):
-                return True
-            if str(incident.get("code") or "") in _EXPECTED_UPSTREAM_CODES:
-                return True
-            if _is_client_fault_incident(
+            if _is_non_actionable_incident(
                 str(incident.get("code") or ""),
                 str(incident.get("source") or ""),
                 _coerce_status(incident.get("status_code")),
@@ -355,11 +526,8 @@ def _is_noisy_incident_event(event: dict[str, Any]) -> bool:
                 return True
 
     blob = _event_text_blob(event)
-    if "gateway incident: client_disconnect" in blob:
-        return True
-    if "gateway incident: invalid_model_id" in blob and "expected_upstream" in blob:
-        return True
-    if "gateway incident: validation_error" in blob:
+    parsed = _parse_incident_message(blob)
+    if parsed is not None and _is_non_actionable_incident(*parsed):
         return True
     return False
 
@@ -511,27 +679,34 @@ def _is_environment_noise_event(event: dict[str, Any], hint: dict[str, Any]) -> 
 def _should_skip_incident_snapshot(snapshot: dict[str, Any]) -> bool:
     """Return True when a debug_logger snapshot must not create a Sentry Issue.
 
+    Primary interception point, evaluated inside ``report_incident_snapshot``
+    before any scope is opened. Shares :func:`_is_non_actionable_incident` with
+    the ``before_send`` backstop so both agree on every incident.
+
     Drops:
       * client disconnect / cancelled (user abort — not a bug)
-      * expected_upstream rejections (esp. INVALID_MODEL_ID)
+      * expected_upstream rejections and Kiro reason codes listed in
+        :data:`_EXPECTED_UPSTREAM_CODES` (INVALID_MODEL_ID,
+        CONTENT_LENGTH_EXCEEDS_THRESHOLD, INSUFFICIENT_MODEL_CAPACITY)
+      * ``source="network"`` transport failures between the user and Kiro
       * client-fault requests (4xx validation errors from a misconfigured caller)
 
-    Keeps actionable incidents such as first-token timeouts and truncated
-    upstream responses.
+    Keeps actionable incidents: everything with ``source="gateway"``,
+    ``first_token_timeout``, and any code outside the enumerated sets.
+
+    Args:
+        snapshot: Dict from vendor ``DebugSession.build_snapshot``.
+
+    Returns:
+        Whether the snapshot must be discarded.
     """
     if bool(snapshot.get("client_disconnected")):
         return True
-    code = str(snapshot.get("code") or "")
-    source = str(snapshot.get("source") or "")
-    if code == "client_disconnect" or source == "cancelled":
-        return True
-    if source == "expected_upstream" or code in _EXPECTED_UPSTREAM_CODES:
-        return True
-    if _is_client_fault_incident(
-        code, source, _coerce_status(snapshot.get("status_code"))
-    ):
-        return True
-    return False
+    return _is_non_actionable_incident(
+        str(snapshot.get("code") or ""),
+        str(snapshot.get("source") or ""),
+        _coerce_status(snapshot.get("status_code")),
+    )
 
 
 def before_send(event: dict[str, Any], hint: dict[str, Any]) -> dict[str, Any] | None:

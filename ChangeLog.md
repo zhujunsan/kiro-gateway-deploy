@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.4.45 (2026-09-05)
+
+**Fixed**
+- Sentry 不再为「用户到 Kiro 之间的网络故障」建 Issue：连接/读取超时、`502`、上游中途断流（`timeout` / `timeout_read` / `timeout_connect` / `bad_gateway` / `incomplete_upstream_response` / DNS / TLS / 代理等）本身网关无法修复，调用方也已经收到可操作的错误码。Sentry TRAY-23 / -24 / -16 / -17 / -1B 全属此类。网关自身的问题照旧上报，包括 `source="gateway"` 的 `streaming_error`、`stream_parse_error`，以及虽然标成 network 但代表网关首字重试用尽的 `first_token_timeout`（TRAY-K）。
+- Kiro 的正常回绝也不再建 Issue：`CONTENT_LENGTH_EXCEEDS_THRESHOLD`（对话超出模型容量，需用户自己裁剪上下文，TRAY-21）与 `INSUFFICIENT_MODEL_CAPACITY`（上游临时满载，稍后重试即可，TRAY-1Y / TRAY-1P 共 150 次）。按上游 reason code 判定而非按状态码，因此不带该 code 的真实 `429` 限流仍会上报。
+- 三条拦截路径（snapshot 主拦截、`before_send` 的 tags / contexts / 消息文本兜底）统一走同一个判定函数，不会再出现只有一条路径生效时 Issue 漏进来的情况；旧版本客户端只带消息文本的事件也能得到相同结论。
+
+**Changed**
+- 同步上游网关至 `main-83d2c30`，docker-compose 镜像同步 pin：
+  - 故障上报的 sustained 判定从「次数 **或** 时长」改为「次数 **且** 时长」。托盘约 60s 轮询一次 `/usage`，两次失败之间的墙钟已超过原先 120s 的时长阈值，次数门槛形同虚设，结果两次网络抖动就建 Issue（线上事件全是 `consecutive=2`，从未达到设计的 5）。时长阈值同时放宽到 300s，并对墙钟回拨做了钳制。
+  - 对 Kiro 的流式请求一律使用 per-request 连接，`PoolTimeout` 直接返回 `503 pool_exhausted` 不再按普通超时重试，避免本机连接池雪崩。
+  - OIDC `400 invalid_grant` 等凭证失效在 `/v1/chat/completions`、`/v1/messages`、`/v1/responses` 统一返回 `401 login_required`，与 `/usage` 语义对齐（此前是 `500`）。
+
 ## v0.4.44 (2026-09-01)
 
 **Fixed**

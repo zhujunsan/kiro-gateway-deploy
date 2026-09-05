@@ -1,11 +1,11 @@
 """Kiro Gateway tray app."""
 
-__version__ = "0.4.44"
+__version__ = "0.4.45"
 
 # Upstream gateway this app vendors. We use a fork that already has the
 # required model aliases and the /usage endpoint baked into source, so no
 # build-time patching is needed. Pinned to a commit for reproducible builds.
-UPSTREAM_SHA = "6eca969"
+UPSTREAM_SHA = "83d2c30"
 UPSTREAM_REPO = "https://github.com/zhujunsan/kiro-gateway.git"
 
 # This app's own repo, used by the update checker (Task 13) to query the
