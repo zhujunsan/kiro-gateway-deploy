@@ -61,6 +61,8 @@ def _make_sup(monkeypatch, tmp_path, provisioned=True):
     monkeypatch.setattr(s, "_wait_healthy", lambda timeout=30: True)
     # Unit tests don't occupy the real gateway port; keep the preflight green.
     monkeypatch.setattr(supervisor.gateway, "wait_port_free", lambda *a, **k: True)
+    import kiro_gateway_tray.provision as pmod
+    monkeypatch.setattr(pmod, "refresh_telemetry_secret", lambda *_a, **_k: "")
     return s
 
 
@@ -892,6 +894,8 @@ def _make_sup_v2(monkeypatch, tmp_path, provisioned=True, tunnel=None):
     monkeypatch.setattr(
         "kiro_gateway_tray.network_watch.NetworkWatcher.stop", lambda self: None
     )
+    import kiro_gateway_tray.provision as pmod
+    monkeypatch.setattr(pmod, "refresh_telemetry_secret", lambda *_a, **_k: "")
     return s
 
 

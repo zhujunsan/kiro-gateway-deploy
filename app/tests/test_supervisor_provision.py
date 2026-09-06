@@ -322,6 +322,21 @@ def test_ensure_dns_repaired_resets_backoff(monkeypatch, tmp_path):
     s.close()
 
 
+def test_close_stops_health_loop_so_later_provision_stubs_are_safe(monkeypatch, tmp_path):
+    """Regression for Windows CI: close() must kill the probe thread.
+
+    A leaked loop would otherwise call a later test's module-level
+    ``provision.run`` / ``tunnel_exists`` stubs.
+    """
+    s = _make_sup(monkeypatch, tmp_path)
+    s.start()
+    thread = s._health_thread
+    assert thread is not None and thread.is_alive()
+    s.close()
+    assert s._health_thread is None
+    assert not thread.is_alive()
+
+
 def test_health_loop_cannot_provision_until_start_finishes(monkeypatch, tmp_path):
     """probe_now during start() must not issue a second /provision."""
     s = _make_sup(monkeypatch, tmp_path)
@@ -339,7 +354,7 @@ def test_health_loop_cannot_provision_until_start_finishes(monkeypatch, tmp_path
     def slow_run(cfg, secret):
         calls.append("run")
         in_register.set()
-        finish_register.wait(timeout=2)
+        finish_register.wait(timeout=30)
         return ("kg-deviceabcdef.example.com", "eyJ_new", "")
 
     monkeypatch.setattr(pmod, "_get_username", lambda cfg: "deviceabcdef")
@@ -349,16 +364,32 @@ def test_health_loop_cannot_provision_until_start_finishes(monkeypatch, tmp_path
     # so a first probe after ready would look like "tunnel deleted".
     monkeypatch.setattr(s, "_start_health_loop", lambda: True)
     monkeypatch.setattr(s, "_probe_tunnel_conns", lambda: 0)
+    monkeypatch.setattr(s, "_sync_telemetry_secret", lambda cfg: cfg)
+    # A leaked loop from another Supervisor instance must not ride this stub.
+    orig_reprovision = supervisor.Supervisor._reprovision_if_deleted
+
+    def _reprovision_only_this(self):
+        if self is not s:
+            return False
+        return orig_reprovision(self)
+
+    monkeypatch.setattr(
+        supervisor.Supervisor, "_reprovision_if_deleted", _reprovision_only_this
+    )
 
     t = threading.Thread(target=s.start, daemon=True)
     t.start()
-    assert in_register.wait(timeout=2)
-    # start() has not set _startup_ready yet
-    assert s._startup_ready.is_set() is False
-    s._run_probe_cycle()
-    assert s._tunnel_disconnected_since is None
-    assert calls == ["run"]
-    finish_register.set()
-    t.join(timeout=2)
-    assert calls == ["run"]
-    s.close()
+    try:
+        assert in_register.wait(timeout=5)
+        # start() has not set _startup_ready yet
+        assert s._startup_ready.is_set() is False
+        s._run_probe_cycle()
+        assert s._tunnel_disconnected_since is None
+        assert calls == ["run"]
+        finish_register.set()
+        t.join(timeout=10)
+        assert calls == ["run"]
+    finally:
+        finish_register.set()
+        t.join(timeout=5)
+        s.close()

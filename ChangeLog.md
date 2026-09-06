@@ -4,6 +4,7 @@
 
 **Fixed**
 - Homebrew 安装时不再弹出 `postflight` 弃用警告：去隔离步骤改为 `postflight_steps`，装完后仍自动执行 `xattr` 清除隔离标记。
+- 修复 Windows CI：`test_health_loop_cannot_provision_until_start_finishes` 会被先前测试泄漏的健康循环误打第二次 `/provision`（该用例全局 stub 了 `tunnel_exists=False`）。每个测试结束后统一 `close()` Supervisor；启动过程不再向假 Worker 发真实 HTTP。
 
 ## v0.4.45 (2026-09-05)
 
