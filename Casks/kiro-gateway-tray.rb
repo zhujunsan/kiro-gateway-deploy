@@ -16,9 +16,8 @@ cask "kiro-gateway-tray" do
 
   app "KiroGatewayTray.app"
 
-  postflight do
-    system_command "/usr/bin/xattr",
-                   args: ["-dr", "com.apple.quarantine", "#{appdir}/KiroGatewayTray.app"],
-                   sudo: false
+  postflight_steps do
+    run "/usr/bin/xattr",
+        args: ["-dr", "com.apple.quarantine", "{{appdir}}/KiroGatewayTray.app"]
   end
 end

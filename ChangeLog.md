@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.4.46 (2026-09-06)
+
+**Fixed**
+- Homebrew 安装时不再弹出 `postflight` 弃用警告：去隔离步骤改为 `postflight_steps`，装完后仍自动执行 `xattr` 清除隔离标记。
+
 ## v0.4.45 (2026-09-05)
 
 **Fixed**
