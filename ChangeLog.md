@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.4.47 (2026-09-14)
+
+**Fixed**
+- 修复 Codex 使用 Responses Lite 时报 `Unsupported input[0] type 'additional_tools'`：新版 Codex 把工具放进 `input` 的 `additional_tools` 项，不再走顶层 `tools`，网关原先当成未知类型直接 400。现合并进现有 function/namespace 转换，hosted 工具仍按原策略剥离。
+
+**Changed**
+- 同步上游网关至 `main-ec81dd0`，docker-compose 镜像同步 pin。
+
 ## v0.4.46 (2026-09-06)
 
 **Fixed**
