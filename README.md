@@ -18,7 +18,7 @@ Cursor 支持自定义 OpenAI 兼容的 API 地址，但有几个坑：
 
 1. **需要公网地址**：Cursor 会先把请求发回自己的服务器，再转发到你指定的目标地址——所以本地部署的服务 Cursor 根本到不了。本项目用 Cloudflare Tunnel 把本机网关暴露到公网（托盘 App 自动完成隧道创建，普通用户不用碰 Cloudflare 控制台）。
 
-2. **只能走 OpenAI 兼容协议，Claude 模型需要别名**：Cursor 只允许自定义 OpenAI 地址，不能自定义 Anthropic 地址，并会特殊处理 `claude-*` 模型名。因此 Claude 使用不含 `opus`/`sonnet`/`haiku` 的 `kiro-o-*`、`kiro-s-*`、`kiro-h-*` 别名。GPT 系列直接使用 Cursor 已有的真实模型名，无需 alias，也无需手动增加 model name。`auto` 同样直接使用原生名称。上游列表缺失但可用的模型仍会按真实 ID 补入 FALLBACK。
+2. **只能走 OpenAI 兼容协议，Claude 模型需要别名**：Cursor 只允许自定义 OpenAI 地址，不能自定义 Anthropic 地址，并会特殊处理 `claude-*` 模型名。因此 Claude 使用不含 `opus`/`sonnet`/`haiku`/`fable` 的 `kiro-o-*`、`kiro-s-*`、`kiro-h-*`、`kiro-f-*` 别名。GPT 系列直接使用 Cursor 已有的真实模型名，无需 alias，也无需手动增加 model name。`auto` 同样直接使用原生名称。上游列表缺失但可用的模型仍会按真实 ID 补入 FALLBACK。
 
 3. **用量查询**：用了这个以后就不直接用 Kiro 客户端了，看不到额度消耗。所以加了一个 `GET /usage` 端点，能随时查订阅用量。
 
@@ -80,12 +80,13 @@ Cursor 支持自定义 OpenAI 兼容的 API 地址，但有几个坑：
 | `kiro-o-4.6` | `claude-opus-4.6` |
 | `kiro-s-5` | `claude-sonnet-5` |
 | `kiro-h-4.5` | `claude-haiku-4.5` |
+| `kiro-f-5.1` | `claude-fable-5.1` |
 | `kiro-deepseek-3.2` | `deepseek-3.2` |
 | `kiro-glm-5` | `glm-5` |
 | `kiro-minimax-m2.5` | `minimax-m2.5` |
 | `kiro-qwen3-coder-next` | `qwen3-coder-next` |
 
-别名由上游 `generate_model_alias` 规则自动生成（`claude-opus|sonnet|haiku-*` → `kiro-o|s|h-*`，其它 → `kiro-{id}`）。改规则见 fork（[`zhujunsan/kiro-gateway`](https://github.com/zhujunsan/kiro-gateway)）`kiro/model_aliases.py`，推送后 CI 产出新镜像 tag。
+别名由上游 `generate_model_alias` 规则自动生成（`claude-opus|sonnet|haiku|fable-*` → `kiro-o|s|h|f-*`，其它 → `kiro-{id}`）。改规则见 fork（[`zhujunsan/kiro-gateway`](https://github.com/zhujunsan/kiro-gateway)）`kiro/model_aliases.py`，推送后 CI 产出新镜像 tag。
 
 ## 查额度（`GET /usage`）
 
@@ -138,7 +139,7 @@ curl -H "Authorization: Bearer $PROXY_API_KEY" https://kg-<你的用户名>.<域
 
 本项目基于 [`ghcr.io/zhujunsan/kiro-gateway`](https://github.com/zhujunsan/kiro-gateway) —— 这是上游 [`jwadow/kiro-gateway`](https://github.com/jwadow/kiro-gateway) 的 fork。除最初针对 Cursor 后端的适配外，fork 还持续合入了以下能力与兼容性修复（当前固定到 `4905ff6`）：
 
-1. **模型与额度** — 注册 `kiro-*` / `kiro-o/s/h` 模型别名，新增 `GET /usage`；补充 Opus 4.8、Sonnet 5、GPT-5.6 Sol/Terra/Luna，移除已不可用模型，并支持按需发现模型及更明确的可用性错误。
+1. **模型与额度** — 注册 `kiro-*` / `kiro-o/s/h/f` 模型别名，新增 `GET /usage`；补充 Opus 4.8、Sonnet 5、GPT-5.6 Sol/Terra/Luna，移除已不可用模型，并支持按需发现模型及更明确的可用性错误。
 2. **请求兼容** — OpenAI 适配器可回退解析 Anthropic `tool_use`；接受 Anthropic `messages[].role=system` 和 `output_config.effort`；对话以 assistant 结尾时自动生成合法的非空 `currentMessage`。
 3. **上下文保护** — 裁剪超大 payload 时固定保留含 system prompt 的首条历史；移除 Claude Code billing attribution；将上下文溢出统一映射为客户端可识别的 `context_length_exceeded`。
 4. **工具调用可靠性** — 截断超长工具名与工具 ID、清洗 ID 中的换行符、将历史里未声明的工具调用安全降级为文本，并正确合并对象类型的 `tool_input` 分片。
