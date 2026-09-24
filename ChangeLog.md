@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.4.48 (2026-09-24)
+
+**Changed**
+- `claude-fable-5.1` 的 Cursor 别名由 `kiro-claude-fable-5.1` 改为 `kiro-f-5.1`，与 opus / sonnet / haiku 的单字母代号一致。请在 Cursor 模型列表里改用新别名。
+- 同步上游网关至 `main-d1d5891`，docker-compose 镜像同步 pin。
+
 ## v0.4.47 (2026-09-14)
 
 **Fixed**
