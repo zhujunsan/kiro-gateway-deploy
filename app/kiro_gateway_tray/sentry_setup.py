@@ -173,21 +173,40 @@ _ADDR_IN_USE_ERRNOS = frozenset({
 #   INSUFFICIENT_MODEL_CAPACITY      upstream temporarily at capacity; retrying
 #                                    later succeeds (TRAY-1Y / TRAY-1P,
 #                                    37 + 113 events)
+#   MODEL_TEMPORARILY_UNAVAILABLE    temporary upstream load (TRAY-P / TRAY-1D)
+#   MONTHLY_REQUEST_COUNT            account monthly quota exhausted (TRAY-27)
 #
 # Compared case-insensitively via ``_is_expected_upstream_code``.
 _EXPECTED_UPSTREAM_CODES = frozenset({
     "INVALID_MODEL_ID",
     "CONTENT_LENGTH_EXCEEDS_THRESHOLD",
     "INSUFFICIENT_MODEL_CAPACITY",
+    "MODEL_TEMPORARILY_UNAVAILABLE",
+    "MONTHLY_REQUEST_COUNT",
 })
 
 # Gateway codes meaning "the user must sign in to Kiro again". Kept as literals
 # rather than imported from login_state so this filter also matches events from
 # gateway versions that predate those constants.
+#
+#   usage_auth_required / account_auth_required / account_not_configured
+#       /usage and account-init failures the tray already prompts for
+#   login_required
+#       chat, messages, and responses credential failure. The gateway emits
+#       this lowercase code with source ``auth`` and HTTP 401 and already tells
+#       the user to sign in again (TRAY-29 on /v1/responses, TRAY-2A on
+#       /v1/messages). Source ``auth`` plus status 401 is not a client_fault,
+#       so the incident decision must consult this set directly.
+#
+# Incident filtering folds case via ``_is_signed_out_code`` so a lowercased
+# message and the gateway's lowercase literal agree. ``_is_signed_out_event``
+# matches these same literals exactly on tags/contexts (and as substrings of
+# the lowercased event blob).
 _SIGNED_OUT_CODES = frozenset({
     "usage_auth_required",
     "account_auth_required",
     "account_not_configured",
+    "login_required",
 })
 
 # Client-error markers that, combined with the AWS SSO OIDC token endpoint, mean
@@ -442,12 +461,34 @@ def _is_transport_fault_incident(code: str, source: str) -> bool:
     return normalized_code in _NETWORK_TRANSPORT_FAULT_CODES
 
 
+def _is_signed_out_code(code: str) -> bool:
+    """True when ``code`` means the user must sign in to Kiro again.
+
+    Membership test against :data:`_SIGNED_OUT_CODES`, lowercased because
+    :func:`_parse_incident_message` reads a lowercased event blob while the
+    gateway emits these codes as lowercase literals — the same literals
+    :func:`_is_signed_out_event` matches exactly on tags and contexts. Adding
+    a signed-out code means editing that frozenset only.
+
+    Args:
+        code: Incident code from tags, contexts, a snapshot, or a message.
+
+    Returns:
+        Whether the code is a signed-out state with no gateway fix.
+    """
+    return code.strip().lower() in _SIGNED_OUT_CODES
+
+
 def _is_non_actionable_incident(code: str, source: str, status: int | None) -> bool:
     """Aggregate every "do not open an Issue" rule for one incident triple.
 
     Single decision function shared by ``_should_skip_incident_snapshot`` (the
     primary drop) and ``_is_noisy_incident_event`` (the ``before_send`` backstop),
     so both interception points cannot drift apart.
+
+    A code in :data:`_SIGNED_OUT_CODES` (including ``login_required``) is
+    non-actionable regardless of source and status. ``source="auth"`` plus
+    HTTP 401 is not a client fault, so this check is what drops TRAY-29 / TRAY-2A.
 
     Args:
         code: Incident code.
@@ -460,6 +501,8 @@ def _is_non_actionable_incident(code: str, source: str, status: int | None) -> b
     if code == "client_disconnect" or source == "cancelled":
         return True
     if source == "expected_upstream" or _is_expected_upstream_code(code):
+        return True
+    if _is_signed_out_code(code):
         return True
     if _is_transport_fault_incident(code, source):
         return True
@@ -570,7 +613,8 @@ def _is_signed_out_event(event: dict[str, Any], hint: dict[str, Any]) -> bool:
 
     Matched in three ways, newest first:
 
-    1. tags/contexts carrying the gateway's stable auth codes;
+    1. tags/contexts carrying the gateway's stable auth codes, including
+       ``login_required`` (chat/messages/responses 401; TRAY-29 / TRAY-2A);
     2. ``usage_outage`` events whose text is an OIDC token 400 — the shape older
        gateways produced before credential failures were classified apart;
     3. bare ``invalid_grant`` text.
@@ -687,12 +731,16 @@ def _should_skip_incident_snapshot(snapshot: dict[str, Any]) -> bool:
       * client disconnect / cancelled (user abort — not a bug)
       * expected_upstream rejections and Kiro reason codes listed in
         :data:`_EXPECTED_UPSTREAM_CODES` (INVALID_MODEL_ID,
-        CONTENT_LENGTH_EXCEEDS_THRESHOLD, INSUFFICIENT_MODEL_CAPACITY)
+        CONTENT_LENGTH_EXCEEDS_THRESHOLD, INSUFFICIENT_MODEL_CAPACITY,
+        MODEL_TEMPORARILY_UNAVAILABLE, MONTHLY_REQUEST_COUNT)
+      * signed-out codes in :data:`_SIGNED_OUT_CODES`, including
+        ``login_required`` (source ``auth``, HTTP 401)
       * ``source="network"`` transport failures between the user and Kiro
       * client-fault requests (4xx validation errors from a misconfigured caller)
 
-    Keeps actionable incidents: everything with ``source="gateway"``,
-    ``first_token_timeout``, and any code outside the enumerated sets.
+    Keeps actionable incidents: ``source="gateway"`` failures
+    (``streaming_error``, ``stream_parse_error``), ``first_token_timeout``,
+    upstream 403 ``UNKNOWN`` (TRAY-1N), and any code outside the enumerated sets.
 
     Args:
         snapshot: Dict from vendor ``DebugSession.build_snapshot``.

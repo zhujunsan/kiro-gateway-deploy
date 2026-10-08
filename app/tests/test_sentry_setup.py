@@ -1414,3 +1414,237 @@ def test_telemetry_url_does_not_inject_incident_url(tmp_path, monkeypatch):
     env = appconfig.to_gateway_env(cfg)
     assert env["TELEMETRY_URL"] == "https://prov.example/telemetry"
     assert "INCIDENT_URL" not in env
+
+
+# (code, source, status, path, detail) for load/quota feedback on release 0.4.48.
+_LOAD_AND_QUOTA_CASES = [
+    (
+        "MODEL_TEMPORARILY_UNAVAILABLE",
+        "kiro_upstream",
+        500,
+        "/v1/chat/completions",
+        "Encountered unexpectedly high load when processing the request, "
+        "please try again. (reason: MODEL_TEMPORARILY_UNAVAILABLE)",
+    ),
+    (
+        "MONTHLY_REQUEST_COUNT",
+        "kiro_upstream",
+        402,
+        "/v1/messages",
+        "Monthly request limit exceeded. Account has reached its monthly quota.",
+    ),
+]
+
+
+class TestLoadAndQuotaUpstreamFiltering:
+    """Temporary upstream load and account quota are not gateway bugs.
+
+    On release 0.4.48 these were missed siblings of the 0.4.45 filter:
+      * ``MODEL_TEMPORARILY_UNAVAILABLE`` — TRAY-P (12 events) and TRAY-1D
+        (2 events). Status 500 high-load reply, same class as
+        ``INSUFFICIENT_MODEL_CAPACITY``.
+      * ``MONTHLY_REQUEST_COUNT`` — TRAY-27, 1 event. Status 402 when the
+        account has reached its monthly quota.
+    """
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            "MODEL_TEMPORARILY_UNAVAILABLE",
+            "model_temporarily_unavailable",
+            "  Model_Temporarily_Unavailable  ",
+            "MONTHLY_REQUEST_COUNT",
+            "monthly_request_count",
+            "  monthly_request_count  ",
+        ],
+    )
+    def test_codes_are_expected_upstream_feedback(self, code):
+        """Membership is case- and whitespace-insensitive, like the 0.4.45 codes."""
+        assert ss._is_expected_upstream_code(code) is True
+
+    @pytest.mark.parametrize("code,source,status,path,detail", _LOAD_AND_QUOTA_CASES)
+    def test_snapshot_and_decision_drop_kiro_upstream(
+        self, monkeypatch, code, source, status, path, detail
+    ):
+        snapshot = _snapshot(
+            code=code,
+            source=source,
+            status_code=status,
+            path=path,
+            error_message=detail,
+        )
+        assert ss._is_non_actionable_incident(code, source, status) is True
+        assert ss._should_skip_incident_snapshot(snapshot) is True
+        _assert_snapshot_dropped(monkeypatch, snapshot)
+
+    @pytest.mark.parametrize("code,source,status,path,detail", _LOAD_AND_QUOTA_CASES)
+    def test_before_send_drops_tagged_incident(self, code, source, status, path, detail):
+        event = _incident_event(code, source, status)
+        assert ss.before_send(event, {}) is None
+
+    @pytest.mark.parametrize("code,source,status,path,detail", _LOAD_AND_QUOTA_CASES)
+    def test_before_send_drops_message_only_incident(
+        self, code, source, status, path, detail
+    ):
+        """Text-only events are classified by the incident message parser."""
+        event = {
+            "message": (
+                f"Gateway incident: {code} ({source}) {path} status={status}: {detail}"
+            ),
+        }
+        assert "tags" not in event and "contexts" not in event
+        assert ss.before_send(event, {}) is None
+
+    def test_unknown_upstream_500_still_reports(self):
+        """A 500 without a listed reason code stays actionable."""
+        event = _incident_event("UNKNOWN", "kiro_upstream", 500)
+        assert ss._is_non_actionable_incident("UNKNOWN", "kiro_upstream", 500) is False
+        assert ss._should_skip_incident_snapshot(
+            _snapshot(code="UNKNOWN", source="kiro_upstream", status_code=500)
+        ) is False
+        assert ss.before_send(event, {}) is event
+
+    def test_unlisted_upstream_500_still_reports(self):
+        event = _incident_event("THROTTLING_EXCEPTION", "kiro_upstream", 500)
+        assert ss.before_send(event, {}) is event
+
+    def test_upstream_402_without_quota_code_still_reports(self):
+        """A 402 that is not MONTHLY_REQUEST_COUNT stays actionable."""
+        event = _incident_event("PAYMENT_REQUIRED", "kiro_upstream", 402)
+        assert ss.before_send(event, {}) is event
+
+    def test_gateway_500_still_reports(self):
+        event = _incident_event("stream_parse_error", "gateway", 500)
+        assert ss._should_skip_incident_snapshot(
+            _snapshot(code="stream_parse_error", source="gateway", status_code=500)
+        ) is False
+        assert ss.before_send(event, {}) is event
+
+    def test_upstream_429_without_these_codes_still_reports(self):
+        """Real rate limits stay reportable; the drop is by reason code, not status."""
+        event = _incident_event("http_429", "kiro_upstream", 429)
+        assert ss.before_send(event, {}) is event
+
+
+class TestLoginRequiredIncidentFiltering:
+    """A 401 ``login_required`` incident is signed-out user state, not a gateway bug.
+
+    On release 0.4.48 the gateway already returns 401 and tells the user to sign
+    in again, but the code was missing from the signed-out set and the shared
+    incident decision never consulted that set:
+      * KIRO-GATEWAY-TRAY-29 — ``/v1/responses``, source ``auth``, status 401
+      * KIRO-GATEWAY-TRAY-2A — ``/v1/messages``, same code, same user
+
+    ``source="auth"`` plus 401 is not a client fault, so both the snapshot path
+    and ``before_send`` must drop it through :func:`_is_non_actionable_incident`.
+    """
+
+    _LOGIN_REQUIRED_DETAIL = (
+        "Kiro credentials are expired or missing. Open Kiro (or run "
+        "'kiro-cli login') and sign in again, then retry."
+    )
+
+    def test_snapshot_and_shared_decision_skip_login_required(self, monkeypatch):
+        """code=login_required, source=auth, status=401 is non-actionable."""
+        snapshot = _snapshot(
+            code="login_required",
+            source="auth",
+            status_code=401,
+            path="/v1/responses",
+            error_message=self._LOGIN_REQUIRED_DETAIL,
+        )
+        assert ss._is_signed_out_code("login_required") is True
+        assert ss._is_non_actionable_incident("login_required", "auth", 401) is True
+        assert ss._should_skip_incident_snapshot(snapshot) is True
+        _assert_snapshot_dropped(monkeypatch, snapshot)
+
+    def test_before_send_drops_login_required_incident_tag(self):
+        """Tags carrying incident.code=login_required must not open an Issue."""
+        event = _incident_event("login_required", "auth", 401)
+        assert event["tags"]["incident.code"] == "login_required"
+        assert ss.before_send(event, {}) is None
+
+    def test_before_send_drops_login_required_incident_message(self):
+        """Text-only events use the same decision as structured incidents."""
+        event = {
+            "message": (
+                "Gateway incident: login_required (auth) /v1/responses status=401: "
+                f"{self._LOGIN_REQUIRED_DETAIL}"
+            ),
+        }
+        assert "tags" not in event and "contexts" not in event
+        parsed = ss._parse_incident_message(event["message"].lower())
+        assert parsed == ("login_required", "auth", 401)
+        assert ss._is_non_actionable_incident(*parsed) is True
+        assert ss.before_send(event, {}) is None
+
+    def test_before_send_drops_login_required_on_messages(self):
+        """TRAY-2A is the same code on /v1/messages."""
+        event = {
+            "message": (
+                "Gateway incident: login_required (auth) /v1/messages status=401: "
+                f"{self._LOGIN_REQUIRED_DETAIL}"
+            ),
+        }
+        assert ss.before_send(event, {}) is None
+
+    @pytest.mark.parametrize(
+        "code",
+        ["LOGIN_REQUIRED", "Login_Required", "  login_required  "],
+    )
+    def test_signed_out_code_matching_folds_case_and_whitespace(self, code):
+        """Incident messages are lowercased; the gateway literal is lowercase."""
+        assert ss._is_signed_out_code(code) is True
+        assert ss._is_non_actionable_incident(code, "auth", 401) is True
+
+    @pytest.mark.parametrize(
+        "code",
+        ["usage_auth_required", "account_auth_required", "account_not_configured"],
+    )
+    def test_existing_signed_out_codes_still_drop(self, code):
+        """Older signed-out codes stay dropped on both interception points."""
+        event = {"message": "gateway degraded", "tags": {"incident.code": code}}
+        assert ss.before_send(event, {}) is None
+        assert ss._is_non_actionable_incident(code, "auth", 401) is True
+        assert ss._should_skip_incident_snapshot(
+            _snapshot(code=code, source="auth", status_code=401)
+        ) is True
+
+    def test_gateway_500_is_not_dropped(self):
+        """source=gateway status=500 stays reportable (streaming_error)."""
+        assert ss._is_signed_out_code("streaming_error") is False
+        assert ss._is_non_actionable_incident("streaming_error", "gateway", 500) is False
+        snapshot = _snapshot(
+            code="streaming_error",
+            source="gateway",
+            status_code=500,
+            error_message="stream failed",
+        )
+        assert ss._should_skip_incident_snapshot(snapshot) is False
+        event = _incident_event("streaming_error", "gateway", 500)
+        assert ss.before_send(event, {}) is event
+
+    def test_unknown_403_kiro_upstream_is_not_dropped(self):
+        """TRAY-1N: upstream 403 UNKNOWN is a different auth failure."""
+        detail = "Bearer token included in the request is invalid"
+        assert ss._is_non_actionable_incident("UNKNOWN", "kiro_upstream", 403) is False
+        assert ss._should_skip_incident_snapshot(
+            _snapshot(
+                code="UNKNOWN",
+                source="kiro_upstream",
+                status_code=403,
+                error_message=detail,
+            )
+        ) is False
+        event = {
+            "message": (
+                "Gateway incident: UNKNOWN (kiro_upstream) /v1/messages "
+                f"status=403: {detail}"
+            ),
+            "tags": {
+                "incident.code": "UNKNOWN",
+                "incident.source": "kiro_upstream",
+                "incident.status_code": "403",
+            },
+        }
+        assert ss.before_send(event, {}) is event

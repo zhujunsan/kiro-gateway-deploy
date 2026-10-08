@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.4.49 (2026-10-08)
+
+**Fixed**
+- Sentry 不再为凭证失效建 Issue：`login_required`（`/v1/messages`、`/v1/responses` 等返回 401，用户需重新登录）。快照与 `before_send` 走同一判定。
+- Sentry 不再为 Kiro 正常回绝建 Issue：`MODEL_TEMPORARILY_UNAVAILABLE`（上游临时高负载）与 `MONTHLY_REQUEST_COUNT`（账号月配额用尽）。按 reason code 判定，不带这些 code 的 500/402/429 仍上报。
+- 网关自身问题仍上报：`source=gateway` 的 `streaming_error` / `stream_parse_error`、`first_token_timeout`、403 无效 Bearer（UNKNOWN）。
+
 ## v0.4.48 (2026-09-24)
 
 **Changed**
