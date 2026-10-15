@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.4.50 (2026-10-15)
+
+**Fixed**
+- Anthropic Messages API 现在接受 Claude Code 回放的 `redacted_thinking` 历史块；不透明数据通过格式校验但不会作为提示词发送给 Kiro，避免请求被 422 拒绝或泄漏加密思考内容。
+- Anthropic 原生 `web_search_20250305` 工具可以省略 `name`，网关会补为 `web_search`；自定义工具和未知服务端工具仍严格校验名称与输入 schema。
+- 工具 JSON Schema 会清理非法 `required`，并无损展开 Bedrock 不接受的安全根级组合；无法保持语义的多分支 `oneOf` / `anyOf` 返回明确的 400，而不会静默选取一个分支。
+- 修复上游额度事件因字段顺序而无法解析：credits 与 token/cache usage 分开处理并支持分片、零值、旧格式及多事件累加，覆盖 OpenAI、Anthropic 和 Responses 的流式与非流式路径。
+
+**Changed**
+- 同步内嵌网关和 Docker 镜像至 `main-c55c508`。
+
 ## v0.4.49 (2026-10-08)
 
 **Fixed**
