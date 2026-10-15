@@ -742,6 +742,12 @@ class Supervisor:
         if identity is None:
             logger.debug("Kiro credential identity unavailable; keeping cached profile")
             return cfg
+        try:
+            identity = kiro_identity.resolve_profile_identity(cfg, identity)
+        except kiro_identity.ProfileDiscoveryError as error:
+            self._set_gateway_error(str(error))
+            logger.warning("Kiro profile discovery blocked gateway launch: {}", error)
+            raise
         profile_arn, api_region = kiro_identity.synchronized_values(cfg, identity)
         if (
             profile_arn == cfg.gateway.profile_arn

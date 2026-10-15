@@ -96,12 +96,18 @@ def test_start_provisioned(monkeypatch, tmp_path):
             {"profileArn": "arn:aws:codewhisperer:eu-west-1:222222222222:profile/NEW"},
             "arn:aws:codewhisperer:eu-west-1:222222222222:profile/NEW", "eu-west-1",
         ),
-        ({"clientIdHash": "new-company", "region": "eu-west-1"}, "", "eu-west-1"),
         (
-            {"clientId": "new-id", "clientSecret": "new-secret", "region": "eu-west-1"},
-            "", "eu-west-1",
+            {"clientIdHash": "new-company", "accessToken": "new-token", "region": "eu-west-1"},
+            "arn:aws:codewhisperer:eu-west-1:222222222222:profile/DISCOVERED", "eu-west-1",
         ),
-        ({"clientIdHash": "new-company"}, "", "us-east-1"),
+        (
+            {"clientId": "new-id", "clientSecret": "new-secret", "accessToken": "new-token", "region": "eu-west-1"},
+            "arn:aws:codewhisperer:eu-west-1:222222222222:profile/DISCOVERED", "eu-west-1",
+        ),
+        (
+            {"clientIdHash": "new-company", "accessToken": "new-token"},
+            "arn:aws:codewhisperer:us-east-1:222222222222:profile/DISCOVERED", "us-east-1",
+        ),
         (
             {"refreshToken": "desktop-refresh"},
             "arn:aws:codewhisperer:us-east-1:111111111111:profile/OLD", "us-east-1",
@@ -131,6 +137,14 @@ def test_start_syncs_current_kiro_identity_before_gateway_launch(
     if credentials is not None:
         credentials_path.write_text(json.dumps(credentials), encoding="utf-8")
     cfg.gateway.kiro_creds_file = str(credentials_path)
+    from kiro_gateway_tray import kiro_identity
+
+    def discover(token: str, region: str, configured: str) -> str:
+        """Return the profile confirmed for the new account in its region."""
+        assert token == "new-token"
+        return f"arn:aws:codewhisperer:{region}:222222222222:profile/DISCOVERED"
+
+    monkeypatch.setattr(kiro_identity, "discover_profile_arn", discover)
     appconfig.save(cfg)
 
     assert s.start() is True
@@ -207,7 +221,8 @@ def test_identity_sync_preserves_latest_unrelated_config(
     latest.audit.max_spool_mb = 512
     appconfig.save(latest)
     identity = kiro_identity.KiroCredentialIdentity(
-        profile_arn=None, api_region="eu-west-1", enterprise_sso=True
+        profile_arn="arn:aws:codewhisperer:eu-west-1:222222222222:profile/NEW",
+        api_region="eu-west-1", enterprise_sso=True
     )
     monkeypatch.setattr(kiro_identity, "read_current_identity", lambda _cfg: identity)
 
@@ -232,7 +247,8 @@ def test_start_uses_current_identity_even_if_persistence_fails(
     cfg.gateway.profile_arn = "arn:aws:codewhisperer:us-east-1:111111111111:profile/OLD"
     appconfig.save(cfg)
     identity = kiro_identity.KiroCredentialIdentity(
-        profile_arn=None, api_region="eu-west-1", enterprise_sso=True
+        profile_arn="arn:aws:codewhisperer:eu-west-1:222222222222:profile/NEW",
+        api_region="eu-west-1", enterprise_sso=True
     )
     monkeypatch.setattr(kiro_identity, "read_current_identity", lambda _cfg: identity)
 
@@ -242,9 +258,70 @@ def test_start_uses_current_identity_even_if_persistence_fails(
     monkeypatch.setattr(appconfig, "update", fail_update)
 
     assert s.start() is True
-    assert s.gateway.start_cfg.gateway.profile_arn == ""
+    assert s.gateway.start_cfg.gateway.profile_arn == identity.profile_arn
     assert s.gateway.start_cfg.gateway.api_region == "eu-west-1"
     assert appconfig.load().gateway.profile_arn == cfg.gateway.profile_arn
+    s.close()
+
+
+@pytest.mark.parametrize("token", [None, "current-token"])
+def test_profile_discovery_failure_preserves_config_and_blocks_child_launch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, token: str | None
+) -> None:
+    """Missing or rejected profile discovery must never launch with an empty ARN."""
+    from kiro_gateway_tray import kiro_identity
+
+    s = _make_sup(monkeypatch, tmp_path)
+    cfg = appconfig.load()
+    cfg.gateway.profile_arn = "arn:aws:codewhisperer:us-east-1:111111111111:profile/OLD"
+    cfg.gateway.kiro_creds_file = str(tmp_path / "sso.json")
+    Path(cfg.gateway.kiro_creds_file).write_text(json.dumps({
+        "clientIdHash": "new-company", "accessToken": token, "region": "us-east-1",
+    }), encoding="utf-8")
+    appconfig.save(cfg)
+
+    def fail_lookup(*args: object) -> str:
+        """Simulate an unavailable identity service."""
+        raise kiro_identity.ProfileDiscoveryError("Cannot discover current Kiro profile; check login.")
+
+    monkeypatch.setattr(kiro_identity, "discover_profile_arn", fail_lookup)
+    with pytest.raises(kiro_identity.ProfileDiscoveryError):
+        s.start()
+    assert s.gateway.is_alive() is False
+    assert s.tunnel.is_alive() is False
+    assert appconfig.load() == cfg
+    assert s.last_error
+    s.close()
+
+
+def test_restart_discovers_new_user_with_same_company_registration(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """clientIdHash identifies a company registration, not an individual account."""
+    from kiro_gateway_tray import kiro_identity
+
+    s = _make_sup(monkeypatch, tmp_path)
+    monkeypatch.setattr(s, "_start_health_loop", lambda: True)
+    cfg = appconfig.load()
+    cfg.gateway.kiro_creds_file = str(tmp_path / "sso.json")
+    appconfig.save(cfg)
+    calls: list[str] = []
+
+    def discover(token: str, region: str, configured: str) -> str:
+        """Return distinct profiles for different users of the same company."""
+        calls.append(token)
+        return f"arn:aws:codewhisperer:{region}:222222222222:profile/{token}"
+
+    monkeypatch.setattr(kiro_identity, "discover_profile_arn", discover)
+    for token in ("first-user", "second-user"):
+        Path(cfg.gateway.kiro_creds_file).write_text(json.dumps({
+            "clientIdHash": "same-company", "accessToken": token, "region": "us-east-1",
+        }), encoding="utf-8")
+        assert (s.start() if token == "first-user" else s.restart()) is True
+        expected = f"arn:aws:codewhisperer:us-east-1:222222222222:profile/{token}"
+        assert s.gateway.start_cfg.gateway.profile_arn == expected
+        assert appconfig.load().gateway.profile_arn == expected
+    assert calls == ["first-user", "second-user"]
     s.close()
 
 

@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.5.2 (2026-10-15)
+
+**Fixed**
+- 修复 v0.5.0 切换企业账号后模型列表可用、聊天却报 `profileArn is required for this request` 的问题：企业 SSO 凭据缺少 ARN 时，在网关启动或重启前使用当前登录 token 查询 `ListAvailableProfiles`，补齐当前账号的有效 ARN，而不是仅清空旧值。
+- 旧配置 ARN 仅在当前账号返回的 profile 列表中得到确认后复用；否则选择唯一有效 profile。查询失败、存在无法确定的多个 profile，或凭据在查询期间变化时，明确报错并阻止网关以空值或未验证的旧身份启动，保留原配置且不修改 Kiro 登录文件。
+
+**Changed**
+- 更新账号切换说明，明确模型列表与额度接口可用不代表聊天身份完整；登录 token 失效或被拒绝时，需在 Kiro IDE 重新登录后重启网关。
+
 ## v0.5.1 (2026-10-15)
 
 **Fixed**
