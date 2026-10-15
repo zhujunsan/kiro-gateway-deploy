@@ -1,6 +1,8 @@
 # app/tests/test_tray_update.py
 import sys
 import types
+from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
@@ -71,3 +73,27 @@ def test_version_line_shows_upgrade_available(tmp_path, monkeypatch):
     app = _make_app()
     line = app._version_line(None)
     assert "可升级 9.9.9" in line
+
+
+@pytest.mark.parametrize("current", ["0.1.0", "0.5.0", "99.0.0"])
+@pytest.mark.parametrize("latest", [None, "v0.1.0", "v0.5.0", "v9.9.9"])
+def test_open_release_always_uses_latest_page(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, current: str, latest: str | None
+) -> None:
+    """Keep the version link independent of installed and cached versions."""
+    from kiro_gateway_tray import GITHUB_REPO
+
+    monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
+    monkeypatch.setattr("kiro_gateway_tray.tray.__version__", current)
+    if latest is not None:
+        updates._write_cache(latest=latest)
+    open_browser = Mock()
+    monkeypatch.setattr("kiro_gateway_tray.tray.webbrowser.open", open_browser)
+    app = _make_app()
+    app._ensure_update_info_sync()
+
+    app._on_open_release(None, None)
+
+    open_browser.assert_called_once_with(
+        f"https://github.com/{GITHUB_REPO}/releases/latest"
+    )

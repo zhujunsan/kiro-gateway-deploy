@@ -1060,10 +1060,9 @@ class TrayApp:
         if info:
             webbrowser.open(info.release_url)
 
-    def _on_open_release(self, _icon, _item):
-        webbrowser.open(
-            f"https://github.com/{GITHUB_REPO}/releases/tag/v{__version__}"
-        )
+    def _on_open_release(self, _icon: object, _item: object) -> None:
+        """Open GitHub's latest release page regardless of the installed version."""
+        webbrowser.open(f"https://github.com/{GITHUB_REPO}/releases/latest")
 
     def _on_open_speedtest(self, _icon, _item):
         cfg = appconfig.load(use_cache=True)
