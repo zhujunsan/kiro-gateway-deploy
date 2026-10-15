@@ -336,9 +336,16 @@ def run_gateway_blocking() -> int:
     from . import telemetry
     app = telemetry.wrap_app(main.app)
 
+    # Audit capture: copy conversation request/response bytes to audit/spool/.
+    # Dedup, compression and upload happen in the tray process. No-op until
+    # the tray writes audit/control.json with mode=best_effort.
+    from . import audit_capture
+    app = audit_capture.wrap_app(app)
+
     # Local in-flight / recent request snapshots for the tray menu. Always on
-    # (unlike telemetry): writes {data_dir}/request_activity.json only; never
-    # uploads prompt/reply text.
+    # (unlike telemetry): writes {data_dir}/request_activity.json only. This
+    # channel never uploads prompt/reply text. Conversation bodies are copied
+    # separately by audit_capture when audit mode is best_effort.
     from . import request_activity
     app = request_activity.wrap_app(app)
 

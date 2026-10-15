@@ -1,3 +1,5 @@
+import json
+from pathlib import Path
 import socket
 import ssl
 import time
@@ -8,9 +10,13 @@ from kiro_gateway_tray import supervisor, appconfig
 
 
 @pytest.fixture(autouse=True)
-def _identity_matches_stored_hostname(monkeypatch):
-    """Keep start() from re-provisioning: slug derived from the stored hostname."""
+def _identity_matches_stored_hostname(monkeypatch, tmp_path):
+    """Keep start() local: isolate credentials and avoid tunnel re-provisioning."""
     import kiro_gateway_tray.provision as pmod
+
+    monkeypatch.setattr(
+        appconfig, "default_creds_file", lambda: str(tmp_path / "absent-kiro-token.json")
+    )
 
     def _username(cfg):
         return pmod.username_from_hostname(cfg.cloudflare.hostname) or "testuser"
@@ -19,10 +25,19 @@ def _identity_matches_stored_hostname(monkeypatch):
 
 
 class _FakeGateway:
-    def __init__(self): self.started = False
-    def start(self, cfg): self.started = True
-    def stop(self): self.started = False
-    def is_alive(self): return self.started
+    def __init__(self):
+        self.started = False
+        self.start_cfg = None
+
+    def start(self, cfg):
+        self.started = True
+        self.start_cfg = cfg
+
+    def stop(self):
+        self.started = False
+
+    def is_alive(self):
+        return self.started
 
 
 class _FakeTunnel:
@@ -72,6 +87,165 @@ def test_start_provisioned(monkeypatch, tmp_path):
     assert s.gateway.is_alive() is True
     assert s.tunnel.is_alive() is True
     assert s.status()["hostname"] == "kg-test.example.com"
+
+
+@pytest.mark.parametrize(
+    "credentials,expected_arn,expected_region",
+    [
+        (
+            {"profileArn": "arn:aws:codewhisperer:eu-west-1:222222222222:profile/NEW"},
+            "arn:aws:codewhisperer:eu-west-1:222222222222:profile/NEW", "eu-west-1",
+        ),
+        ({"clientIdHash": "new-company", "region": "eu-west-1"}, "", "eu-west-1"),
+        (
+            {"clientId": "new-id", "clientSecret": "new-secret", "region": "eu-west-1"},
+            "", "eu-west-1",
+        ),
+        ({"clientIdHash": "new-company"}, "", "us-east-1"),
+        (
+            {"refreshToken": "desktop-refresh"},
+            "arn:aws:codewhisperer:us-east-1:111111111111:profile/OLD", "us-east-1",
+        ),
+        (
+            None,
+            "arn:aws:codewhisperer:us-east-1:111111111111:profile/OLD", "us-east-1",
+        ),
+    ],
+)
+def test_start_syncs_current_kiro_identity_before_gateway_launch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    credentials: dict[str, str] | None,
+    expected_arn: str,
+    expected_region: str,
+) -> None:
+    """Current identity must reach the child, disk, cache, and launch environment."""
+    s = _make_sup(monkeypatch, tmp_path, provisioned=True)
+    monkeypatch.setattr(s, "_start_health_loop", lambda: True)
+    cfg = appconfig.load()
+    cfg.gateway.profile_arn = (
+        "arn:aws:codewhisperer:us-east-1:111111111111:profile/OLD"
+    )
+    cfg.gateway.api_region = "us-east-1"
+    credentials_path = tmp_path / "kiro-auth-token.json"
+    if credentials is not None:
+        credentials_path.write_text(json.dumps(credentials), encoding="utf-8")
+    cfg.gateway.kiro_creds_file = str(credentials_path)
+    appconfig.save(cfg)
+
+    assert s.start() is True
+
+    assert s.gateway.start_cfg is not None
+    assert s.gateway.start_cfg.gateway.profile_arn == expected_arn
+    assert s.gateway.start_cfg.gateway.api_region == expected_region
+    assert s._get_cfg().gateway.profile_arn == expected_arn
+    persisted = appconfig.load()
+    assert persisted.gateway.profile_arn == expected_arn
+    assert persisted.gateway.api_region == expected_region
+    env = appconfig.to_gateway_env(s.gateway.start_cfg)
+    assert env["PROFILE_ARN"] == expected_arn
+    assert env["KIRO_API_REGION"] == expected_region
+    s.close()
+
+
+def test_restart_rereads_changed_kiro_profile(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Restart picks up an account change without requiring a tray relaunch."""
+    s = _make_sup(monkeypatch, tmp_path)
+    monkeypatch.setattr(s, "_start_health_loop", lambda: True)
+    credential_path = tmp_path / "kiro-auth-token.json"
+    cfg = appconfig.load()
+    cfg.gateway.kiro_creds_file = str(credential_path)
+    appconfig.save(cfg)
+    old_arn = "arn:aws:codewhisperer:us-east-1:111111111111:profile/OLD"
+    new_arn = "arn:aws:codewhisperer:eu-west-1:222222222222:profile/NEW"
+    credential_path.write_text(json.dumps({"profileArn": old_arn}), encoding="utf-8")
+    assert s.start() is True
+    assert s.gateway.start_cfg.gateway.profile_arn == old_arn
+
+    credential_path.write_text(json.dumps({"profileArn": new_arn}), encoding="utf-8")
+    assert s.restart() is True
+
+    assert s.gateway.start_cfg.gateway.profile_arn == new_arn
+    assert appconfig.load().gateway.api_region == "eu-west-1"
+    s.close()
+
+
+def test_identity_sync_skips_write_when_unchanged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Repeated startup checks do not rewrite an unchanged configuration."""
+    from kiro_gateway_tray import kiro_identity
+
+    s = _make_sup(monkeypatch, tmp_path)
+    cfg = s._load()
+    identity = kiro_identity.KiroCredentialIdentity(
+        profile_arn=None, api_region=None, enterprise_sso=False
+    )
+    monkeypatch.setattr(kiro_identity, "read_current_identity", lambda _cfg: identity)
+
+    def unexpected_update(_mutator: object) -> appconfig.AppCfg:
+        raise AssertionError("unchanged identity must not write config")
+
+    monkeypatch.setattr(appconfig, "update", unexpected_update)
+
+    assert s._sync_kiro_identity(cfg) is cfg
+
+
+def test_identity_sync_preserves_latest_unrelated_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A stale supervisor snapshot cannot overwrite newer tunnel or audit fields."""
+    from kiro_gateway_tray import kiro_identity
+
+    s = _make_sup(monkeypatch, tmp_path)
+    stale_cfg = s._load()
+    latest = appconfig.load()
+    latest.gateway.proxy_api_key = "new-gateway-key"
+    latest.cloudflare.hostname = "kg-latest.example.com"
+    latest.audit.max_spool_mb = 512
+    appconfig.save(latest)
+    identity = kiro_identity.KiroCredentialIdentity(
+        profile_arn=None, api_region="eu-west-1", enterprise_sso=True
+    )
+    monkeypatch.setattr(kiro_identity, "read_current_identity", lambda _cfg: identity)
+
+    updated = s._sync_kiro_identity(stale_cfg)
+
+    assert updated.gateway.api_region == "eu-west-1"
+    assert updated.gateway.proxy_api_key == "new-gateway-key"
+    assert updated.cloudflare.hostname == "kg-latest.example.com"
+    assert updated.audit.max_spool_mb == 512
+    assert appconfig.load() == updated
+
+
+def test_start_uses_current_identity_even_if_persistence_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Read-only config does not force this launch to use a previous account ARN."""
+    from kiro_gateway_tray import kiro_identity
+
+    s = _make_sup(monkeypatch, tmp_path)
+    monkeypatch.setattr(s, "_start_health_loop", lambda: True)
+    cfg = appconfig.load()
+    cfg.gateway.profile_arn = "arn:aws:codewhisperer:us-east-1:111111111111:profile/OLD"
+    appconfig.save(cfg)
+    identity = kiro_identity.KiroCredentialIdentity(
+        profile_arn=None, api_region="eu-west-1", enterprise_sso=True
+    )
+    monkeypatch.setattr(kiro_identity, "read_current_identity", lambda _cfg: identity)
+
+    def fail_update(_mutator: object) -> appconfig.AppCfg:
+        raise PermissionError("read-only config directory")
+
+    monkeypatch.setattr(appconfig, "update", fail_update)
+
+    assert s.start() is True
+    assert s.gateway.start_cfg.gateway.profile_arn == ""
+    assert s.gateway.start_cfg.gateway.api_region == "eu-west-1"
+    assert appconfig.load().gateway.profile_arn == cfg.gateway.profile_arn
+    s.close()
 
 
 def test_start_not_provisioned_no_callback_raises(monkeypatch, tmp_path):
@@ -843,8 +1017,6 @@ def test_startup_sync_failure_does_not_block_gateway(monkeypatch, tmp_path):
 # =============================================================================
 # Tunnel Health Model Tests
 # =============================================================================
-
-import json
 
 
 class _FakeTunnelWithReconnect:

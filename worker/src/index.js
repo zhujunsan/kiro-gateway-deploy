@@ -47,6 +47,18 @@
 //   → 401 { error: "unauthorized" }
 //   Idempotent overwrite (last-write-wins) via ON CONFLICT DO UPDATE.
 //
+// POST /client-config
+//   body: { shared_secret, username }
+//   → 200 { ok: true, audit: { mode: "off"|"best_effort", rotate_seconds } }
+//   通用客户端配置。audit.usernames 非空时只有名单内用户拿到 best_effort。
+//   D1 行边缘缓存 TTL 5 分钟；改完想立刻生效就把 client_config.js 的 CACHE_GEN +1。
+//
+// POST /audit/upload-url
+//   body: { shared_secret, username, keys: ["audit/v1/YY-MM-DD/<userId>/....jsonl.zst", ...] }
+//   → 200 { ok, uploads: [{ key, url, headers }] }   URL 15 分钟，必须带 x-oss-forbid-overwrite
+//   → 503 { error: "audit storage not configured" }  OSS_* 未配置
+//   目录是 IdC userId。拿不到 userId 时才允许落在调用者自己的 username 下。单次最多 10 个。
+//
 // POST /announcements
 //   headers: { User-Agent: "KiroGatewayTray/<version> (<platform>)" }
 //   body: { shared_secret, username }
@@ -72,6 +84,9 @@
 //   DOMAIN_SUFFIX   — e.g. "example.com"
 //   HOSTNAME_PREFIX — e.g. "kg"  → final hostname = kg-<username>.<DOMAIN_SUFFIX>
 //   TELEMETRY_SECRET — 客户端上报 /telemetry 用的预共享密钥（独立于 SHARED_SECRET）
+//   OSS_ACCESS_KEY_ID / OSS_ACCESS_KEY_SECRET — 审计上传用的 RAM 子账号，仅 PutObject
+// Optional vars (wrangler.toml [vars], not secrets):
+//   OSS_BUCKET, OSS_REGION (cn-shanghai), OSS_ENDPOINT (oss-cn-shanghai.aliyuncs.com)
 // Optional:
 //   IDLE_CLEANUP_DAYS — 闲置隧道清理阈值（天）；未配置则不清理
 // Required bindings (wrangler.toml):
@@ -85,6 +100,14 @@ import {
   clientContextFromRequest,
   selectAnnouncements,
 } from "./announcements.js";
+import {
+  CLIENT_CONFIG_CACHE_GEN,
+  CLIENT_CONFIG_CACHE_TTL,
+  CLIENT_CONFIG_SQL,
+  auditConfigFor,
+  validateAuditKeys,
+} from "./client_config.js";
+import { presignPut } from "./oss_sign.js";
 import {
   ProvisionConflictError,
   StaleGenerationError,
@@ -1020,6 +1043,102 @@ async function handleAnnouncements(request, env, json) {
   return json({ ok: true, announcements });
 }
 
+// --- 客户端配置（/client-config）---
+
+async function loadClientConfigRows(env) {
+  const cache = caches.default;
+  const cacheKey = new Request(
+    `https://client-config.cache/rows-g${CLIENT_CONFIG_CACHE_GEN}`,
+    { method: "GET" },
+  );
+  const cached = await cache.match(cacheKey);
+  if (cached) {
+    try {
+      return await cached.json();
+    } catch {
+      // Fall through and read D1.
+    }
+  }
+  let rows;
+  try {
+    const result = await env.TELEMETRY_DB.prepare(CLIENT_CONFIG_SQL).all();
+    rows = result.results || [];
+  } catch (err) {
+    console.log(`[client-config] query failed: ${err.message}`);
+    return [];
+  }
+  const resp = new Response(JSON.stringify(rows), {
+    headers: {
+      "Content-Type": "application/json",
+      "Cache-Control": `public, max-age=${CLIENT_CONFIG_CACHE_TTL}`,
+    },
+  });
+  await cache.put(cacheKey, resp.clone());
+  return rows;
+}
+
+async function handleClientConfig(request, env, json) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: "invalid JSON" }, 400);
+  }
+  const { shared_secret, username } = body || {};
+  if (!shared_secret || !env.SHARED_SECRET || !timingSafeEqual(shared_secret, env.SHARED_SECRET)) {
+    return json({ error: "unauthorized" }, 401);
+  }
+  if (!username || !USERNAME_RE.test(username)) {
+    return json({ error: "username must be lowercase alphanumeric/hyphen, 1-32 chars" }, 400);
+  }
+  const rows = await loadClientConfigRows(env);
+  const auditRow = rows.find((row) => row.key === "audit");
+  const audit = auditConfigFor(auditRow ? auditRow.value : null, username);
+  return json({ ok: true, audit });
+}
+
+// --- 审计上传 URL（/audit/upload-url）---
+
+function ossConfigured(env) {
+  return Boolean(env.OSS_ACCESS_KEY_ID && env.OSS_ACCESS_KEY_SECRET && env.OSS_BUCKET && env.OSS_REGION && env.OSS_ENDPOINT);
+}
+
+async function handleAuditUploadUrl(request, env, json) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: "invalid JSON" }, 400);
+  }
+  const { shared_secret, username, keys } = body || {};
+  if (!shared_secret || !env.SHARED_SECRET || !timingSafeEqual(shared_secret, env.SHARED_SECRET)) {
+    return json({ error: "unauthorized" }, 401);
+  }
+  if (!username || !USERNAME_RE.test(username)) {
+    return json({ error: "username must be lowercase alphanumeric/hyphen, 1-32 chars" }, 400);
+  }
+  const keyError = validateAuditKeys(username, keys);
+  if (keyError) return json({ error: keyError }, 400);
+  if (!ossConfigured(env)) return json({ error: "audit storage not configured" }, 503);
+
+  const now = new Date();
+  const uploads = [];
+  for (const key of keys) {
+    const signed = await presignPut({
+      accessKeyId: env.OSS_ACCESS_KEY_ID,
+      accessKeySecret: env.OSS_ACCESS_KEY_SECRET,
+      bucket: env.OSS_BUCKET,
+      region: env.OSS_REGION,
+      endpoint: env.OSS_ENDPOINT,
+      key,
+      now,
+      expires: 900,
+    });
+    uploads.push({ key, url: signed.url, headers: signed.headers });
+  }
+  return json({ ok: true, uploads });
+}
+
 // --- request handler ---
 
 export default {
@@ -1060,6 +1179,30 @@ export default {
       }
       try {
         return await handleTunnelStatus(request, env, json);
+      } catch (err) {
+        return json({ error: err.message }, 500);
+      }
+    }
+
+    // 客户端配置：激活码鉴权，只读 client_config，审计开关是第一个字段。
+    if (url.pathname === "/client-config") {
+      if (request.method !== "POST") {
+        return new Response("not found", { status: 404 });
+      }
+      try {
+        return await handleClientConfig(request, env, json);
+      } catch (err) {
+        return json({ error: err.message }, 500);
+      }
+    }
+
+    // 审计对象的预签名 PUT。客户端不持有 OSS AK。
+    if (url.pathname === "/audit/upload-url") {
+      if (request.method !== "POST") {
+        return new Response("not found", { status: 404 });
+      }
+      try {
+        return await handleAuditUploadUrl(request, env, json);
       } catch (err) {
         return json({ error: err.message }, 500);
       }

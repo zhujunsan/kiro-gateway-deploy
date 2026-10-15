@@ -93,3 +93,16 @@ CREATE TABLE IF NOT EXISTS provision_lock (
   holder      TEXT,
   updated_at  INTEGER NOT NULL
 );
+
+-- 客户端远程开关。audit 是第一行；value 为 JSON。
+-- audit: {"mode":"off"|"best_effort","usernames":[],"rotate_seconds":600}
+-- usernames 非空时只对名单内用户返回 best_effort（灰度）。
+CREATE TABLE IF NOT EXISTS client_config (
+  key        TEXT PRIMARY KEY,
+  value      TEXT NOT NULL,
+  updated_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s', 'now') AS INTEGER))
+);
+
+INSERT INTO client_config (key, value)
+VALUES ('audit', '{"mode":"off","usernames":[],"rotate_seconds":600}')
+ON CONFLICT(key) DO NOTHING;

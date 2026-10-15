@@ -40,6 +40,22 @@
 
 > 需要手动改配置时，托盘菜单「打开配置文件」或 `kiro-gateway-tray --print-config` 可定位 `config.toml`。
 
+### 切换 Kiro / 企业 SSO 账号
+
+先在 Kiro IDE 中退出旧账号并登录新账号，再点击托盘菜单「重启」。App 每次启动或重启网关前，
+都会检查当前 Kiro 凭据文件（默认 `~/.aws/sso/cache/kiro-auth-token.json`，也可通过
+`gateway.kiro_creds_file` 指定）：
+
+- 凭据有有效的 `profileArn`：自动更新配置中的 `profile_arn`，并使用 ARN 中的区域。
+- 企业 SSO 凭据没有 `profileArn`：自动清除旧账号缓存的 ARN，并在凭据提供有效 `region` 时更新区域。
+- 普通 Desktop 凭据没有 ARN：保留手动配置的 ARN；文件缺失或损坏时保留原配置，不猜测账号身份。
+- 仅在值变化时保存；如果配置目录不可写，本次启动仍使用新身份，并记录检查目录权限的警告。
+
+此检查读取本地凭据，不调用 AWS 接口验证权限，也不会修改 Kiro 的登录文件。
+运行中切换账号后仍需点击「重启」以重新加载网关内存中的 token。
+若重启后仍无法获取模型或额度，请先确认新账号在 Kiro IDE 中可正常使用，
+以及管理员已为该账号分配所需订阅和权限。
+
 ## 开发者怎么构建
 
 ```bash

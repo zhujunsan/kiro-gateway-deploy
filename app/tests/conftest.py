@@ -2,7 +2,12 @@
 """Shared pytest fixtures for the tray app test suite."""
 from __future__ import annotations
 
+import os
+
 import pytest
+
+# See audit_runtime.ensure. Set before any Supervisor.start during collection.
+os.environ.setdefault("KIRO_AUDIT_AUTOSTART", "0")
 
 
 @pytest.fixture(autouse=True)

@@ -50,10 +50,21 @@ class TelemetryCfg:
 
 
 @dataclass
+class AuditCfg:
+    # Local override of the cloud on/off switch. Empty means "follow the cloud"
+    # (which defaults to off until /client-config says otherwise). Used to turn
+    # capture on for a single machine before the cloud side exists.
+    mode_override: str = ""
+    max_spool_mb: int = 1024       # compressed outbox + plaintext + raw spool
+    rotate_seconds: int = 600      # how often a batch is sealed
+
+
+@dataclass
 class AppCfg:
     gateway: GatewayCfg = field(default_factory=GatewayCfg)
     cloudflare: CloudflareCfg = field(default_factory=CloudflareCfg)
     telemetry: TelemetryCfg = field(default_factory=TelemetryCfg)
+    audit: AuditCfg = field(default_factory=AuditCfg)
     gateway_extra: dict = field(default_factory=lambda: {
         "FAKE_REASONING": "false",
         # 关闭按字节自动裁剪：Kiro 的上下文上限是按 token 算的（~200k），
@@ -124,6 +135,7 @@ def _load_from_disk() -> AppCfg:
         gateway=GatewayCfg(**{**asdict(GatewayCfg()), **raw_gateway}),
         cloudflare=CloudflareCfg(**{**asdict(CloudflareCfg()), **(raw.get("cloudflare") or {})}),
         telemetry=TelemetryCfg(**{**asdict(TelemetryCfg()), **(raw.get("telemetry") or {})}),
+        audit=AuditCfg(**{**asdict(AuditCfg()), **(raw.get("audit") or {})}),
         gateway_extra=extra,
     )
 

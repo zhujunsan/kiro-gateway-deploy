@@ -19,12 +19,48 @@
 | DOMAIN_SUFFIX | example.com |
 | HOSTNAME_PREFIX | kg |
 | TELEMETRY_SECRET | 客户端上报 `/telemetry` 用的预共享密钥，独立于 SHARED_SECRET。可用 `openssl rand -hex 32` 生成 |
+| OSS_ACCESS_KEY_ID | 审计上传专用 RAM 子账号的 AccessKey ID。只授权 `oss:PutObject` 到 `audit/v1/*`。不要用主账号 AK |
+| OSS_ACCESS_KEY_SECRET | 上面那个子账号的 Secret。只通过 `wrangler secret put` 写入，不要进仓库、不要发到聊天里 |
 
 ### 可选 Secrets/Vars
 
 | Secret | 说明 |
 |---|---|
 | IDLE_CLEANUP_DAYS | 闲置隧道清理阈值（天）。设为正整数后 cron 会自动清理超过该天数未连接的隧道及对应 DNS 记录。未配置则不清理，安全默认 |
+| OSS_BUCKET / OSS_REGION / OSS_ENDPOINT | 写在 `wrangler.toml` 的 `[vars]`。当前是 `cvc-kirogateway-log`、`cn-shanghai`、`oss-cn-shanghai.aliyuncs.com`。未配置时 `/audit/upload-url` 返回 503 |
+
+## 审计记录
+
+`POST /client-config` 下发审计开关（D1 `client_config` 表的 `audit` 行）。`POST /audit/upload-url` 为每个对象签发 15 分钟的 OSS V4 预签名 PUT，并要求客户端带 `x-oss-forbid-overwrite: true`。对象键必须是 `audit/v1/YY-MM-DD/<IdC userId>/...jsonl.zst`。拿不到 userId 时才允许用调用者自己的 username。
+
+阿里云侧（账号操作，不进仓库）：
+
+1. 建私有 bucket，打开「阻止公共访问」和 SSE-OSS。不要加删除型生命周期。
+2. RAM 子账号只开 OpenAPI，策略只留这一条：
+
+```json
+{
+  "Version": "1",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": ["oss:PutObject"],
+    "Resource": ["acs:oss:*:*:cvc-kirogateway-log/audit/v1/*"]
+  }]
+}
+```
+
+3. `wrangler.toml` 的 `[vars]` 已填 `OSS_BUCKET = cvc-kirogateway-log`、`OSS_REGION = cn-shanghai`、`OSS_ENDPOINT = oss-cn-shanghai.aliyuncs.com`。AK 只用下面的 secret，不要写进 toml。
+
+首次上线：
+
+```bash
+wrangler d1 execute kiro-telemetry --remote --file=./migrations/2026-09-30-client-config.sql
+wrangler secret put OSS_ACCESS_KEY_ID
+wrangler secret put OSS_ACCESS_KEY_SECRET
+wrangler deploy
+```
+
+灰度：把 `audit` 行改成 `{"mode":"best_effort","usernames":["<你的 username>"],"rotate_seconds":600}`。确认 OSS 上的文件能还原后，把 `usernames` 改成 `[]` 即对所有人开启。改完如果想立刻生效，把 `src/client_config.js` 里的 `CLIENT_CONFIG_CACHE_GEN` 加 1 再 deploy。
 
 ## 更新 SHARED_SECRET（换批用户时）
 

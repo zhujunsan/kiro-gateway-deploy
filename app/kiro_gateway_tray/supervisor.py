@@ -15,6 +15,7 @@ from typing import Callable, Iterator
 import httpx
 
 from . import appconfig
+from . import audit_runtime
 from . import gateway
 from .log import logger
 from .httpclient import local_client, resolve_proxy
@@ -721,6 +722,62 @@ class Supervisor:
             logger.exception("identity migration re-provision failed")
             return cfg
 
+    def _sync_kiro_identity(self, cfg: AppCfg) -> AppCfg:
+        """Persist Kiro's current account identity before child launch.
+
+        Kiro replaces its credential cache when the user changes personal or
+        company accounts. The tray historically kept the profile ARN entered
+        during first-run setup forever, which could combine a new account token
+        with the previous account's ARN and break quota/model requests.
+
+        Args:
+            cfg: Configuration loaded at the beginning of startup.
+
+        Returns:
+            Latest configuration, updated when Kiro selected another identity.
+        """
+        from . import kiro_identity
+
+        identity = kiro_identity.read_current_identity(cfg)
+        if identity is None:
+            logger.debug("Kiro credential identity unavailable; keeping cached profile")
+            return cfg
+        profile_arn, api_region = kiro_identity.synchronized_values(cfg, identity)
+        if (
+            profile_arn == cfg.gateway.profile_arn
+            and api_region == cfg.gateway.api_region
+        ):
+            return cfg
+
+        previous_arn = cfg.gateway.profile_arn
+        previous_region = cfg.gateway.api_region
+
+        def _apply(latest: AppCfg) -> None:
+            """Update identity fields without replacing unrelated configuration."""
+            latest.gateway.profile_arn, latest.gateway.api_region = (
+                kiro_identity.synchronized_values(latest, identity)
+            )
+
+        try:
+            cfg = appconfig.update(_apply)
+        except (OSError, ValueError, TypeError):
+            logger.warning(
+                "Could not save the current Kiro account identity; using it for "
+                "this launch only. Check config.toml directory permissions if "
+                "this warning persists.",
+                exc_info=True,
+            )
+            _apply(cfg)
+        self._cfg = cfg
+        logger.info(
+            "synchronized Kiro account identity before gateway launch "
+            "(profile_changed={}, region_changed={}, enterprise_sso={})",
+            previous_arn != profile_arn,
+            previous_region != api_region,
+            identity.enterprise_sso,
+        )
+        return cfg
+
     def _sync_telemetry_secret(self, cfg: AppCfg) -> AppCfg:
         """Best-effort parent-side telemetry secret refresh before child launch.
 
@@ -818,6 +875,7 @@ class Supervisor:
         cfg = self._migrate_identity_if_needed(cfg)
         self._sync_port_if_changed(cfg)
         cfg = self._sync_telemetry_secret(cfg)
+        cfg = self._sync_kiro_identity(cfg)
         with self._state_lock:
             self._gw_health = "starting"
             self._last_error = None
@@ -850,6 +908,12 @@ class Supervisor:
             self._tunnel_seen_ready = False
         self._startup_ready.set()
         self._start_health_loop()
+        # Audit processing lives in this process and must keep running across a
+        # gateway restart, so ensure() is idempotent and stop() does not join it.
+        try:
+            audit_runtime.ensure()
+        except Exception:
+            logger.warning("audit pipeline failed to start", exc_info=True)
         return healthy
 
     def stop(self) -> None:
@@ -857,6 +921,14 @@ class Supervisor:
         self._stop_health_loop()
         self.tunnel.stop()
         self.gateway.stop()
+        # The child renames its open spool to *.ready on shutdown. Fold those
+        # into the current batch now; compression waits until the next launch.
+        # The uploader thread is intentionally left running so restart() does
+        # not interrupt an upload.
+        try:
+            audit_runtime.flush()
+        except Exception:
+            logger.debug("audit flush on stop failed", exc_info=True)
         with self._state_lock:
             self._gw_health = "stopped"
             self._last_error = None

@@ -24,6 +24,8 @@ dependencies = [
     "tiktoken",
     # Error / tracing for tray + gateway (DSN is public ingest-only).
     "sentry-sdk[fastapi]>=2.35.0",
+    # Audit batches are zstd-compressed in the tray process (not the gateway child).
+    "zstandard>=0.22",
 ]
 
 [project.optional-dependencies]

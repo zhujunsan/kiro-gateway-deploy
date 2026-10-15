@@ -50,7 +50,7 @@ hiddenimports = []
 
 for pkg in ("tiktoken", "tiktoken_ext", "uvicorn", "websockets", "httptools",
             "fastapi", "pystray", "loguru", "dotenv", "starlette", "pydantic",
-            "sentry_sdk"):
+            "sentry_sdk", "zstandard"):
     d, b, h = collect_all(pkg)
     datas += d; binaries += b; hiddenimports += h
 

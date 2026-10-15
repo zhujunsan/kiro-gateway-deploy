@@ -2,9 +2,11 @@
 """Local in-flight / recent request snapshots for the tray menu.
 
 Lives beside (not inside) usage telemetry: same ASGI wrap pattern as
-``telemetry.py`` / ``speedtest.py``, but **never uploads** prompt or reply
-text. The gateway child writes ``{data_dir}/request_activity.json``; the tray
-parent reads it on a short refresh loop.
+``telemetry.py`` / ``speedtest.py``. This channel never uploads prompt or
+reply text; that statement is about telemetry and the tray menu snapshot
+only. Conversation bodies are recorded by ``audit_capture`` when audit mode
+is ``best_effort``. The gateway child writes ``{data_dir}/request_activity.json``;
+the tray parent reads it on a short refresh loop.
 
 Tracks only ``POST /v1/chat/completions``, ``POST /v1/messages``, and
 ``POST /v1/responses``.
