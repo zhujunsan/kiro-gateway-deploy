@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 import socket
 import ssl
+import threading
 import time
 
 import httpx
@@ -79,6 +80,61 @@ def _make_sup(monkeypatch, tmp_path, provisioned=True):
     import kiro_gateway_tray.provision as pmod
     monkeypatch.setattr(pmod, "refresh_telemetry_secret", lambda *_a, **_k: "")
     return s
+
+
+@pytest.mark.parametrize("discover", [False, True])
+def test_tray_account_recheck_reloads_current_identity_before_refresh(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, discover: bool
+) -> None:
+    """The menu action reaches real startup synchronization, not just /usage."""
+    from kiro_gateway_tray import kiro_identity
+    from kiro_gateway_tray.tray import TrayApp, _ThrottleGate
+
+    s = _make_sup(monkeypatch, tmp_path)
+    monkeypatch.setattr(s, "_start_health_loop", lambda: True)
+    cfg = appconfig.load()
+    old_arn = "arn:aws:codewhisperer:us-east-1:111111111111:profile/OLD"
+    new_arn = "arn:aws:codewhisperer:eu-west-1:222222222222:profile/NEW"
+    cfg.gateway.profile_arn = old_arn
+    token_path = tmp_path / "kiro-auth-token.json"
+    cfg.gateway.kiro_creds_file = str(token_path)
+    token_path.write_text(json.dumps({"profileArn": old_arn}), encoding="utf-8")
+    appconfig.save(cfg)
+    assert s.start()
+    new_credentials = {"profileArn": new_arn} if not discover else {
+        "clientIdHash": "new-company", "accessToken": "current-token", "region": "eu-west-1",
+    }
+    token_path.write_text(json.dumps(new_credentials), encoding="utf-8")
+    lookups: list[tuple[str, str, str]] = []
+
+    def lookup(token: str, region: str, configured: str) -> str:
+        """Verify discovery uses the current token rather than the cached ARN."""
+        lookups.append((token, region, configured))
+        return new_arn
+
+    monkeypatch.setattr(kiro_identity, "discover_profile_arn", lookup)
+    # Build only the action controller: native UI and all account HTTP are stubbed.
+    app = object.__new__(TrayApp)
+    app.sup = s
+    app._gateway_action_gate = _ThrottleGate()
+    done = threading.Event()
+    refreshed: list[str] = []
+    monkeypatch.setattr(app, "_notify", lambda *_args: None)
+    monkeypatch.setattr(app, "_refresh_icon", lambda: None)
+    monkeypatch.setattr(app, "_request_redraw", done.set)
+    monkeypatch.setattr(
+        app, "_refresh_account_caches",
+        lambda: refreshed.append(s.gateway.start_cfg.gateway.profile_arn),
+    )
+
+    app._recheck_login()
+
+    assert done.wait(timeout=2.0)
+    assert refreshed == [new_arn]
+    assert s.gateway.start_cfg.gateway.api_region == "eu-west-1"
+    assert appconfig.load().gateway.profile_arn == new_arn
+    assert lookups == ([("current-token", "eu-west-1", old_arn)] if discover else [])
+    assert json.loads(token_path.read_text(encoding="utf-8")) == new_credentials
 
 
 def test_start_provisioned(monkeypatch, tmp_path):

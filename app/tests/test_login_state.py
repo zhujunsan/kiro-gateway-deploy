@@ -217,6 +217,15 @@ def test_login_alert_without_gateway_message():
     assert "网关说明" not in body
 
 
+@pytest.mark.parametrize("code", ["account_auth_required", "account_not_configured"])
+def test_login_alert_explains_credential_reload_and_restart(code: str) -> None:
+    """Manual detection must disclose the restart and active-request disruption."""
+    _title, body = login_state.login_alert_text(_signed_out(code))
+    assert "重新读取当前 Kiro 凭据" in body
+    assert "重启网关" in body
+    assert "中断进行中的请求" in body
+
+
 def test_any_login_required():
     assert login_state.any_login_required([LoginState(), _signed_out()]) is True
     assert login_state.any_login_required([LoginState(), LoginState()]) is False

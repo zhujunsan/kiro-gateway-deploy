@@ -13,6 +13,8 @@ import time
 
 import pytest
 
+from kiro_gateway_tray.tray import TrayApp
+
 
 @pytest.fixture(autouse=True)
 def _stub_pystray(monkeypatch):
@@ -181,7 +183,7 @@ def test_clicking_usage_row_explains_and_forces_recheck(monkeypatch):
     alerts: list[tuple[str, str]] = []
     monkeypatch.setattr(dialogs, "alert", lambda t, b: alerts.append((t, b)))
     rechecked = threading.Event()
-    monkeypatch.setattr(app._usage_cache, "recheck", rechecked.set)
+    monkeypatch.setattr(app, "_recheck_login", rechecked.set)
     monkeypatch.setattr(app, "_request_redraw", lambda: None)
 
     app._on_usage_row(None, None)
@@ -213,7 +215,7 @@ def test_failed_dialog_still_triggers_recheck(monkeypatch):
         dialogs, "alert", lambda *_a: (_ for _ in ()).throw(RuntimeError("no ui"))
     )
     rechecked = threading.Event()
-    monkeypatch.setattr(app._usage_cache, "recheck", rechecked.set)
+    monkeypatch.setattr(app, "_recheck_login", rechecked.set)
     monkeypatch.setattr(app, "_request_redraw", lambda: None)
 
     app._on_usage_row(None, None)
@@ -355,3 +357,172 @@ def test_cache_keeps_generic_failure_behaviour(monkeypatch):
     cache.refresh()
     time.sleep(0.2)
     assert cache.gate.login_required is False
+
+
+def _prepare_account_action(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[TrayApp, list[str], threading.Event]:
+    """Build an offline app with observable lifecycle and UI actions.
+
+    Args:
+        monkeypatch: Fixture replacing I/O and native UI calls.
+
+    Returns:
+        App, ordered action log, and worker-completion signal.
+    """
+    app = _make_app()
+    app._login_gate.note_login_required(_signed_out_state())
+    actions: list[str] = []
+    done = threading.Event()
+    monkeypatch.setattr(app, "_notify", lambda _title, body: actions.append(body))
+    monkeypatch.setattr(app, "_refresh_icon", lambda: None)
+    monkeypatch.setattr(app, "_request_redraw", done.set)
+    monkeypatch.setattr(app, "_refresh_account_caches", lambda: actions.append("refresh"))
+    return app, actions, done
+
+
+@pytest.mark.parametrize("gateway_state", ["running", "stopped", "error"])
+def test_manual_recheck_restarts_before_refreshing_account(
+    monkeypatch: pytest.MonkeyPatch, gateway_state: str
+) -> None:
+    """Every manual reread uses the supervisor restart and waits for readiness."""
+    app, actions, done = _prepare_account_action(monkeypatch)
+    monkeypatch.setattr(app.sup, "status", lambda: {"gateway": gateway_state})
+    monkeypatch.setattr(app.sup, "restart", lambda: actions.append("restart") or True)
+    monkeypatch.setattr(app.sup, "start", lambda: pytest.fail("restart was bypassed"))
+
+    app._recheck_login()
+
+    assert done.wait(timeout=2.0)
+    assert "重启" in actions[0]
+    assert actions[1:3] == ["restart", "refresh"]
+    assert "正在验证" in actions[3]
+    assert app._login_gate.login_required  # Restart alone does not prove login works.
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_failed_recheck_preserves_login_hint_and_skips_account_requests(
+    monkeypatch: pytest.MonkeyPatch, raises: bool
+) -> None:
+    """Discovery/startup failures must not fetch quota or announce login recovery."""
+    from kiro_gateway_tray.kiro_identity import ProfileDiscoveryError
+
+    app, actions, done = _prepare_account_action(monkeypatch)
+    old_gate = app._login_gate
+    monkeypatch.setattr(app.sup, "status", lambda: {"gateway": "running"})
+    monkeypatch.setattr(type(app.sup), "last_error", property(lambda _self: "profile lookup failed"))
+
+    def restart() -> bool:
+        """Simulate either a readiness failure or a blocked profile lookup."""
+        if raises:
+            raise ProfileDiscoveryError("profile lookup failed")
+        return False
+
+    monkeypatch.setattr(app.sup, "restart", restart)
+    app._recheck_login()
+
+    assert done.wait(timeout=2.0)
+    assert actions[-1] == "profile lookup failed"
+    assert "refresh" not in actions
+    assert not any("已重新读取" in message for message in actions)
+    assert app._login_gate is old_gate
+    assert app._login_gate.login_required
+    assert app._gateway_action_gate.try_enter()  # Failures release the click guard.
+    app._gateway_action_gate.done()
+
+
+def test_repeated_recheck_and_restart_clicks_share_one_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A manual reread and regular restart cannot race two child lifecycles."""
+    app, actions, done = _prepare_account_action(monkeypatch)
+    monkeypatch.setattr(app.sup, "status", lambda: {"gateway": "running"})
+    entered = threading.Event()
+    release = threading.Event()
+    calls: list[int] = []
+
+    def restart() -> bool:
+        """Hold one restart while more menu callbacks arrive."""
+        calls.append(threading.get_ident())
+        entered.set()
+        assert release.wait(timeout=2.0)
+        return True
+
+    monkeypatch.setattr(app.sup, "restart", restart)
+    app._recheck_login()
+    try:
+        assert entered.wait(timeout=2.0)
+        app._recheck_login()
+        app._on_start_or_restart(None, None)
+        assert len(calls) == 1
+        assert "refresh" not in actions
+        assert calls[0] != threading.get_ident()
+    finally:
+        release.set()
+        assert done.wait(timeout=2.0)
+    assert actions.count("refresh") == 1
+
+
+@pytest.mark.parametrize("old_login_required", [False, True])
+def test_account_refresh_replaces_caches_and_isolates_old_usage_results(
+    monkeypatch: pytest.MonkeyPatch, old_login_required: bool
+) -> None:
+    """Late old-account usage results cannot change the new cache or login gate."""
+    from kiro_gateway_tray import usage
+    from kiro_gateway_tray.async_cache import AsyncRefreshCache
+
+    app = _make_app()
+    old_usage = app._usage_cache
+    old_models = app._models_cache
+    old_usage._cache._value = "old quota"
+    old_models._value = ["old model"]
+    app._login_gate.note_login_required(_signed_out_state())
+    refreshes: list[tuple[object, bool]] = []
+    monkeypatch.setattr(
+        AsyncRefreshCache, "refresh",
+        lambda self, *, force=False: refreshes.append((self, force)),
+    )
+
+    app._refresh_account_caches()
+
+    assert app._usage_cache is not old_usage
+    assert app._models_cache is not old_models
+    assert app._usage_cache._cache.get() is None
+    assert app._models_cache.get() is None
+    assert app._login_gate.login_required  # Retain the hint until validation succeeds.
+    assert refreshes == [(app._usage_cache._cache, True), (app._models_cache, True)]
+
+    def old_result() -> dict[str, object]:
+        """Finish a quota request issued for the previous account."""
+        if old_login_required:
+            raise usage.LoginRequiredError(_signed_out_state())
+        return {"breakdowns": [{"used": 1, "limit": 10}]}
+
+    monkeypatch.setattr(usage, "fetch", old_result)
+    app._login_gate.note_signed_in()
+    old_usage._cache._fetch()
+    assert not app._login_gate.login_required
+    assert app._usage_cache._cache.get() is None
+
+
+def test_old_health_response_is_discarded_after_account_cache_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An overlapping pre-restart health probe must not latch the new account."""
+    from kiro_gateway_tray import usage
+
+    app = _make_app()
+    old_gate = app._login_gate
+    monkeypatch.setattr(app.sup, "status", lambda: {"gateway": "running"})
+    monkeypatch.setattr(app, "_notify", lambda *_args: pytest.fail("stale login notice"))
+
+    def old_health() -> object:
+        """Replace account caches while the earlier health probe is outstanding."""
+        app._init_account_caches()
+        return _signed_out_state()
+
+    monkeypatch.setattr(usage, "fetch_health", old_health)
+    app._poll_login_state()
+
+    assert app._login_gate is not old_gate
+    assert not app._login_gate.login_required

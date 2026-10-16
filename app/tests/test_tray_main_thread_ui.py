@@ -25,6 +25,8 @@ def _make_app(monkeypatch):
     from kiro_gateway_tray import macos_menu, tray as tray_mod
 
     app = tray_mod.TrayApp()
+    # Lifecycle UI tests isolate account I/O; account refresh has its own tests.
+    monkeypatch.setattr(app, "_refresh_account_caches", lambda: None)
     icon = MagicMock()
     app._icon = icon
 

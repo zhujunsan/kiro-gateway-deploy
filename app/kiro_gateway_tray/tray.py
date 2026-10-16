@@ -8,6 +8,8 @@ import time
 import webbrowser
 from typing import Callable
 
+import httpx
+
 from . import (
     __version__,
     GITHUB_REPO,
@@ -294,6 +296,7 @@ class TrayApp:
 
     _PROBE_MIN_INTERVAL = 2.0  # seconds between on-open health probes
     _USAGE_REFRESH_INTERVAL = 60  # seconds between background usage refreshes
+    _MODELS_CACHE_COOLDOWN = 14400  # seconds between model-list refreshes
     _ANNOUNCEMENT_REFRESH_INTERVAL = 3600  # seconds between announcement polls
     # Poll the activity file often enough to notice start/finish; do NOT redraw
     # on this cadence just to tick elapsed time (see _on_activity_update).
@@ -307,15 +310,7 @@ class TrayApp:
         self.sup.provision_callback = _first_run_setup
         self._icon = None
 
-        # One gate shared by the quota row and the /health probe, so "signed out"
-        # is a single fact rather than per-caller guesswork.
-        self._login_gate = login_state.LoginGate()
-        self._usage_cache = _UsageCache(
-            on_update=self._request_redraw, gate=self._login_gate
-        )
-        self._models_cache = AsyncRefreshCache(
-            usage.fetch_models, cooldown=14400, on_update=self._request_redraw,
-        )
+        self._init_account_caches()
         self._activity_cache = AsyncRefreshCache(
             request_activity.load_snapshot,
             cooldown=0,
@@ -335,6 +330,7 @@ class TrayApp:
         self._update_info = None
         self._update_gate = _ThrottleGate()
         self._probe_gate = _ThrottleGate(min_interval=self._PROBE_MIN_INTERVAL)
+        self._gateway_action_gate = _ThrottleGate()
         self._announcements: list[announcements.Announcement] = []
         self._announcements_loaded = False
         self._announcement_gate = _ThrottleGate()
@@ -342,6 +338,36 @@ class TrayApp:
         # Windows-only: auto-adapt the tray icon to the taskbar light/dark
         # theme. Constructed in run(); start() is a no-op off Windows.
         self._theme_watcher: ThemeWatcher | None = None
+
+    def _init_account_caches(
+        self, state: login_state.LoginState | None = None
+    ) -> None:
+        """Create caches isolated from any previous gateway account.
+
+        Args:
+            state: Previous login hint to retain until a fresh request succeeds.
+        """
+        self._login_gate = login_state.LoginGate()
+        if state is not None and state.login_required:
+            self._login_gate.note_login_required(state)
+        self._usage_cache = _UsageCache(
+            on_update=self._request_redraw, gate=self._login_gate
+        )
+        self._models_cache = AsyncRefreshCache(
+            usage.fetch_models,
+            cooldown=self._MODELS_CACHE_COOLDOWN,
+            on_update=self._request_redraw,
+        )
+
+    def _refresh_account_caches(self) -> None:
+        """Discard old account results and validate the newly started gateway.
+
+        Fresh cache and login-gate objects keep an old in-flight usage request
+        from restoring the previous account's quota or signed-out state.
+        """
+        self._init_account_caches(self._login_gate.state)
+        self._usage_cache.recheck()
+        self._models_cache.refresh(force=True)
 
     def _on_activity_update(self) -> None:
         """Redraw only when the activity snapshot's contents change.
@@ -987,33 +1013,61 @@ class TrayApp:
 
     # --- menu actions ---
 
-    def _on_start_or_restart(self, icon, _item):
-        restarting = self.sup.status()["gateway"] == "running"
+    def _on_start_or_restart(self, icon: object, _item: object) -> None:
+        """Start or restart through the shared account-synchronization workflow."""
+        self._start_or_restart_gateway()
 
-        def _work():
+    def _start_or_restart_gateway(self, *, recheck_login: bool = False) -> None:
+        """Reload credentials off the UI thread before refreshing account data.
+
+        Args:
+            recheck_login: Whether the user explicitly requested account reread.
+                This always restarts, including an unhealthy running child.
+        """
+        if not self._gateway_action_gate.try_enter():
+            return
+        restarting = recheck_login or self.sup.status()["gateway"] == "running"
+
+        def _work() -> None:
+            """Run the supervisor lifecycle once and report actionable failures."""
+            logger.info(
+                "gateway account reload requested (manual_recheck={}, restarting={})",
+                recheck_login, restarting,
+            )
             try:
                 if restarting:
-                    # A restart first drains the running gateway, which can take
-                    # a few seconds when a streaming reply is still open (see
-                    # gateway.GRACEFUL_STOP_TIMEOUT). Without this the click
-                    # looks ignored until the whole restart finishes.
-                    self._notify(APP_NAME, "正在重启网关…")
+                    # Notify before draining a live streaming response.
+                    message = (
+                        "正在重新读取 Kiro 账号并重启网关…"
+                        if recheck_login else "正在重启网关…"
+                    )
+                    self._notify(APP_NAME, message)
                     ok = self.sup.restart()
                     verb = "已重启"
                 else:
                     ok = self.sup.start()
                     verb = "已启动"
-                cfg = appconfig.load()
                 if ok:
-                    self._notify(APP_NAME, f"{verb}\n{_tunnel_url(cfg)}")
+                    self._refresh_account_caches()
+                    if recheck_login:
+                        self._notify(
+                            APP_NAME,
+                            "已重新读取 Kiro 账号，正在验证额度与模型列表。",
+                        )
+                    else:
+                        cfg = appconfig.load()
+                        self._notify(APP_NAME, f"{verb}\n{_tunnel_url(cfg)}")
                 else:
                     detail = self.sup.last_error or "网关未能就绪，请查看日志目录。"
                     self._notify(f"{APP_NAME} 错误", detail)
-            except Exception as e:
-                self._notify(f"{APP_NAME} 错误", str(e)[:200])
-            # Never call icon.update_menu() here — worker thread; see _request_redraw.
-            self._refresh_icon()
-            self._request_redraw()
+            except (OSError, RuntimeError, ValueError, httpx.HTTPError) as error:
+                self._notify(f"{APP_NAME} 错误", str(error)[:200])
+            finally:
+                self._gateway_action_gate.done()
+                # Worker threads must marshal every UI change to the main thread.
+                self._refresh_icon()
+                self._request_redraw()
+
         threading.Thread(target=_work, daemon=True).start()
 
     def _on_stop(self, icon, _item):
@@ -1136,10 +1190,8 @@ class TrayApp:
         self._recheck_login()
 
     def _recheck_login(self) -> None:
-        """Re-probe credential state now, bypassing the signed-out backoff."""
-        self._login_gate.force_recheck()
-        self._usage_cache.recheck()
-        self._request_redraw()
+        """Restart with current Kiro credentials, then validate account data."""
+        self._start_or_restart_gateway(recheck_login=True)
 
     def _poll_login_state(self) -> None:
         """Refresh credential state from /health, which never calls upstream.
@@ -1150,21 +1202,25 @@ class TrayApp:
         """
         if self.sup.status()["gateway"] != "running":
             return
-        was_required = self._login_gate.login_required
+        gate = self._login_gate
+        was_required = gate.login_required
         try:
             state = usage.fetch_health()
         except Exception:
             logger.debug("health login probe failed", exc_info=True)
             return
+        if gate is not self._login_gate:
+            # A restart replaced this account while the old probe was in flight.
+            return
 
         if state.login_required:
-            self._login_gate.note_login_required(state)
+            gate.note_login_required(state)
         elif was_required:
             # Credentials recovered (user signed in): resume normal polling.
-            self._login_gate.note_signed_in()
+            gate.note_signed_in()
 
-        if self._login_gate.login_required != was_required:
-            self._notify_login_change(self._login_gate.state, was_required)
+        if gate.login_required != was_required:
+            self._notify_login_change(gate.state, was_required)
             self._request_redraw()
 
     def _notify_login_change(

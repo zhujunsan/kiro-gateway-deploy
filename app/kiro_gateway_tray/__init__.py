@@ -1,6 +1,6 @@
 """Kiro Gateway tray app."""
 
-__version__ = "0.5.2"
+__version__ = "0.5.3"
 
 # Upstream gateway this app vendors. We use a fork that already has the
 # required model aliases and the /usage endpoint baked into source, so no

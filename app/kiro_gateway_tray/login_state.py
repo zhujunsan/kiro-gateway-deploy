@@ -252,6 +252,7 @@ def login_alert_text(state: LoginState) -> tuple[str, str]:
     else:
         title = "Kiro 登录已过期"
         action = "请打开 Kiro 重新登录（或执行 kiro-cli login），然后点击「重新检测」。"
+    action += "\n重新检测会重新读取当前 Kiro 凭据并重启网关，可能中断进行中的请求。"
     detail = state.message.strip()
     body = f"{action}\n\n网关说明：{detail}" if detail else action
     return title, body
