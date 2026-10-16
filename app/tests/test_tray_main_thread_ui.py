@@ -503,3 +503,45 @@ def test_tunnel_title_stopped_no_detail(monkeypatch):
     title = app._tunnel_title()
     assert "已停止" in title
     assert "(" not in title
+
+
+def test_first_run_setup_asks_only_for_tunnel_credentials(monkeypatch, tmp_path):
+    """First-run setup collects the provision URL and activation code only."""
+    monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
+    from kiro_gateway_tray import appconfig
+    from kiro_gateway_tray import tray as tray_mod
+
+    monkeypatch.setattr(appconfig, "_CACHE", None)
+    prompts: list[tuple[str, str, dict]] = []
+
+    def fake_prompt(title, prompt, **kwargs):
+        prompts.append((title, prompt, kwargs))
+        if "1/2" in title:
+            return "https://provision.example.com"
+        return "activation-secret"
+
+    monkeypatch.setattr(tray_mod.dialogs, "prompt_validated", fake_prompt)
+    monkeypatch.setattr(tray_mod.dialogs, "generate_api_key", lambda: "generated-key-123")
+
+    cfg = appconfig.AppCfg()
+    cfg.gateway.profile_arn = "arn:aws:codewhisperer:us-east-1:111111111111:profile/OLD"
+    cfg.gateway.api_region = "ap-northeast-1"
+
+    secret = tray_mod._first_run_setup(cfg)
+
+    assert secret == "activation-secret"
+    assert [title for title, _, _ in prompts] == [
+        f"{tray_mod.APP_NAME} - 隧道配置 (1/2)",
+        f"{tray_mod.APP_NAME} - 隧道配置 (2/2)",
+    ]
+    assert prompts[1][2]["hidden"] is True
+    assert all("profileArn" not in prompt and "ARN" not in title for title, prompt, _ in prompts)
+    assert cfg.cloudflare.provision_url == "https://provision.example.com"
+    assert cfg.gateway.proxy_api_key == "generated-key-123"
+    assert cfg.gateway.profile_arn.endswith("profile/OLD")
+    assert cfg.gateway.api_region == "ap-northeast-1"
+    saved = appconfig.load()
+    assert saved.cloudflare.provision_url == "https://provision.example.com"
+    assert saved.gateway.proxy_api_key == "generated-key-123"
+    assert saved.gateway.profile_arn == cfg.gateway.profile_arn
+    assert not appconfig.is_provisioned(saved)

@@ -104,19 +104,16 @@ def _speedtest_url(cfg) -> str:
 
 
 def _first_run_setup(cfg) -> str:
-    """Guided setup. Cloudflare credentials + Kiro profileArn.
+    """Guided setup for the Cloudflare tunnel.
 
-    Gateway API key is auto-generated (strong random).
-    profileArn is entered by the user (the gateway only writes it back into the
-    token file after a successful run, so it is usually unreadable on first run);
-    api_region is parsed from the entered ARN.
+    Gateway API key is auto-generated. ``profileArn`` and ``api_region`` are
+    resolved from the current Kiro login when the gateway starts, so this
+    wizard does not ask for them.
     Returns the shared secret for provisioning.
     """
-    from . import provision as _prov
-
-    # --- Page 1/3: Provision 服务地址 (URL, validated) ---
+    # --- Page 1/2: Provision 服务地址 (URL, validated) ---
     url = dialogs.prompt_validated(
-        f"{APP_NAME} - 隧道配置 (1/3)",
+        f"{APP_NAME} - 隧道配置 (1/2)",
         "请输入 Provision 服务地址：\n\n由管理员提供的隧道签发服务 URL。",
         validate=dialogs.validate_url,
         default=cfg.cloudflare.provision_url or "",
@@ -124,32 +121,13 @@ def _first_run_setup(cfg) -> str:
     cfg.cloudflare.provision_url = url
     appconfig.save(cfg)
 
-    # --- Page 2/3: 激活码（共享密钥, hidden, validated） ---
+    # --- Page 2/2: 激活码（共享密钥, hidden, validated） ---
     secret = dialogs.prompt_validated(
-        f"{APP_NAME} - 隧道配置 (2/3)",
+        f"{APP_NAME} - 隧道配置 (2/2)",
         f"请输入激活码（共享密钥）：\n\nWorker: {url}",
         validate=dialogs.validate_secret,
         hidden=True,
     )
-
-    # --- Page 3/3: Kiro profileArn (multiline, validated) ---
-    # profileArn 由 Kiro Gateway 成功运行后才写回 kiro-auth-token.json，首次初始化
-    # 通常读不到，需要用户手动粘贴。ARN 很长，用多行可换行的输入框便于核对；
-    # api_region 从该 ARN 中解析得到。
-    default_arn = _prov.read_profile_arn(cfg)
-    profile_arn = dialogs.prompt_validated(
-        f"{APP_NAME} - Profile ARN (3/3)",
-        "请输入 Kiro profileArn：\n\n"
-        "形如 arn:aws:codewhisperer:us-east-1:123456789012:profile/XXXX\n"
-        "（首次使用时 Kiro Gateway 尚未写回，需要手动填写）",
-        validate=dialogs.validate_profile_arn,
-        default=default_arn,
-        multiline=True,
-    )
-    cfg.gateway.profile_arn = profile_arn
-    region = _prov.region_from_arn(profile_arn)
-    if region:
-        cfg.gateway.api_region = region
 
     # --- Auto-generate Gateway API key ---
     if not cfg.gateway.proxy_api_key or cfg.gateway.proxy_api_key == "change-me":

@@ -183,6 +183,75 @@ def _osascript_input(title: str, prompt: str, default: str = "", hidden: bool = 
     raise RuntimeError("无法解析对话框返回值。")
 
 
+def _selector_name(action: object) -> str:
+    """Normalize an AppKit selector to its name, such as ``paste:``."""
+    if action is None:
+        return ""
+    if isinstance(action, bytes):
+        return action.decode("ascii", "ignore")
+    return str(action)
+
+
+def _menu_contains_action(menu: object, name: str) -> bool:
+    """Return whether ``menu`` or one of its submenus already has ``name``."""
+    if menu is None:
+        return False
+    try:
+        count = int(menu.numberOfItems())
+    except (AttributeError, TypeError, ValueError):
+        return False
+    for index in range(count):
+        item = menu.itemAtIndex_(index)
+        if _selector_name(item.action()) == name:
+            return True
+        submenu = item.submenu() if hasattr(item, "submenu") else None
+        if _menu_contains_action(submenu, name):
+            return True
+    return False
+
+
+def _ensure_cocoa_edit_menu() -> None:
+    """Install Cut/Copy/Paste key equivalents for a menu-bar-only app.
+
+    ``LSUIElement`` apps have no application menu. AppKit does not handle
+    Cmd+C/V/X/A inside ``NSTextField`` itself: it looks those shortcuts up on
+    the main menu and sends ``paste:`` down the responder chain. The field
+    editor's context menu calls ``paste:`` directly, so right-click paste
+    still works when the shortcut does not.
+    """
+    from AppKit import NSApplication, NSMenu, NSMenuItem
+
+    app = NSApplication.sharedApplication()
+    main = app.mainMenu()
+    if main is not None and _menu_contains_action(main, "paste:"):
+        return
+    if main is None:
+        main = NSMenu.alloc().init()
+        app.setMainMenu_(main)
+
+    edit = NSMenu.alloc().initWithTitle_("编辑")
+    for spec in (
+        ("撤销", "undo:", "z"),
+        ("重做", "redo:", "Z"),
+        None,
+        ("剪切", "cut:", "x"),
+        ("拷贝", "copy:", "c"),
+        ("粘贴", "paste:", "v"),
+        None,
+        ("全选", "selectAll:", "a"),
+    ):
+        if spec is None:
+            edit.addItem_(NSMenuItem.separatorItem())
+            continue
+        title, action, key = spec
+        edit.addItem_(
+            NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, action, key)
+        )
+    top = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("编辑", None, "")
+    top.setSubmenu_(edit)
+    main.addItem_(top)
+
+
 def _cocoa_input(
     title: str,
     prompt: str,
@@ -211,6 +280,7 @@ def _cocoa_input(
     )
 
     NSApplication.sharedApplication()
+    _ensure_cocoa_edit_menu()
 
     alert = NSAlert.alloc().init()
     alert.setMessageText_(title)

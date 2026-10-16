@@ -726,9 +726,9 @@ class Supervisor:
         """Persist Kiro's current account identity before child launch.
 
         Kiro replaces its credential cache when the user changes personal or
-        company accounts. The tray historically kept the profile ARN entered
-        during first-run setup forever, which could combine a new account token
-        with the previous account's ARN and break quota/model requests.
+        company accounts. A cached profile ARN from an earlier login could
+        combine a new account token with the previous account's ARN and break
+        quota/model requests.
 
         Args:
             cfg: Configuration loaded at the beginning of startup.

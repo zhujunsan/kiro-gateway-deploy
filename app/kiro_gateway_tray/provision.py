@@ -87,11 +87,11 @@ def _read_per_user_client_id(cfg: AppCfg, data: dict | None) -> str | None:
 
 
 def read_profile_arn(cfg: AppCfg) -> str:
-    """Return profileArn: user-entered config value first, then the token file.
+    """Return profileArn: configured value first, then the token file.
 
-    The Kiro Gateway only writes profileArn back into kiro-auth-token.json after
-    it has run successfully, so on first run it is usually absent. The user fills
-    it in during setup, after which the config value is authoritative."""
+    Startup normally writes the ARN discovered from the current Kiro login into
+    config. This helper remains for callers that need the best currently known
+    value before that sync, including a token file that already contains one."""
     if cfg.gateway.profile_arn:
         return cfg.gateway.profile_arn
     data = _read_kiro_token(cfg)

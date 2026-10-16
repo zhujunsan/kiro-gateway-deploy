@@ -235,6 +235,101 @@ def test_cocoa_alert_sets_icon(monkeypatch, tmp_path):
     assert alert.ran is True
 
 
+def test_cocoa_edit_menu_adds_paste_shortcut_once(monkeypatch):
+    """Cmd+V needs an Edit menu item; a second call must not add another."""
+
+    class _Item:
+        def __init__(self, title, action, key):
+            self.title = title
+            self._action = action
+            self.key = key
+            self._submenu = None
+
+        def action(self):
+            return self._action
+
+        def submenu(self):
+            return self._submenu
+
+        def setSubmenu_(self, menu):
+            self._submenu = menu
+
+    class _Menu:
+        def __init__(self):
+            self.items = []
+            self.title = ""
+
+        @classmethod
+        def alloc(cls):
+            return cls()
+
+        def init(self):
+            return self
+
+        def initWithTitle_(self, title):
+            self.title = title
+            return self
+
+        def numberOfItems(self):
+            return len(self.items)
+
+        def itemAtIndex_(self, index):
+            return self.items[index]
+
+        def addItem_(self, item):
+            self.items.append(item)
+
+    class _MenuItem:
+        @classmethod
+        def alloc(cls):
+            return cls()
+
+        def initWithTitle_action_keyEquivalent_(self, title, action, key):
+            return _Item(title, action, key)
+
+        @staticmethod
+        def separatorItem():
+            return _Item("", None, "")
+
+    class _App:
+        def __init__(self):
+            self.menu = None
+
+        def mainMenu(self):
+            return self.menu
+
+        def setMainMenu_(self, menu):
+            self.menu = menu
+
+    app = _App()
+
+    class _NSApp:
+        @staticmethod
+        def sharedApplication():
+            return app
+
+    monkeypatch.setitem(
+        sys.modules,
+        "AppKit",
+        types.SimpleNamespace(NSApplication=_NSApp, NSMenu=_Menu, NSMenuItem=_MenuItem),
+    )
+    dialogs._ensure_cocoa_edit_menu()
+    dialogs._ensure_cocoa_edit_menu()
+
+    paste_items = []
+
+    def walk(menu):
+        if menu is None:
+            return
+        for item in menu.items:
+            if item.action() == "paste:" and item.key == "v":
+                paste_items.append(item)
+            walk(item.submenu())
+
+    walk(app.menu)
+    assert len(paste_items) == 1
+
+
 def test_run_cocoa_modal_runs_inline_on_main_thread(monkeypatch):
     class _Thread:
         @staticmethod
