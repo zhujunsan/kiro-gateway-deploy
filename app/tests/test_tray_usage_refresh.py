@@ -404,18 +404,16 @@ def test_manual_recheck_restarts_before_refreshing_account(
 def test_failed_recheck_preserves_login_hint_and_skips_account_requests(
     monkeypatch: pytest.MonkeyPatch, raises: bool
 ) -> None:
-    """Discovery/startup failures must not fetch quota or announce login recovery."""
-    from kiro_gateway_tray.kiro_identity import ProfileDiscoveryError
-
+    """Startup failures must not fetch quota or announce login recovery."""
     app, actions, done = _prepare_account_action(monkeypatch)
     old_gate = app._login_gate
     monkeypatch.setattr(app.sup, "status", lambda: {"gateway": "running"})
     monkeypatch.setattr(type(app.sup), "last_error", property(lambda _self: "profile lookup failed"))
 
     def restart() -> bool:
-        """Simulate either a readiness failure or a blocked profile lookup."""
+        """Simulate either a readiness failure or a startup exception."""
         if raises:
-            raise ProfileDiscoveryError("profile lookup failed")
+            raise RuntimeError("profile lookup failed")
         return False
 
     monkeypatch.setattr(app.sup, "restart", restart)

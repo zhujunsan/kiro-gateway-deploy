@@ -726,9 +726,10 @@ class Supervisor:
         """Persist Kiro's current account identity before child launch.
 
         Kiro replaces its credential cache when the user changes personal or
-        company accounts. A cached profile ARN from an earlier login could
-        combine a new account token with the previous account's ARN and break
-        quota/model requests.
+        company accounts. An ARN present in that file always wins. When it is
+        missing (common for enterprise SSO), the cached ARN is passed only as a
+        hint: the gateway verifies it against the current login and replaces
+        it, or discovers one from scratch when the hint is empty.
 
         Args:
             cfg: Configuration loaded at the beginning of startup.
@@ -742,12 +743,8 @@ class Supervisor:
         if identity is None:
             logger.debug("Kiro credential identity unavailable; keeping cached profile")
             return cfg
-        try:
-            identity = kiro_identity.resolve_profile_identity(cfg, identity)
-        except kiro_identity.ProfileDiscoveryError as error:
-            self._set_gateway_error(str(error))
-            logger.warning("Kiro profile discovery blocked gateway launch: {}", error)
-            raise
+        # Local files only: the gateway discovers or verifies the profile with a
+        # freshly refreshed token, so an expired token here cannot block launch.
         profile_arn, api_region = kiro_identity.synchronized_values(cfg, identity)
         if (
             profile_arn == cfg.gateway.profile_arn

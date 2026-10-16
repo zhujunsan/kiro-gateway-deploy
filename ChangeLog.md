@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.5.5 (2026-10-16)
+
+**Fixed**
+- 企业 SSO 账号不再需要手填 `profileArn`。登录文件里没有 ARN，或 access token 已过期时，网关先刷新 token，再用新 token 查询 `ListAvailableProfiles`；查到唯一 profile 后写回 `kiro-auth-token.json`，下次启动由托盘同步进配置。
+- 托盘启动不再因为 profile 查询失败而阻止网关启动。登录文件里的 `region` 只作为 SSO 登录区域，不再当成 API 区域；API 区域只从 profile ARN 解析。
+- profile 查询按「已配置 ARN 所在区域、当前 API 区域、`us-east-1`、`eu-central-1`」依次尝试。查不到、账号下有多个 profile，或网络不可达时给出明确原因；已配置 ARN 且失败不是登录失效时，沿用该 ARN 启动并记录警告。
+
+**Changed**
+- 同步内嵌网关和 Docker 镜像至 `main-3b432f7`。
+
 ## v0.5.4 (2026-10-16)
 
 **Changed**
