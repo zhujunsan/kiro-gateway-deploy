@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.5.7 (2026-10-22)
+
+**New**
+- 思考强度改为原生透传，和 Kiro IDE 一致。Claude 4.6 及以上、GPT-5.6、Kimi 会把 effort 作为上游原生字段发出，不再只是在 prompt 里注入思考预算；其他模型保持原来的行为。
+- 支持多种方式指定档位：OpenAI 的 `reasoning_effort`、Anthropic 的 `thinking` / `output_config.effort`（Claude Code）、Responses 的 `reasoning.effort`，以及模型名后缀（如 `kiro-o-5-high`、`gpt-5.6-luna-low`，Cursor 自定义模型可用，优先级最高）。模型不支持的档位映射到最近的合法档位，例如 4.6 上的 `xhigh` 会变成 `high`。
+- `max` 档同时放开到该模型允许的最大输出长度，避免还没给出答案就被截断。`max` 明显更慢、更贵，日常建议用 `high` 或 `xhigh`。
+- 原生思考内容会正常输出：OpenAI 为 `reasoning_content`，Anthropic 为 thinking 块，Responses 为推理摘要。
+- 思考签名回传：Anthropic thinking 块与 Responses 推理项携带上游真实签名，客户端下一轮带回后会写入历史，模型可以看到自己之前的推理，对工具调用循环更连贯。OpenAI Chat 协议没有对应字段，不支持回传。
+
+**Fixed**
+- Codex 选择 `max` 推理档位时不再报 422。
+- 上游因网关附加的思考相关字段拒绝请求（档位不合法、输出上限越界、签名无效、模型不支持）时，网关会自动修正或去掉这些字段并重试，请求照常成功，日志中记录一条警告。
+
+**Changed**
+- 同步内嵌网关和 Docker 镜像至 `main-e10ced8`。
+- 新增开关：`NATIVE_EFFORT=false` 恢复旧的思考行为；`NATIVE_EFFORT_MAX_TIER_OUTPUT_TOKENS=false` 让 `max` 档保持上游默认输出上限。
+
 ## v0.5.6 (2026-10-21)
 
 **Fixed**
