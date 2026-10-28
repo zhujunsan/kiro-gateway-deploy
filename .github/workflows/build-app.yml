@@ -31,7 +31,8 @@ jobs:
             arch: x64
           - os: windows-latest
             arch: amd64
-          - os: ubuntu-latest
+          # Python 3.11.9 has no Ubuntu 26.04 build; keep packaging reproducible.
+          - os: ubuntu-24.04
             arch: amd64
     env:
       IS_RELEASE: ${{ startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch' }}
@@ -129,7 +130,7 @@ jobs:
     name: publish release
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
@@ -167,7 +168,7 @@ jobs:
     name: bump homebrew cask
     needs: release
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:

@@ -1,4 +1,9 @@
 # app/tests/test_inject_metadata.py
+import re
+from pathlib import Path
+
+import pytest
+
 from scripts.inject_metadata import inject
 
 SAMPLE = '''\
@@ -39,3 +44,27 @@ def test_upstream_overrides_optional():
 
 def test_empty_env_is_noop():
     assert inject(SAMPLE, {}) == SAMPLE
+
+
+@pytest.mark.parametrize("job", ["build", "release", "bump-cask"])
+def test_release_jobs_pin_linux_for_fixed_python(job: str) -> None:
+    """Keep all Linux release jobs on an image that provides Python 3.11.9.
+
+    Args:
+        job: Release workflow job whose runner and Python setup must agree.
+    """
+    root = Path(__file__).resolve().parents[2]
+    workflow = (root / ".github" / "workflows" / "build-app.yml").read_text(
+        encoding="utf-8"
+    )
+    match = re.search(
+        rf"^  {re.escape(job)}:\n(.*?)(?=^  [\w-]+:|\Z)",
+        workflow,
+        re.MULTILINE | re.DOTALL,
+    )
+    assert match is not None, f"Release job {job} is missing"
+    body = match.group(1)
+    selector = "- os:" if job == "build" else "runs-on:"
+    assert f"{selector} ubuntu-24.04" in body
+    assert "ubuntu-latest" not in body
+    assert 'python-version: "3.11.9"' in body
