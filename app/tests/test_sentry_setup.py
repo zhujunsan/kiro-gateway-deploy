@@ -198,8 +198,8 @@ class TestSignedOutFiltering:
 
     Sentry KIRO-GATEWAY-TRAY-D was 1195 events / 36 users of exactly this, with
     one account reaching ``consecutive=6883``. The tray now shows an actionable
-    menu prompt and stops polling, so these events add nothing — but genuine
-    outages (DNS / TLS / timeout / proxy) must still report.
+    menu prompt and stops polling, so these events add nothing. Transport
+    outages are classified by cause in ``TestUsageOutageCauseFiltering``.
     """
 
     def test_drops_usage_auth_required_message(self):
@@ -258,8 +258,9 @@ class TestSignedOutFiltering:
             "ConnectTimeout:",
         ],
     )
-    def test_keeps_genuine_usage_outages(self, detail):
-        """Network failures are actionable and must survive the filter."""
+    def test_keeps_cause_less_legacy_usage_outages(self, detail):
+        """The signed-out filter must not eat transport failures, and a legacy
+        message with no ``cause`` tag cannot be classified, so it passes."""
         event = {
             "message": f"GET /usage upstream unreachable (consecutive=5): {detail}",
             "tags": {"usage_outage": "true", "subsystem": "usage_upstream"},
@@ -279,7 +280,8 @@ class TestSignedOutFiltering:
         assert ss.before_send(event, {}) is event
 
     def test_keeps_connect_failure_to_oidc_host(self):
-        """Same host, but a transport failure — still a real outage."""
+        """Same host, but a transport failure — not a signed-out event. (No
+        ``usage_outage`` tag or cause, so the cause filter leaves it alone.)"""
         event = {
             "message": (
                 "GET /usage upstream unreachable (consecutive=5): ConnectError: "
@@ -298,6 +300,115 @@ class TestSignedOutFiltering:
             "tags": [["incident.code", "usage_auth_required"]],
         }
         assert ss.before_send(event, {}) is None
+
+
+class TestUsageOutageCauseFiltering:
+    """External /usage outage causes never open an Issue (gateway policy).
+
+    Current gateways only breadcrumb them; older vendored gateways still call
+    ``capture_message`` with ``usage_outage_cause`` and log WARNING, so the tray
+    drops both. ``upstream_status`` / ``other`` outages must still report.
+    """
+
+    @staticmethod
+    def _outage(cause: str, *, tags: bool = True, detail: str = "ConnectError: x") -> dict:
+        event: dict = {
+            "message": f"GET /usage upstream unreachable (cause={cause}, consecutive=5): {detail}",
+            "level": "error",
+        }
+        if tags:
+            event["tags"] = {
+                "subsystem": "usage_upstream",
+                "usage_outage": "true",
+                "usage_outage_cause": cause,
+            }
+        return event
+
+    @pytest.mark.parametrize("cause", ["tls", "dns", "timeout", "connect"])
+    def test_drops_external_cause_from_legacy_gateway(self, cause):
+        assert ss.before_send(self._outage(cause), {}) is None
+
+    @pytest.mark.parametrize("cause", ["upstream_status", "other"])
+    def test_keeps_actionable_cause(self, cause):
+        event = self._outage(cause, detail="HTTPStatusError: Server error '503'")
+        assert ss.before_send(event, {}) is event
+
+    def test_matches_set_with_upstream_constant(self):
+        """Literals must equal the gateway's USAGE_OUTAGE_EXTERNAL_CAUSES."""
+        assert ss._USAGE_OUTAGE_EXTERNAL_CAUSES == {"tls", "dns", "timeout", "connect"}
+
+    @pytest.mark.parametrize("value", ["TLS", " dns ", "Timeout"])
+    def test_tag_is_case_and_space_insensitive(self, value):
+        event = self._outage("x")
+        event["tags"]["usage_outage_cause"] = value
+        assert ss.before_send(event, {}) is None
+
+    def test_list_shaped_tags(self):
+        event = {
+            "message": "GET /usage upstream unreachable (cause=dns, consecutive=5): x",
+            "tags": [["usage_outage", "true"], ["usage_outage_cause", "dns"]],
+        }
+        assert ss.before_send(event, {}) is None
+
+    def test_falls_back_to_message_cause_when_tag_missing(self):
+        event = self._outage("timeout")
+        del event["tags"]["usage_outage_cause"]
+        assert ss.before_send(event, {}) is None
+
+    def test_message_cause_needs_usage_outage_tag(self):
+        """Untagged text alone is not trusted: an unrelated message quoting the
+        format must not be silently dropped."""
+        event = self._outage("dns", tags=False)
+        assert ss.before_send(event, {}) is event
+
+    def test_tag_wins_over_message_text(self):
+        event = self._outage("upstream_status")
+        event["message"] = "GET /usage upstream unreachable (cause=dns, consecutive=5): x"
+        assert ss.before_send(event, {}) is event
+
+    def test_unknown_cause_kept(self):
+        event = self._outage("proxy")
+        assert ss.before_send(event, {}) is event
+
+    def test_empty_cause_tag_without_outage_tag_kept(self):
+        event = {"message": "x", "tags": {"usage_outage_cause": ""}}
+        assert ss.before_send(event, {}) is event
+
+    def test_signed_out_oidc_400_still_dropped_with_other_cause(self):
+        event = self._outage(
+            "upstream_status",
+            detail=("HTTPStatusError: Client error '400 Bad Request' for url "
+                    "'https://oidc.us-east-1.amazonaws.com/token'"),
+        )
+        assert ss.before_send(event, {}) is None
+
+    @pytest.mark.parametrize("cause", ["tls", "dns", "timeout", "connect"])
+    def test_before_send_log_drops_legacy_external_outage_warning(self, cause):
+        payload = {
+            "severity_text": "warn", "severity_number": 13,
+            "body": (f"GET /usage upstream outage after 5 consecutive soft failures "
+                     f"(cause={cause}, last request attempts=3): ConnectError: x"),
+        }
+        assert ss.before_send_log(payload, {}) is None
+
+    @pytest.mark.parametrize("cause", ["upstream_status", "other"])
+    def test_before_send_log_keeps_actionable_outage_warning(self, cause):
+        payload = {
+            "severity_text": "warn", "severity_number": 13,
+            "body": (f"GET /usage upstream outage started after 5 consecutive soft "
+                     f"failures (cause={cause}, last request attempts=3): x"),
+        }
+        assert ss.before_send_log(payload, {}) is payload
+
+    def test_before_send_log_ignores_cause_in_unrelated_body(self):
+        payload = {"severity_text": "warn", "severity_number": 13,
+                   "body": "tunnel reconnect (cause=dns)"}
+        assert ss.before_send_log(payload, {}) is payload
+
+    def test_before_send_log_tolerates_missing_or_non_str_body(self):
+        for body in (None, 123, {"x": 1}):
+            payload = {"severity_text": "error", "severity_number": 17, "body": body}
+            assert ss.before_send_log(payload, {}) is payload
 
     def test_tolerates_non_dict_contexts(self):
         event = {"message": "harmless", "contexts": {"trace": "not-a-dict"}}
@@ -1648,3 +1759,179 @@ class TestLoginRequiredIncidentFiltering:
             },
         }
         assert ss.before_send(event, {}) is event
+
+
+# --- add_breadcrumb / local-only records ----------------------------------------
+
+
+class _RecordingSdk:
+    def __init__(self):
+        self.crumbs: list[dict] = []
+
+    def add_breadcrumb(self, crumb):
+        self.crumbs.append(crumb)
+
+
+@pytest.fixture
+def _fresh_pending(monkeypatch):
+    monkeypatch.setattr(ss, "_PENDING_BREADCRUMBS", [])
+
+
+def test_add_breadcrumb_buffers_until_init_then_replays_once(monkeypatch, _fresh_pending):
+    sdk = _RecordingSdk()
+    monkeypatch.setitem(__import__("sys").modules, "sentry_sdk", sdk)
+
+    ss.add_breadcrumb(category="logging.fallback", message="m", level="warning", data={"a": 1})
+    assert sdk.crumbs == []
+    assert len(ss._PENDING_BREADCRUMBS) == 1
+
+    monkeypatch.setattr(ss, "_READY", True)
+    ss._replay_pending_breadcrumbs()
+    ss._replay_pending_breadcrumbs()  # second replay must not duplicate
+
+    assert sdk.crumbs == [{
+        "type": "default", "category": "logging.fallback", "message": "m",
+        "level": "warning", "data": {"a": 1},
+    }]
+    assert ss._PENDING_BREADCRUMBS == []
+
+
+def test_add_breadcrumb_when_ready_goes_straight_to_sdk(monkeypatch, _fresh_pending):
+    sdk = _RecordingSdk()
+    monkeypatch.setitem(__import__("sys").modules, "sentry_sdk", sdk)
+    monkeypatch.setattr(ss, "_READY", True)
+
+    ss.add_breadcrumb(category="c", message="m")
+
+    assert len(sdk.crumbs) == 1
+    assert sdk.crumbs[0]["level"] == "info"
+    assert ss._PENDING_BREADCRUMBS == []
+
+
+def test_add_breadcrumb_buffer_is_bounded(_fresh_pending):
+    for i in range(ss._MAX_PENDING_BREADCRUMBS + 5):
+        ss.add_breadcrumb(category="c", message=str(i))
+    assert len(ss._PENDING_BREADCRUMBS) == ss._MAX_PENDING_BREADCRUMBS
+
+
+def test_add_breadcrumb_never_raises_when_sdk_breaks(monkeypatch, _fresh_pending):
+    class _Broken:
+        @staticmethod
+        def add_breadcrumb(crumb):
+            raise RuntimeError("sdk exploded")
+
+    monkeypatch.setitem(__import__("sys").modules, "sentry_sdk", _Broken)
+    monkeypatch.setattr(ss, "_READY", True)
+    ss.add_breadcrumb(category="c", message="m")  # must not raise
+
+
+def test_add_breadcrumb_copies_data(_fresh_pending):
+    data = {"k": "v"}
+    ss.add_breadcrumb(category="c", message="m", data=data)
+    data["k"] = "mutated"
+    assert ss._PENDING_BREADCRUMBS[0]["data"] == {"k": "v"}
+
+
+def test_init_sentry_wires_before_breadcrumb_and_replays(monkeypatch, _fresh_pending):
+    init_kwargs: list[dict] = []
+    replayed: list[dict] = []
+
+    class _FakeSdk:
+        @staticmethod
+        def init(**kwargs):
+            init_kwargs.append(kwargs)
+
+        @staticmethod
+        def set_tag(key, value):
+            pass
+
+        @staticmethod
+        def set_user(user):
+            pass
+
+        @staticmethod
+        def add_breadcrumb(crumb):
+            replayed.append(crumb)
+
+    modules = __import__("sys").modules
+    monkeypatch.setenv("SENTRY_DSN", "https://key@o1.ingest.sentry.io/99")
+    monkeypatch.setitem(modules, "sentry_sdk", _FakeSdk)
+    from types import SimpleNamespace
+    monkeypatch.setitem(modules, "sentry_sdk.integrations.logging",
+                        SimpleNamespace(LoggingIntegration=lambda **kw: None))
+    monkeypatch.setitem(modules, "sentry_sdk.integrations.loguru",
+                        SimpleNamespace(LoguruIntegration=lambda **kw: None))
+    monkeypatch.setitem(modules, "sentry_sdk.scrubber",
+                        SimpleNamespace(DEFAULT_DENYLIST=[], EventScrubber=lambda **kw: None))
+
+    ss.add_breadcrumb(category="logging.fallback", message="early")
+    assert ss.init_sentry(process="tray") is True
+
+    assert init_kwargs[0]["before_breadcrumb"] is ss.before_breadcrumb
+    assert [c["message"] for c in replayed] == ["early"]
+
+
+def test_before_breadcrumb_drops_local_only_log_records():
+    record = logging.LogRecord("x", logging.WARNING, __file__, 1, "msg", (), None)
+    record.extra = {ss.LOCAL_ONLY_EXTRA: True}
+    assert ss.before_breadcrumb({"message": "msg"}, {"log_record": record}) is None
+
+
+@pytest.mark.parametrize("hint", [
+    None,
+    {},
+    {"log_record": None},
+    {"log_record": logging.LogRecord("x", logging.INFO, __file__, 1, "m", (), None)},
+])
+def test_before_breadcrumb_keeps_everything_else(hint):
+    crumb = {"message": "keep"}
+    assert ss.before_breadcrumb(crumb, hint) is crumb
+
+
+def test_before_breadcrumb_keeps_record_with_falsy_marker():
+    record = logging.LogRecord("x", logging.WARNING, __file__, 1, "m", (), None)
+    record.extra = {ss.LOCAL_ONLY_EXTRA: False, "other": 1}
+    crumb = {"message": "keep"}
+    assert ss.before_breadcrumb(crumb, {"log_record": record}) is crumb
+
+
+def test_before_send_log_drops_local_only_warning():
+    payload = {
+        "severity_text": "warn", "severity_number": 13,
+        "attributes": {f"sentry.message.parameter.{ss.LOCAL_ONLY_EXTRA}": True},
+    }
+    assert ss.before_send_log(payload, {}) is None
+
+
+def test_before_send_log_keeps_warning_with_other_attributes():
+    payload = {
+        "severity_text": "warn", "severity_number": 13,
+        "attributes": {"sentry.message.parameter.other": True, "logger.name": "x"},
+    }
+    assert ss.before_send_log(payload, {}) is payload
+
+
+def test_local_only_marker_through_real_loguru_breadcrumb_handler(monkeypatch):
+    """Integration: loguru -> sentry's LoguruBreadcrumbHandler -> our
+    before_breadcrumb. A local-only WARNING yields no breadcrumb; a normal one
+    does."""
+    sentry_sdk = pytest.importorskip("sentry_sdk")
+    from loguru import logger as real_logger
+    from sentry_sdk.integrations.loguru import LoguruBreadcrumbHandler
+
+    seen: list[dict] = []
+
+    def _add_breadcrumb(crumb, hint=None):
+        if ss.before_breadcrumb(crumb, hint) is not None:
+            seen.append(crumb)
+
+    monkeypatch.setattr(sentry_sdk, "add_breadcrumb", _add_breadcrumb)
+    handler_id = real_logger.add(LoguruBreadcrumbHandler(level="INFO"), level="INFO")
+    try:
+        real_logger.bind(**{ss.LOCAL_ONLY_EXTRA: True}).warning("local only")
+        real_logger.warning("normal")
+    finally:
+        real_logger.remove(handler_id)
+
+    assert len(seen) == 1
+    assert seen[0]["message"].endswith(" - normal")

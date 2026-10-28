@@ -3,8 +3,35 @@
 from __future__ import annotations
 
 import argparse
+import multiprocessing
 import os
 import sys
+
+
+def _divert_multiprocessing_helpers() -> None:
+    """Let multiprocessing helper processes run instead of our own CLI.
+
+    In the frozen app ``sys.executable`` is this binary, so when loguru's
+    ``enqueue=True`` (or anything else) touches multiprocessing, Python's
+    resource tracker is spawned as ``KiroGatewayTray -B -S -I -c "from
+    multiprocessing.resource_tracker import main;main(N)"``. Without this call
+    argparse rejects those arguments, the tracker never runs, and named POSIX
+    semaphores of every SIGKILLed process leak until reboot — on macOS that
+    eventually exhausts ``kern.posix.sem.max`` and ``sem_open`` fails with
+    ``ENOSPC`` ("No space left on device").
+
+    PyInstaller's runtime hook replaces ``multiprocessing.freeze_support`` with
+    a version that recognises helper invocations, runs them, and exits. From
+    source it is the stock function (a no-op off frozen Windows). The lookup
+    happens at call time so that the hooked version is the one invoked.
+    """
+    multiprocessing.freeze_support()
+
+
+# Divert helper processes before the heavier imports below (loguru, sentry,
+# platformdirs ...): the resource tracker needs none of them.
+if __name__ == "__main__":
+    _divert_multiprocessing_helpers()
 
 # Works both as a package module (python -m kiro_gateway_tray) and as a PyInstaller
 # entry script (where there is no parent package for relative imports).
@@ -53,6 +80,9 @@ def _show_already_running() -> None:
 
 
 def main() -> int:
+    # Also here (idempotent) for callers that invoke main() without running
+    # this module as __main__; must precede argparse either way.
+    _divert_multiprocessing_helpers()
     parser = argparse.ArgumentParser(prog="kiro-gateway-tray")
     parser.add_argument("--cli", action="store_true", help="force headless CLI mode")
     parser.add_argument("--print-config", action="store_true",

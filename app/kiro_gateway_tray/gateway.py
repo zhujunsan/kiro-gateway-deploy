@@ -25,7 +25,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import appconfig, paths, proc_guard
+from . import appconfig, log, paths, proc_guard
 from .appconfig import AppCfg
 from .log import logger
 
@@ -273,14 +273,20 @@ def can_bind(host: str, port: int) -> bool:
 _can_bind = can_bind
 
 
-def _setup_child_logging() -> None:
+def _setup_child_logging() -> log.FileSinkResult:
     """In the child: route loguru (gateway) and stdlib logging (uvicorn) to a
-    rotating file sink under the app log dir."""
-    import logging
+    rotating file sink under the app log dir.
 
-    log_dir = paths.log_dir()
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = str(log_dir / "gateway.log")
+    The file sink goes through ``log.add_file_sink``: if the OS refuses it
+    (e.g. macOS named-semaphore exhaustion surfacing as ``ENOSPC``, or a full
+    / read-only log volume) the child degrades to a synchronous sink or to
+    stderr only — which the tray captures in ``gateway-bootstrap.log`` —
+    instead of crashing before uvicorn starts.
+
+    Returns:
+        Outcome of the file sink installation.
+    """
+    import logging
 
     from loguru import logger as _loguru
 
@@ -298,11 +304,18 @@ def _setup_child_logging() -> None:
 
     intercept = _InterceptHandler()
     for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
-        log = logging.getLogger(name)
-        log.handlers = [intercept]
-        log.propagate = False
+        std_logger = logging.getLogger(name)
+        std_logger.handlers = [intercept]
+        std_logger.propagate = False
 
-    _loguru.add(log_file, rotation="2 MB", retention=5, encoding="utf-8", enqueue=True)
+    return log.add_file_sink(
+        _loguru,
+        paths.log_dir() / "gateway.log",
+        component="gateway",
+        rotation="2 MB",
+        retention=5,
+        encoding="utf-8",
+    )
 
 
 def run_gateway_blocking() -> int:

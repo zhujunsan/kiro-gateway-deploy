@@ -58,6 +58,10 @@ _ACTIVITY_EMPTY_SLOT_TITLE = "暂无进行中的对话"
 _ACTIVITY_SPARE_SLOT_TITLE = ""
 _GATEWAY_PREFIX = "🖥 网关:"
 _TUNNEL_PREFIX = "🌐 隧道:"
+# Signed-in quota row. The signed-out hint ("🔑 …") is deliberately not
+# live-patched: its prefix collides with the password row and it also flips the
+# row's enabled state, so that transition waits for the post-close rebuild.
+_USAGE_PREFIX = "📊 额度:"
 # Fixed announcement rows reserved between the update notice and the status
 # block. pystray builds the menu once, so the slots must exist up front; each
 # one hides itself when there is no announcement to put in it.
@@ -329,7 +333,7 @@ class TrayApp:
         if state is not None and state.login_required:
             self._login_gate.note_login_required(state)
         self._usage_cache = _UsageCache(
-            on_update=self._request_redraw, gate=self._login_gate
+            on_update=self._on_usage_update, gate=self._login_gate
         )
         self._models_cache = AsyncRefreshCache(
             usage.fetch_models,
@@ -505,6 +509,11 @@ class TrayApp:
             tunnel_item = macos_menu.find_menu_item_by_title_prefix(nsmenu, _TUNNEL_PREFIX)
             if tunnel_item is not None:
                 macos_menu.apply_menu_item_title(tunnel_item, self._tunnel_title())
+            usage_item = macos_menu.find_menu_item_by_title_prefix(nsmenu, _USAGE_PREFIX)
+            if usage_item is not None:
+                usage_title = self._live_usage_title()
+                if usage_title is not None:
+                    macos_menu.apply_menu_item_title(usage_item, usage_title)
         except Exception:
             logger.debug("live status title patch failed", exc_info=True)
 
@@ -882,13 +891,18 @@ class TrayApp:
         else:
             recent_rows = [request_activity.format_recent_line(r) for r in snap.recent]
 
+        top_level = [
+            (_GATEWAY_PREFIX, self._gateway_title()),
+            (_TUNNEL_PREFIX, self._tunnel_title()),
+            (_ACTIVITY_ACTIVE_PREFIX, self._activity_active_title(snap)),
+        ]
+        usage_title = self._live_usage_title()
+        if usage_title is not None:
+            top_level.append((_USAGE_PREFIX, usage_title))
+
         tray_live.apply_live_titles(
             self._icon,
-            top_level_prefixes=[
-                (_GATEWAY_PREFIX, self._gateway_title()),
-                (_TUNNEL_PREFIX, self._tunnel_title()),
-                (_ACTIVITY_ACTIVE_PREFIX, self._activity_active_title(snap)),
-            ],
+            top_level_prefixes=top_level,
             submenu_by_parent_prefix={
                 _ACTIVITY_ACTIVE_PREFIX: active_rows,
             },
@@ -909,8 +923,16 @@ class TrayApp:
         except Exception:
             logger.debug("status menu live tick failed", exc_info=True)
 
+    def _on_usage_update(self) -> None:
+        """Fresh quota arrived: patch the open menu in place, else redraw.
+
+        Before this, a quota fetch that landed while the menu was open only set
+        ``_redraw_deferred``, so the row stayed stale until close + reopen.
+        """
+        self._on_supervisor_status_change()
+
     def _on_supervisor_status_change(self) -> None:
-        """Keep gateway/tunnel labels live even while the status menu is open."""
+        """Keep gateway/tunnel/quota labels live even while the menu is open."""
         if self._menu_session_open or macos_menu.is_status_menu_open(self._icon):
             self._redraw_deferred = True
 
@@ -1142,14 +1164,46 @@ class TrayApp:
         return self._tunnel_title()
 
     def _usage_line(self, _item):
+        self._kick_usage_refresh_if_due()
+        return self._usage_title()
+
+    def _usage_title(self) -> str:
+        """Render the quota row from cached state without any I/O.
+
+        Returns:
+            Menu title for the quota row.
+        """
         gw = self.sup.status()["gateway"]
         if gw != "running":
-            return f"📊 额度: ({_STATUS_ZH.get(gw, gw)})"
+            return f"{_USAGE_PREFIX} ({_STATUS_ZH.get(gw, gw)})"
         if self._login_gate.login_required:
-            # Do not call refresh(): a signed-out account must not be polled.
             return f"🔑 {login_state.menu_hint(self._login_gate.state)}"
+        return f"{_USAGE_PREFIX} {self._usage_cache.display()}"
+
+    def _kick_usage_refresh_if_due(self) -> None:
+        """Ask the usage cache for fresh data (cooldown-gated, non-blocking).
+
+        Skipped when the gateway is down or Kiro is signed out: a signed-out
+        account must not be polled (see ``_UsageCache``).
+        """
+        if self.sup.status()["gateway"] != "running":
+            return
+        if self._login_gate.login_required:
+            return
         self._usage_cache.refresh()
-        return f"📊 额度: {self._usage_cache.display()}"
+
+    def _live_usage_title(self) -> str | None:
+        """Quota title safe to patch in place, or ``None`` if a rebuild is needed.
+
+        Returns:
+            The new title when it keeps the ``📊 额度:`` prefix; otherwise
+            ``None`` after flagging a deferred redraw (signed-out transition).
+        """
+        title = self._usage_title()
+        if title.startswith(_USAGE_PREFIX):
+            return title
+        self._redraw_deferred = True
+        return None
 
     def _usage_row_enabled(self, _item) -> bool:
         """The quota row is only clickable when it offers a re-login re-check."""
@@ -1571,6 +1625,12 @@ class TrayApp:
         # Worth it: the hourly timer lags after the machine wakes from sleep.
         self._kick_announcement_check()
         self._kick_probe_if_due()
+        # Cooldown-gated (60s), so a stale quota refreshes on open and the
+        # result is patched into the open menu via _on_usage_update.
+        try:
+            self._kick_usage_refresh_if_due()
+        except Exception:
+            logger.debug("usage refresh on menu open failed", exc_info=True)
 
     def _start_usage_refresh_loop(self) -> None:
         """Periodically refresh the usage cache while the gateway is running.

@@ -67,6 +67,18 @@ _SENSITIVE_VAR_NAMES = frozenset({
 _READY = False
 _SNAPSHOT_BRIDGE_INSTALLED = False
 
+# Loguru ``extra`` key marking a record as local-only: the Sentry loguru
+# integration must neither turn it into a breadcrumb nor ship it to Sentry
+# Logs. Used when the caller records an explicit breadcrumb itself.
+LOCAL_ONLY_EXTRA = "sentry_local_only"
+# Prefix the loguru integration uses for ``extra`` values in Sentry Logs.
+_LOG_PARAMETER_PREFIX = "sentry.message.parameter."
+# Breadcrumbs recorded before ``init_sentry`` (the tray sets up logging first)
+# are buffered and replayed once the SDK is live. Bounded so a disabled SDK
+# can never accumulate memory.
+_PENDING_BREADCRUMBS: list[dict[str, Any]] = []
+_MAX_PENDING_BREADCRUMBS = 20
+
 # OpenTelemetry SeverityNumber: warn starts at 13. INFO/SUCCESS sit at 9–11.
 _OTEL_SEVERITY_WARN = 13
 _SENTRY_LOGS_DROP_TEXT = frozenset({"trace", "debug", "info"})
@@ -209,9 +221,20 @@ _SIGNED_OUT_CODES = frozenset({
     "login_required",
 })
 
+# /usage outage causes the gateway cannot fix (the user's link to AWS is broken).
+# Mirrors ``USAGE_OUTAGE_EXTERNAL_CAUSES`` in the gateway's usage_upstream.py,
+# kept as literals so the filter also covers vendored gateways that predate it.
+# Current gateways record these as breadcrumbs only and log them at INFO; older
+# ones still capture an ``usage_outage`` Issue every 15 minutes and log WARNING,
+# which this set lets the tray drop.
+_USAGE_OUTAGE_EXTERNAL_CAUSES = frozenset({"tls", "dns", "timeout", "connect"})
+# ``(cause=<tag>`` as written by the gateway's outage message and log line.
+_USAGE_OUTAGE_CAUSE_RE = re.compile(r"\(cause=([a-z_]+)")
+
 # Client-error markers that, combined with the AWS SSO OIDC token endpoint, mean
-# our refresh token was rejected. 4xx only: a 5xx or a connect failure against
-# the same host is a real outage and must still report.
+# our refresh token was rejected. 4xx only: a 5xx against the same host is an
+# upstream problem and must still report (connect failures are external causes,
+# see _USAGE_OUTAGE_EXTERNAL_CAUSES).
 _OIDC_REJECT_MARKERS = (
     "400 bad request",
     "401 unauthorized",
@@ -619,7 +642,9 @@ def _is_signed_out_event(event: dict[str, Any], hint: dict[str, Any]) -> bool:
        gateways produced before credential failures were classified apart;
     3. bare ``invalid_grant`` text.
 
-    Keep genuine outages (DNS/TLS/timeout/proxy): those are actionable.
+    Transport outages are not handled here: external causes are dropped by
+    :func:`_is_external_usage_outage_event`; ``upstream_status`` / ``other``
+    outages (including a 5xx from the OIDC endpoint) still report.
     """
     tags = _tag_map(event)
     for key in ("incident.code", "error.code", "code", "usage_auth_reason"):
@@ -651,6 +676,45 @@ def _is_signed_out_event(event: dict[str, Any], hint: dict[str, Any]) -> bool:
     if _looks_like_oidc_token_rejection(blob):
         return True
     return False
+
+
+def _usage_outage_cause_from_text(text: str) -> str | None:
+    """Extract the ``cause=`` tag from a gateway /usage outage message.
+
+    Args:
+        text: Event message or log body (any case).
+
+    Returns:
+        The lowercased cause tag, or ``None`` when the text is not a /usage
+        outage line or carries no cause.
+    """
+    lowered = text.lower()
+    if "get /usage upstream" not in lowered:
+        return None
+    match = _USAGE_OUTAGE_CAUSE_RE.search(lowered)
+    return match.group(1) if match else None
+
+
+def _is_external_usage_outage_event(event: dict[str, Any]) -> bool:
+    """Drop /usage outage Issues whose cause is outside the gateway's control.
+
+    Current gateways never capture these (breadcrumb only). Vendored gateways
+    from before that change still call ``capture_message`` for TLS / DNS /
+    timeout / connect outages, so this is the backstop that keeps the policy
+    consistent until every shipped vendor is updated. ``upstream_status`` and
+    ``other`` outages pass through.
+
+    Args:
+        event: Sentry event payload.
+
+    Returns:
+        Whether the event is a /usage outage with an external cause.
+    """
+    tags = _tag_map(event)
+    cause = tags.get("usage_outage_cause", "").strip().lower()
+    if not cause and tags.get("usage_outage", "").lower() == "true":
+        cause = _usage_outage_cause_from_text(_event_text_blob(event)) or ""
+    return cause in _USAGE_OUTAGE_EXTERNAL_CAUSES
 
 
 def _looks_like_oidc_token_rejection(blob: str) -> bool:
@@ -783,6 +847,8 @@ def before_send(event: dict[str, Any], hint: dict[str, Any]) -> dict[str, Any] |
         return None
     if _is_signed_out_event(event, hint):
         return None
+    if _is_external_usage_outage_event(event):
+        return None
     if _is_environment_noise_event(event, hint):
         return None
 
@@ -816,6 +882,8 @@ def before_send_log(
     Integrations already filter at WARNING, but uvicorn access logs and
     loguru INFO can arrive via more than one path. This is the last gate
     before ingest, independent of which integration captured the record.
+    Also drops local-only records and /usage outage lines with an external
+    cause (see ``_USAGE_OUTAGE_EXTERNAL_CAUSES``).
 
     Args:
         log: Sentry structured log payload (severity_text / severity_number).
@@ -832,7 +900,90 @@ def before_send_log(
     number = log.get("severity_number")
     if isinstance(number, int) and number < _OTEL_SEVERITY_WARN:
         return None
+    attributes = log.get("attributes")
+    if isinstance(attributes, dict) and attributes.get(
+        _LOG_PARAMETER_PREFIX + LOCAL_ONLY_EXTRA
+    ):
+        return None
+    # Older vendored gateways log external /usage outages at WARNING; current
+    # ones use INFO. Either way they must stay out of Sentry.
+    cause = _usage_outage_cause_from_text(str(log.get("body") or ""))
+    if cause in _USAGE_OUTAGE_EXTERNAL_CAUSES:
+        return None
     return log
+
+
+def before_breadcrumb(
+    crumb: dict[str, Any],
+    hint: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Drop breadcrumbs generated from records marked ``LOCAL_ONLY_EXTRA``.
+
+    The loguru integration hands each record to the stdlib breadcrumb handler,
+    which exposes loguru's ``extra`` dict as ``log_record.extra``.
+
+    Args:
+        crumb: Breadcrumb about to be recorded.
+        hint: SDK hint; carries ``log_record`` for logging-derived crumbs.
+
+    Returns:
+        ``None`` for local-only records, otherwise ``crumb`` unchanged.
+    """
+    record = (hint or {}).get("log_record")
+    extra = getattr(record, "extra", None)
+    if isinstance(extra, dict) and extra.get(LOCAL_ONLY_EXTRA):
+        return None
+    return crumb
+
+
+def add_breadcrumb(
+    *,
+    category: str,
+    message: str,
+    level: str = "info",
+    data: dict[str, Any] | None = None,
+) -> None:
+    """Record a breadcrumb now, or buffer it until ``init_sentry`` succeeds.
+
+    Breadcrumbs are attached to later events only; this never sends an event.
+    Never raises.
+
+    Args:
+        category: Breadcrumb category (dotted name).
+        message: Human-readable summary.
+        level: Sentry level name (``"info"``, ``"warning"``, ...).
+        data: Optional structured details.
+    """
+    crumb: dict[str, Any] = {
+        "type": "default",
+        "category": category,
+        "message": message,
+        "level": level,
+        "data": dict(data or {}),
+    }
+    if not _READY:
+        if len(_PENDING_BREADCRUMBS) < _MAX_PENDING_BREADCRUMBS:
+            _PENDING_BREADCRUMBS.append(crumb)
+        return
+    try:
+        import sentry_sdk
+        sentry_sdk.add_breadcrumb(crumb)
+    except Exception:
+        pass
+
+
+def _replay_pending_breadcrumbs() -> None:
+    """Hand breadcrumbs buffered before init to the now-live SDK. Never raises."""
+    if not _PENDING_BREADCRUMBS:
+        return
+    pending = list(_PENDING_BREADCRUMBS)
+    _PENDING_BREADCRUMBS.clear()
+    try:
+        import sentry_sdk
+        for crumb in pending:
+            sentry_sdk.add_breadcrumb(crumb)
+    except Exception:
+        pass
 
 
 def init_sentry(*, process: ProcessKind) -> bool:
@@ -879,6 +1030,7 @@ def init_sentry(*, process: ProcessKind) -> bool:
             enable_logs=True,
             before_send=before_send,
             before_send_log=before_send_log,
+            before_breadcrumb=before_breadcrumb,
             event_scrubber=EventScrubber(denylist=denylist, recursive=True),
             integrations=[
                 # Default LoggingIntegration ships INFO into Sentry Logs
@@ -909,6 +1061,7 @@ def init_sentry(*, process: ProcessKind) -> bool:
         return False
 
     _READY = True
+    _replay_pending_breadcrumbs()
     return True
 
 

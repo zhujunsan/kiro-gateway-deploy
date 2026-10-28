@@ -1,7 +1,13 @@
 # app/tests/test_gateway.py
+import errno as _errno
+import logging as _logging
 import socket
 from pathlib import Path
-from kiro_gateway_tray import gateway, appconfig
+
+import pytest as _pytest
+from loguru import logger as _loguru
+
+from kiro_gateway_tray import gateway, appconfig, sentry_setup as _sentry_setup
 
 
 def test_vendor_root_missing_raises(monkeypatch):
@@ -298,3 +304,106 @@ def test_stop_closes_bootstrap_log_even_when_kill_needed(monkeypatch, tmp_path):
 
     assert handle.closed is True
     assert gp._bootstrap_log is None
+
+
+# --- _setup_child_logging: file sink degradation ------------------------------
+
+@_pytest.fixture
+def _child_logging_env(tmp_path, monkeypatch):
+    """Isolate _setup_child_logging: temp log dir, captured breadcrumbs,
+    restored uvicorn logger handlers, and loguru.add scripted per test."""
+    monkeypatch.setenv("KIRO_GATEWAY_TRAY_HOME", str(tmp_path))
+    crumbs: list[dict] = []
+    monkeypatch.setattr(_sentry_setup, "add_breadcrumb", lambda **kw: crumbs.append(kw))
+    names = ("uvicorn", "uvicorn.error", "uvicorn.access")
+    saved = {n: (_logging.getLogger(n).handlers[:], _logging.getLogger(n).propagate) for n in names}
+    calls: list[dict] = []
+    added: list[int] = []
+    real_add = _loguru.add
+    state = {"fail": []}
+
+    def _add(sink, **kwargs):
+        calls.append({"sink": sink, **kwargs})
+        if state["fail"]:
+            exc = state["fail"].pop(0)
+            if exc is not None:
+                raise exc
+        handler_id = real_add(sink, **kwargs)
+        added.append(handler_id)
+        return handler_id
+
+    _loguru.add = _add
+    try:
+        yield {"tmp": tmp_path, "crumbs": crumbs, "calls": calls, "state": state}
+    finally:
+        del _loguru.add
+        for handler_id in added:
+            _loguru.remove(handler_id)
+        for n, (handlers, propagate) in saved.items():
+            _logging.getLogger(n).handlers = handlers
+            _logging.getLogger(n).propagate = propagate
+
+
+def _gateway_log(env) -> Path:
+    return env["tmp"] / "logs" / "gateway.log"
+
+
+def test_child_logging_keeps_enqueued_sink_by_default(_child_logging_env):
+    env = _child_logging_env
+
+    result = gateway._setup_child_logging()
+
+    assert result.mode == "enqueued"
+    assert env["calls"] == [{
+        "sink": str(_gateway_log(env)), "enqueue": True,
+        "rotation": "2 MB", "retention": 5, "encoding": "utf-8",
+    }]
+    assert env["crumbs"] == []
+    # uvicorn loggers are still intercepted into loguru.
+    for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        std = _logging.getLogger(name)
+        assert std.propagate is False
+        assert len(std.handlers) == 1
+
+
+def test_child_logging_enospc_degrades_to_synchronous_and_still_writes(_child_logging_env):
+    env = _child_logging_env
+    env["state"]["fail"] = [OSError(_errno.ENOSPC, "No space left on device")]
+
+    result = gateway._setup_child_logging()
+    _loguru.info("gateway alive after degradation")
+
+    assert result.mode == "synchronous"
+    assert [c["enqueue"] for c in env["calls"]] == [True, False]
+    text = _gateway_log(env).read_text(encoding="utf-8")
+    assert "gateway alive after degradation" in text
+    assert "degraded to synchronous" in text
+    assert len(env["crumbs"]) == 1
+    assert env["crumbs"][0]["data"]["component"] == "gateway"
+
+
+def test_child_logging_double_failure_does_not_raise(_child_logging_env):
+    env = _child_logging_env
+    env["state"]["fail"] = [
+        OSError(_errno.ENOSPC, "No space left on device"),
+        OSError(_errno.ENOSPC, "No space left on device"),
+    ]
+
+    result = gateway._setup_child_logging()
+
+    assert result.mode == "stderr_only"
+    assert result.handler_id is None
+    assert len(env["calls"]) == 2
+    assert len(env["crumbs"]) == 1
+    # uvicorn interception is configured before the sink, so it survives.
+    assert _logging.getLogger("uvicorn").propagate is False
+
+
+def test_child_logging_does_not_swallow_programming_errors(_child_logging_env):
+    env = _child_logging_env
+    env["state"]["fail"] = [TypeError("unexpected keyword")]
+
+    with _pytest.raises(TypeError):
+        gateway._setup_child_logging()
+    assert len(env["calls"]) == 1
+    assert env["crumbs"] == []

@@ -153,6 +153,155 @@ def test_status_title_patch_uses_live_menu(monkeypatch):
     assert all(t is live_menu for t in targets)
 
 
+class _FakeItem:
+    def __init__(self, title):
+        self.title = title
+
+
+def _patch_fake_menu(monkeypatch, app, items):
+    """Route macos_menu lookups/writes to plain Python ``_FakeItem`` rows."""
+    menu = object()
+    app._live_nsmenu = menu
+
+    def _find(_nsmenu, prefix):
+        for it in items:
+            if it.title.startswith(prefix):
+                return it
+        return None
+
+    monkeypatch.setattr(
+        "kiro_gateway_tray.tray.macos_menu.find_menu_item_by_title_prefix", _find
+    )
+    monkeypatch.setattr(
+        "kiro_gateway_tray.tray.macos_menu.apply_menu_item_title",
+        lambda it, title: setattr(it, "title", title),
+    )
+
+
+def test_open_menu_patches_quota_row_from_cache(monkeypatch):
+    """The quota row must update in place while the menu stays open."""
+    app = _make_app(monkeypatch)
+    monkeypatch.setattr(app.sup, "status", lambda: {"gateway": "running"})
+    usage_row = _FakeItem("📊 额度: 1352.24 / 2000.0")
+    _patch_fake_menu(monkeypatch, app, [usage_row])
+
+    app._usage_cache._cache._value = "1400.00 / 2000.0"
+    app._live_patch_status_titles()
+
+    assert usage_row.title == "📊 额度: 1400.00 / 2000.0"
+    assert app._redraw_deferred is False
+
+
+def test_quota_patch_shows_gateway_state_when_not_running(monkeypatch):
+    app = _make_app(monkeypatch)
+    monkeypatch.setattr(app.sup, "status", lambda: {"gateway": "stopped"})
+    usage_row = _FakeItem("📊 额度: 1 / 2")
+    _patch_fake_menu(monkeypatch, app, [usage_row])
+
+    app._live_patch_status_titles()
+
+    assert usage_row.title.startswith("📊 额度: (")
+    assert "1 / 2" not in usage_row.title
+
+
+def test_quota_patch_defers_signed_out_transition_to_rebuild(monkeypatch):
+    """Signed-out hint changes prefix/enabled state: rebuild after close."""
+    from kiro_gateway_tray.login_state import LoginState
+
+    app = _make_app(monkeypatch)
+    monkeypatch.setattr(app.sup, "status", lambda: {"gateway": "running"})
+    app._login_gate.note_login_required(
+        LoginState(login_required=True, code="account_auth_required", message="x")
+    )
+    usage_row = _FakeItem("📊 额度: 1 / 2")
+    _patch_fake_menu(monkeypatch, app, [usage_row])
+
+    app._live_patch_status_titles()
+
+    assert usage_row.title == "📊 额度: 1 / 2"  # untouched in place
+    assert app._redraw_deferred is True
+
+
+def test_usage_update_while_open_patches_instead_of_only_deferring(monkeypatch):
+    """A fetch landing mid-session must reach the visible row."""
+    app = _make_app(monkeypatch)
+    monkeypatch.setattr("kiro_gateway_tray.tray.sys.platform", "darwin")
+    monkeypatch.setattr(
+        "kiro_gateway_tray.tray.macos_menu.run_on_main_thread", lambda fn: fn()
+    )
+    patched = {"n": 0}
+    monkeypatch.setattr(
+        app, "_live_patch_status_titles",
+        lambda *a, **k: patched.__setitem__("n", patched["n"] + 1),
+    )
+    monkeypatch.setattr(app, "_request_redraw", lambda: pytest.fail("rebuilt mid-menu"))
+
+    app._on_usage_update()
+
+    assert patched["n"] == 1
+
+
+def test_usage_update_while_closed_requests_redraw(monkeypatch):
+    app = _make_app(monkeypatch)
+    app._menu_session_open = False
+    monkeypatch.setattr(
+        "kiro_gateway_tray.tray.macos_menu.is_status_menu_open", lambda _ic: False
+    )
+    redraws = {"n": 0}
+    monkeypatch.setattr(
+        app, "_request_redraw", lambda: redraws.__setitem__("n", redraws["n"] + 1)
+    )
+
+    app._on_usage_update()
+
+    assert redraws["n"] == 1
+
+
+def test_menu_open_kicks_usage_refresh_only_when_signed_in(monkeypatch):
+    from kiro_gateway_tray.login_state import LoginState
+
+    app = _make_app(monkeypatch)
+    monkeypatch.setattr(app, "_kick_announcement_check", lambda: None)
+    monkeypatch.setattr(app, "_kick_probe_if_due", lambda: None)
+    monkeypatch.setattr(app.sup, "status", lambda: {"gateway": "running"})
+    calls = {"n": 0}
+    monkeypatch.setattr(
+        app._usage_cache, "refresh", lambda *a: calls.__setitem__("n", calls["n"] + 1)
+    )
+
+    app._on_menu_open()
+    assert calls["n"] == 1
+
+    app._login_gate.note_login_required(
+        LoginState(login_required=True, code="account_auth_required", message="x")
+    )
+    app._on_menu_open()
+    assert calls["n"] == 1, "polled /usage while signed out"
+
+    app._login_gate.note_signed_in()
+    monkeypatch.setattr(app.sup, "status", lambda: {"gateway": "stopped"})
+    app._on_menu_open()
+    assert calls["n"] == 1, "polled /usage while gateway stopped"
+
+
+def test_crossplatform_tick_includes_quota_row(monkeypatch):
+    app = _make_app(monkeypatch)
+    monkeypatch.setattr(
+        app.sup, "status", lambda: {"gateway": "running", "tunnel": "running"}
+    )
+    app._usage_cache._cache._value = "5 / 10"
+    seen = {}
+    monkeypatch.setattr(
+        "kiro_gateway_tray.tray.tray_live.apply_live_titles",
+        lambda icon, **kw: seen.update(kw),
+    )
+    from kiro_gateway_tray.request_activity import ActivitySnapshot
+
+    app._live_patch_open_menu_crossplatform(ActivitySnapshot())
+
+    assert ("📊 额度:", "📊 额度: 5 / 10") in seen["top_level_prefixes"]
+
+
 def test_tick_patches_status_titles_every_time(monkeypatch):
     """Each tick must re-read status and re-apply titles (no dedupe skip)."""
     app = _make_app(monkeypatch)
