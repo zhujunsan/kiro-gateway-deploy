@@ -1,6 +1,6 @@
 ---
 name: kiro-gateway-release
-description: Kiro Gateway Tray App 提交代码与版本发布工作流。当用户说"提交代码"、"提交下"、"发版"、"发个版"、"打个版本"、"升个版本"、"出个版本"等时务必使用。涵盖：审查全部待提交变动、识别应排除的本地/构建文件、升级 `app/kiro_gateway_tray/__init__.py` 的 `__version__`、在根目录 `ChangeLog.md` 追加版本段落、运行测试、生成中文 commit、打 `v*` tag 并安全推送（禁止强推主分支）。推 tag 后 GitHub Actions 自动构建三平台安装包并发版，release 说明取自本次 ChangeLog.md 段落。
+description: Kiro Gateway Tray App 提交代码与版本发布工作流。当用户说"提交代码"、"提交下"、"发版"、"发个版"、"打个版本"、"升个版本"、"出个版本"等时务必使用。涵盖：审查全部待提交变动、识别应排除的本地/构建文件、升级 `app/kiro_gateway_tray/__init__.py` 的 `__version__`、在根目录 `ChangeLog.md` 追加版本段落、运行测试、生成中文 commit、打 `v*` tag 并安全推送（禁止强推主分支）。推 tag 后 GitHub Actions 自动构建 macOS、Windows 与 Linux（x86_64 / ARM64）安装包并发版，release 说明取自本次 ChangeLog.md 段落。
 ---
 
 # Kiro Gateway Tray 发版工作流
@@ -128,8 +128,8 @@ git push origin vX.Y.Z
 
 推送 `v*` tag 会触发 `.github/workflows/build-app.yml`：
 
-- `build` job 在 macOS(arm64/x64)、Windows、Linux 上跑测试并用 PyInstaller 打包安装包
-- `release` job 提取本次 `ChangeLog.md` 段落作为 Release 说明（其后附 CI 自动生成的提交列表），创建 GitHub Release 并上传四平台产物
+- `build` job 在 macOS(arm64/x64)、Windows、Linux(x86_64/ARM64) 上跑测试并用 PyInstaller 打包安装包
+- `release` job 提取本次 `ChangeLog.md` 段落作为 Release 说明（其后附 CI 自动生成的提交列表），创建 GitHub Release 并上传五套安装包
 
 可提示用户去仓库 Actions 页查看构建进度，或 `gh run watch` 跟踪。
 

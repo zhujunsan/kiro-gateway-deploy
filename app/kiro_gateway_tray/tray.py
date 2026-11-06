@@ -1110,9 +1110,17 @@ class TrayApp:
         icon.stop()
 
     def _on_update(self, _icon, _item):
+        """Start the browser download of this machine's installer.
+
+        The release page is the fallback when this OS/CPU has no published
+        asset, so the click still leads somewhere useful.
+        """
         info = self._update_info
-        if info:
-            webbrowser.open(info.release_url)
+        if not info:
+            return
+        url = info.download_url or info.release_url
+        logger.info("update download: {}", url)
+        webbrowser.open(url)
 
     def _on_open_release(self, _icon: object, _item: object) -> None:
         """Open GitHub's latest release page regardless of the installed version."""

@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.5.10 (2026-11-06)
+
+**New**
+- 新增 Linux ARM64 安装包 `kiro-gateway-tray-<ver>-linux-aarch64.AppImage`。打包按本机 CPU 选择对应的 cloudflared 与 AppImage 文件名，CI 在原生 ARM64 环境构建。
+
+**Changed**
+- 托盘菜单出现新版本时，点击后直接下载当前系统对应的安装包：macOS 为 arm64 或 Intel 的 DMG，Windows 为 amd64 安装包，Linux 为 x86_64 或 ARM64 的 AppImage。认不出系统或 CPU 时仍打开 GitHub 发布页。
+- 发布产物不再附带 `.sha256` 侧车文件。Homebrew cask 改为下载 DMG 后在本地计算校验和。
+- 同步内嵌网关与 Docker 镜像至 `main-3011d7a`。默认模型列表补上 `claude-opus-5.5`、`claude-sonnet-5.5`、`kimi-k3`（别名 `kiro-o-5.5`、`kiro-s-5.5`、`kiro-kimi-k3`），并下线已不可用的 `gpt-5.6-sol`。
+
 ## v0.5.9 (2026-10-28)
 
 本版包含 v0.5.8 的全部修复。v0.5.8 因 Linux 构建环境迁移未完成发布，保留原标签且不覆盖。

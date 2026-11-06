@@ -84,19 +84,36 @@ def _target() -> tuple[str, str]:
     return os_name, arch
 
 
+def release_asset(os_name: str, arch: str) -> str:
+    """Return the pinned cloudflared release filename for this OS and CPU.
+
+    Args:
+        os_name: ``darwin``, ``linux``, or ``windows``.
+        arch: ``amd64`` or ``arm64``.
+
+    Returns:
+        Release asset filename.
+
+    Raises:
+        ValueError: The OS or architecture is not one this project ships.
+    """
+    if arch not in ("amd64", "arm64"):
+        raise ValueError(f"unsupported cloudflared arch {arch!r}")
+    if os_name == "windows":
+        return "cloudflared-windows-amd64.exe"
+    if os_name == "darwin":
+        return f"cloudflared-darwin-{arch}.tgz"
+    if os_name == "linux":
+        return f"cloudflared-linux-{arch}"
+    raise ValueError(f"unsupported cloudflared OS {os_name!r}")
+
+
 def fetch(os_name: str, arch: str) -> Path:
     dest_dir = DEST_BASE / f"{os_name}-{arch}"
     dest_dir.mkdir(parents=True, exist_ok=True)
 
-    if os_name == "windows":
-        filename = "cloudflared-windows-amd64.exe"
-        dest = dest_dir / "cloudflared.exe"
-    elif os_name == "darwin":
-        filename = f"cloudflared-darwin-{arch}.tgz"
-        dest = dest_dir / "cloudflared"
-    else:
-        filename = f"cloudflared-linux-{arch}"
-        dest = dest_dir / "cloudflared"
+    filename = release_asset(os_name, arch)
+    dest = dest_dir / ("cloudflared.exe" if os_name == "windows" else "cloudflared")
 
     url = f"{BASE_URL}/{filename}"
     print(f"downloading {url}")

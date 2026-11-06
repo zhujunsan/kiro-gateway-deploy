@@ -29,7 +29,8 @@ Cursor 支持自定义 OpenAI 兼容的 API 地址，但有几个坑：
 1. 从 [GitHub Releases](https://github.com/zhujunsan/kiro-gateway-deploy/releases) 下载对应平台的安装包：
    - macOS：`KiroGatewayTray-<ver>-macos-arm64.dmg` → 打开 DMG，拖入 Applications
    - Windows：`KiroGatewayTray-<ver>-windows-amd64-setup.exe` → 双击运行安装向导
-   - Linux：`kiro-gateway-tray-<ver>-linux-x86_64.AppImage` → `chmod +x`，双击或直接运行
+   - Linux x86_64：`kiro-gateway-tray-<ver>-linux-x86_64.AppImage` → `chmod +x`，双击或直接运行
+   - Linux ARM64：`kiro-gateway-tray-<ver>-linux-aarch64.AppImage` → `chmod +x`，双击或直接运行
 
    > macOS 也可以用 Homebrew 安装（本仓库即是 tap）：
    >
@@ -70,19 +71,22 @@ Cursor 支持自定义 OpenAI 兼容的 API 地址，但有几个坑：
 
 ## 可用模型
 
-直接使用真实模型名（无需 alias，也无需在 Cursor 手动增加 model name）：`auto`、`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`。
+直接使用真实模型名（无需 alias，也无需在 Cursor 手动增加 model name）：`auto`、`gpt-5.6-terra`、`gpt-5.6-luna`。
 
 需要手动添加的别名（网关会按可用模型自动生成；下表为当前常见集合）：
 
 | 别名 | 实际模型 |
 |---|---|
+| `kiro-o-5.5` | `claude-opus-5.5` |
 | `kiro-o-5` | `claude-opus-5` |
 | `kiro-o-4.6` | `claude-opus-4.6` |
+| `kiro-s-5.5` | `claude-sonnet-5.5` |
 | `kiro-s-5` | `claude-sonnet-5` |
 | `kiro-h-4.5` | `claude-haiku-4.5` |
 | `kiro-f-5.1` | `claude-fable-5.1` |
 | `kiro-deepseek-3.2` | `deepseek-3.2` |
 | `kiro-glm-5` | `glm-5` |
+| `kiro-kimi-k3` | `kimi-k3` |
 | `kiro-minimax-m2.5` | `minimax-m2.5` |
 | `kiro-qwen3-coder-next` | `qwen3-coder-next` |
 

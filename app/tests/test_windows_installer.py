@@ -46,6 +46,7 @@ def test_windows_installer_stamps_version_and_platform_guards():
 
     assert "VersionInfoVersion={#AppVersion}" in script
     assert "ArchitecturesAllowed=x64compatible" in script
+    assert "OutputBaseFilename=KiroGatewayTray-{#AppVersion}-windows-amd64-setup" in script
     assert "MinVersion=10.0" in script
     assert "PrivilegesRequiredOverridesAllowed=dialog" in script
 

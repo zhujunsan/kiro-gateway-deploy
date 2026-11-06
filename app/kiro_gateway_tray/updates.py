@@ -5,7 +5,9 @@ Behavior (see plan Task 13):
     once per 4 hours (cached on disk)
   - cache file: <data_dir>/update_check.json
   - all failures are swallowed silently (never bother the user)
-  - never auto-downloads; UI just surfaces a "new version" menu line
+  - the check itself never downloads; the "new version" menu line opens the
+    installer that matches this machine (browser download), and falls back to
+    the release page when this OS/CPU has no published installer
 
 Cache staleness rules (avoid the "高于发布版" confusion after an upgrade):
   - a failed fetch still bumps ``checked_at`` so we don't hammer the (anonymous,
@@ -17,10 +19,13 @@ Cache staleness rules (avoid the "高于发布版" confusion after an upgrade):
 from __future__ import annotations
 
 import json
+import platform
 import re
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import quote
 
 import httpx
 
@@ -32,6 +37,30 @@ _TTL_SECONDS = 4 * 60 * 60
 _CACHE_NAME = "update_check.json"
 _RELEASE_API = "https://api.github.com/repos/{repo}/releases/latest"
 _RELEASE_PAGE = "https://github.com/{repo}/releases/latest"
+_DOWNLOAD_URL = "https://github.com/{repo}/releases/download/{tag}/{filename}"
+
+# Published installer names (see packaging/make_dist.py and target_arch.py).
+# macOS DMGs use amd64/arm64. Windows publishes a single amd64 setup exe
+# (it also runs on Windows on ARM via emulation). Linux AppImages use
+# x86_64/aarch64.
+_MACOS_ARCH = {
+    "arm64": "arm64",
+    "aarch64": "arm64",
+    "x86_64": "amd64",
+    "amd64": "amd64",
+}
+_WINDOWS_ARCH = {
+    "amd64": "amd64",
+    "x86_64": "amd64",
+    "arm64": "amd64",
+    "aarch64": "amd64",
+}
+_LINUX_ARCH = {
+    "x86_64": "x86_64",
+    "amd64": "x86_64",
+    "aarch64": "aarch64",
+    "arm64": "aarch64",
+}
 
 
 @dataclass
@@ -40,6 +69,7 @@ class UpdateInfo:
     latest: str | None
     update_available: bool
     release_url: str
+    download_url: str | None = None
 
 
 @dataclass
@@ -69,6 +99,138 @@ def _parse_version(tag: str) -> tuple[int, int, int]:
 
 def _is_newer(current: str, latest: str) -> bool:
     return _parse_version(latest) > _parse_version(current)
+
+
+def _version_from_tag(tag: str) -> str:
+    """Return the version embedded in installer filenames.
+
+    Release tags are ``v1.2.3``; published files use ``1.2.3``.
+
+    Args:
+        tag: GitHub release tag, with or without a leading ``v``.
+
+    Returns:
+        Version text with a single leading ``v``/``V`` removed, or ``""``.
+    """
+    text = (tag or "").strip()
+    if text[:1] in ("v", "V"):
+        return text[1:]
+    return text
+
+
+def _release_tag(tag: str) -> str:
+    """Return the GitHub tag used in a release-asset URL.
+
+    Args:
+        tag: Version or tag. Bare versions gain a leading ``v``.
+
+    Returns:
+        Tag text, empty when ``tag`` is blank.
+    """
+    text = (tag or "").strip()
+    if not text:
+        return ""
+    if text[:1] in ("v", "V"):
+        return text
+    return f"v{text}"
+
+
+def _os_kind(system: str) -> str | None:
+    """Map a ``sys.platform`` / ``platform.system()`` value to an installer family.
+
+    Args:
+        system: Platform name, any case.
+
+    Returns:
+        ``macos``, ``windows``, ``linux``, or None when we ship no installer.
+    """
+    name = (system or "").lower()
+    if name == "darwin" or name.startswith("mac"):
+        return "macos"
+    if name.startswith("win"):
+        return "windows"
+    if name.startswith("linux"):
+        return "linux"
+    return None
+
+
+def installer_filename(version: str, system: str, machine: str) -> str | None:
+    """Return the published installer filename for this version, OS, and CPU.
+
+    Args:
+        version: Release tag or version (``v1.2.3`` or ``1.2.3``).
+        system: ``sys.platform`` or ``platform.system()``.
+        machine: ``platform.machine()``.
+
+    Returns:
+        Filename such as ``KiroGatewayTray-1.2.3-macos-arm64.dmg``, or None
+        when this OS/CPU has no published installer.
+    """
+    ver = _version_from_tag(version)
+    kind = _os_kind(system)
+    arch_table = {
+        "macos": _MACOS_ARCH,
+        "windows": _WINDOWS_ARCH,
+        "linux": _LINUX_ARCH,
+    }.get(kind or "")
+    if not ver or arch_table is None:
+        return None
+    arch = arch_table.get(machine.lower())
+    if arch is None:
+        return None
+    if kind == "macos":
+        return f"KiroGatewayTray-{ver}-macos-{arch}.dmg"
+    if kind == "windows":
+        return f"KiroGatewayTray-{ver}-windows-{arch}-setup.exe"
+    return f"kiro-gateway-tray-{ver}-linux-{arch}.AppImage"
+
+
+def download_url_for(
+    tag: str,
+    *,
+    repo: str | None = None,
+    system: str | None = None,
+    machine: str | None = None,
+) -> str | None:
+    """Direct download URL for this machine's installer of ``tag``.
+
+    Opening the URL in a browser starts the download. Callers that get None
+    should open the release page so the user can still pick a file.
+
+    Args:
+        tag: Release tag or version the menu is offering.
+        repo: ``owner/repo``. Defaults to ``GITHUB_REPO``.
+        system: Platform name. Defaults to ``sys.platform``.
+        machine: CPU name. Defaults to ``platform.machine()``.
+
+    Returns:
+        ``https://github.com/<repo>/releases/download/<tag>/<filename>``,
+        or None when no installer matches.
+    """
+    filename = installer_filename(
+        tag,
+        sys.platform if system is None else system,
+        platform.machine() if machine is None else machine,
+    )
+    release_tag = _release_tag(tag)
+    if filename is None or not release_tag:
+        return None
+    return _DOWNLOAD_URL.format(
+        repo=repo or GITHUB_REPO,
+        tag=quote(release_tag, safe=""),
+        filename=quote(filename, safe=""),
+    )
+
+
+def _update_info(current: str, latest: str | None, available: bool) -> UpdateInfo:
+    """Build an ``UpdateInfo``, including this machine's download URL."""
+    return UpdateInfo(
+        current=current,
+        latest=latest,
+        update_available=available,
+        release_url=_RELEASE_PAGE.format(repo=GITHUB_REPO),
+        download_url=download_url_for(latest) if latest else None,
+    )
 
 
 def _read_cache() -> dict | None:
@@ -126,12 +288,7 @@ def peek_cached(current: str | None = None) -> UpdateInfo | None:
     latest = (_read_cache() or {}).get("latest")
     if not latest or not _is_newer(current, latest):
         return None
-    return UpdateInfo(
-        current=current,
-        latest=latest,
-        update_available=True,
-        release_url=_RELEASE_PAGE.format(repo=GITHUB_REPO),
-    )
+    return _update_info(current, latest, True)
 
 
 def check(current: str | None = None, force: bool = False) -> UpdateInfo:
@@ -140,7 +297,6 @@ def check(current: str | None = None, force: bool = False) -> UpdateInfo:
     Never raises: on any failure returns update_available=False.
     """
     current = current or __version__
-    release_url = _RELEASE_PAGE.format(repo=GITHUB_REPO)
     try:
         if force or _should_check():
             logger.info("update check: querying GitHub releases")
@@ -160,8 +316,7 @@ def check(current: str | None = None, force: bool = False) -> UpdateInfo:
         latest = (_read_cache() or {}).get("latest")
 
     available = bool(latest) and _is_newer(current, latest)
-    return UpdateInfo(current=current, latest=latest,
-                      update_available=available, release_url=release_url)
+    return _update_info(current, latest, available)
 
 
 def version_status(current: str | None = None) -> VersionStatus:

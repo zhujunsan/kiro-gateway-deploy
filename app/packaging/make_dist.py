@@ -1,7 +1,6 @@
 # app/packaging/make_dist.py
 from __future__ import annotations
 
-import hashlib
 import os
 import platform
 import shutil
@@ -13,21 +12,9 @@ APP = Path(__file__).resolve().parents[1]
 DIST = APP / "dist"
 OUT = APP / "release"
 sys.path.insert(0, str(APP))
+sys.path.insert(0, str(APP / "packaging"))
 from kiro_gateway_tray import __version__ as VER  # noqa: E402
-
-
-def _sha256(p: Path) -> str:
-    h = hashlib.sha256()
-    with p.open("rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-def _write_sha(out: Path) -> str:
-    digest = _sha256(out)
-    (out.parent / (out.name + ".sha256")).write_text(f"{digest}  {out.name}\n")
-    return digest
+from target_arch import appimage_arch, appimagetool_filename, linux_appimage_filename  # noqa: E402
 
 
 def _codesign_adhoc(app_path: Path) -> None:
@@ -157,7 +144,8 @@ def build_windows_installer() -> Path:
 
 
 def build_linux_appimage() -> Path:
-    out = OUT / f"kiro-gateway-tray-{VER}-linux-x86_64.AppImage"
+    machine = platform.machine()
+    out = OUT / linux_appimage_filename(VER, machine)
     build_dir = APP / "build"
 
     appdir = build_dir / "kiro-gateway-tray.AppDir"
@@ -190,15 +178,15 @@ def build_linux_appimage() -> Path:
         shutil.copy(icon_src, appdir / "kiro-gateway-tray.png")
         shutil.copy(icon_src, appdir / ".DirIcon")
 
-    # appimagetool downloaded by CI to app/build/
-    appimagetool = build_dir / "appimagetool-x86_64.AppImage"
+    # appimagetool downloaded by CI to app/build/, one file per CPU architecture.
+    appimagetool = build_dir / appimagetool_filename(machine)
     if not appimagetool.exists():
         raise FileNotFoundError(
             f"appimagetool not found at {appimagetool}; "
-            "CI should have downloaded it via fetch_appimagetool step"
+            "CI should have downloaded it via the fetch appimagetool step"
         )
 
-    env = {**os.environ, "APPIMAGE_EXTRACT_AND_RUN": "1"}
+    env = {**os.environ, "APPIMAGE_EXTRACT_AND_RUN": "1", "ARCH": appimage_arch(machine)}
     subprocess.run(
         [str(appimagetool), str(appdir), str(out)],
         check=True,
@@ -217,8 +205,7 @@ def main() -> None:
     else:
         out = build_linux_appimage()
 
-    digest = _write_sha(out)
-    print(f"[ok] {out.name}  sha256={digest}")
+    print(f"[ok] {out.name}")
 
 
 if __name__ == "__main__":

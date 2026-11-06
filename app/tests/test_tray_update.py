@@ -97,3 +97,52 @@ def test_open_release_always_uses_latest_page(
     open_browser.assert_called_once_with(
         f"https://github.com/{GITHUB_REPO}/releases/latest"
     )
+
+
+def test_on_update_opens_arch_installer(monkeypatch: pytest.MonkeyPatch) -> None:
+    app = _make_app()
+    asset = (
+        "https://github.com/zhujunsan/kiro-gateway-deploy/releases/download/"
+        "v1.2.3/KiroGatewayTray-1.2.3-macos-arm64.dmg"
+    )
+    app._update_info = updates.UpdateInfo(
+        current="0.1.0",
+        latest="v1.2.3",
+        update_available=True,
+        release_url=f"https://github.com/zhujunsan/kiro-gateway-deploy/releases/latest",
+        download_url=asset,
+    )
+    open_browser = Mock()
+    monkeypatch.setattr("kiro_gateway_tray.tray.webbrowser.open", open_browser)
+
+    app._on_update(None, None)
+
+    open_browser.assert_called_once_with(asset)
+
+
+def test_on_update_falls_back_to_release_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    app = _make_app()
+    page = "https://github.com/zhujunsan/kiro-gateway-deploy/releases/latest"
+    app._update_info = updates.UpdateInfo(
+        current="0.1.0",
+        latest="v1.2.3",
+        update_available=True,
+        release_url=page,
+        download_url=None,
+    )
+    open_browser = Mock()
+    monkeypatch.setattr("kiro_gateway_tray.tray.webbrowser.open", open_browser)
+
+    app._on_update(None, None)
+
+    open_browser.assert_called_once_with(page)
+
+
+def test_on_update_without_info_does_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    app = _make_app()
+    open_browser = Mock()
+    monkeypatch.setattr("kiro_gateway_tray.tray.webbrowser.open", open_browser)
+
+    app._on_update(None, None)
+
+    open_browser.assert_not_called()

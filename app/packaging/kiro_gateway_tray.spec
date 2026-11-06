@@ -15,18 +15,22 @@ RES = APP / "resources"
 # Windows is excluded: PyInstaller's strip needs binutils' `strip`, which isn't
 # present on the runner and can corrupt PE files. macOS strip is safe here
 # because ad-hoc signing happens later in make_dist.py (after packaging).
+import platform as _pf
+
+sys.path.insert(0, str(Path(SPECPATH)))
+from target_arch import cloudflared_arch
+
+_arch = cloudflared_arch(_pf.machine())
 if sys.platform.startswith("win"):
     _cf_sub, _cf_exe, _name = "windows-amd64", "cloudflared.exe", "KiroGatewayTray"
     _console = False
     _strip = False
 elif sys.platform == "darwin":
-    import platform as _pf
-    _arch = "arm64" if _pf.machine() == "arm64" else "amd64"
     _cf_sub, _cf_exe, _name = f"darwin-{_arch}", "cloudflared", "KiroGatewayTray"
     _console = False
     _strip = True
 else:
-    _cf_sub, _cf_exe, _name = "linux-amd64", "cloudflared", "kiro-gateway-tray"
+    _cf_sub, _cf_exe, _name = f"linux-{_arch}", "cloudflared", "kiro-gateway-tray"
     _console = True
     _strip = True
 
