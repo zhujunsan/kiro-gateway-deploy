@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.5.12 (2026-11-10)
+
+**New**
+- 新增 Debian / Ubuntu 安装包 `kiro-gateway-tray_<ver>_amd64.deb` 与 `kiro-gateway-tray_<ver>_arm64.deb`。程序安装到应用菜单，可用 apt 升级和卸载。Linux x86_64 与 ARM64 的 AppImage 继续发布。
+
+**Changed**
+- 托盘菜单出现新版本时，Linux 仍下载对应架构的 AppImage。deb 需要 apt 安装，不作为点击即运行的更新包。
+
 ## v0.5.11 (2026-11-10)
 
 **Fixed**

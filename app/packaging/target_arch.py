@@ -1,8 +1,9 @@
 """Map a host CPU name to the architecture tokens used in release artifacts.
 
-cloudflared release assets use ``amd64`` / ``arm64``. AppImage filenames and
-``appimagetool`` use ``x86_64`` / ``aarch64``. Callers pass ``platform.machine()``
-(or an equivalent string) and get the token for the artifact they are building.
+cloudflared release assets and Debian packages use ``amd64`` / ``arm64``.
+AppImage filenames and ``appimagetool`` use ``x86_64`` / ``aarch64``. Callers
+pass ``platform.machine()`` (or an equivalent string) and get the token for the
+artifact they are building.
 """
 from __future__ import annotations
 
@@ -19,6 +20,16 @@ _APPIMAGE_ARCH = {
     "amd64": "x86_64",
     "arm64": "aarch64",
     "aarch64": "aarch64",
+}
+
+# Debian architecture names. The token set matches cloudflared today, but the
+# two artifacts are separate contracts: a new cloudflared build does not imply
+# a new .deb.
+_DEB_ARCH = {
+    "x86_64": "amd64",
+    "amd64": "amd64",
+    "arm64": "arm64",
+    "aarch64": "arm64",
 }
 
 
@@ -92,3 +103,28 @@ def appimagetool_filename(machine: str) -> str:
         Filename such as ``appimagetool-aarch64.AppImage``.
     """
     return f"appimagetool-{appimage_arch(machine)}.AppImage"
+
+
+def deb_arch(machine: str) -> str:
+    """Return the Debian package architecture (``amd64`` or ``arm64``).
+
+    Args:
+        machine: Value of ``platform.machine()``.
+
+    Returns:
+        ``amd64`` or ``arm64``.
+    """
+    return _lookup(machine, _DEB_ARCH)
+
+
+def linux_deb_filename(version: str, machine: str) -> str:
+    """Return the published Debian package filename for this version and CPU.
+
+    Args:
+        version: Application version without a leading ``v``.
+        machine: Value of ``platform.machine()``.
+
+    Returns:
+        Filename such as ``kiro-gateway-tray_1.2.3_arm64.deb``.
+    """
+    return f"kiro-gateway-tray_{version}_{deb_arch(machine)}.deb"

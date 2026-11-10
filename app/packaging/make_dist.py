@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -14,7 +15,17 @@ OUT = APP / "release"
 sys.path.insert(0, str(APP))
 sys.path.insert(0, str(APP / "packaging"))
 from kiro_gateway_tray import __version__ as VER  # noqa: E402
-from target_arch import appimage_arch, appimagetool_filename, linux_appimage_filename  # noqa: E402
+from target_arch import (  # noqa: E402
+    appimage_arch,
+    appimagetool_filename,
+    deb_arch,
+    linux_appimage_filename,
+    linux_deb_filename,
+)
+
+_LINUX_BINARY = "kiro-gateway-tray"
+_DEB_VERSION_RE = re.compile(r"^[0-9][A-Za-z0-9.+:~-]*$")
+_DEB_ARCHITECTURES = frozenset({"amd64", "arm64"})
 
 
 def _codesign_adhoc(app_path: Path) -> None:
@@ -143,6 +154,209 @@ def build_windows_installer() -> Path:
     return OUT / f"KiroGatewayTray-{VER}-windows-amd64-setup.exe"
 
 
+def render_desktop_entry(exec_path: str) -> str:
+    """Return a ``.desktop`` file that launches ``exec_path``.
+
+    Args:
+        exec_path: Freedesktop ``Exec`` value. AppImage keeps the bare binary
+            name; the Debian package uses the absolute ``/usr/bin`` wrapper.
+
+    Returns:
+        Desktop-entry text, including the trailing newline.
+
+    Raises:
+        ValueError: ``exec_path`` is empty or contains a newline.
+    """
+    if not exec_path or any(char in exec_path for char in "\n\r"):
+        raise ValueError(f"invalid desktop Exec value: {exec_path!r}")
+    return (
+        "[Desktop Entry]\n"
+        "Name=Kiro Gateway Tray\n"
+        f"Exec={exec_path}\n"
+        "Icon=kiro-gateway-tray\n"
+        "Type=Application\n"
+        "Categories=Utility;Network;\n"
+        "Comment=Kiro gateway tray app\n"
+        "Terminal=false\n"
+        "StartupNotify=false\n"
+    )
+
+
+def render_deb_control(version: str, arch: str) -> str:
+    """Return a Debian ``control`` file for this version and architecture.
+
+    Args:
+        version: Debian upstream version. Digits, letters, and ``. + ~ -``.
+        arch: ``amd64`` or ``arm64``.
+
+    Returns:
+        Control-file text, including the trailing newline.
+
+    Raises:
+        ValueError: ``version`` or ``arch`` cannot appear in a Debian control file.
+    """
+    if not _DEB_VERSION_RE.fullmatch(version):
+        raise ValueError(
+            f"version {version!r} cannot be used in a Debian package; "
+            "use digits, letters, and . + ~ -"
+        )
+    if arch not in _DEB_ARCHITECTURES:
+        raise ValueError(f"unsupported Debian architecture {arch!r}")
+    return (
+        "Package: kiro-gateway-tray\n"
+        f"Version: {version}\n"
+        "Section: net\n"
+        "Priority: optional\n"
+        f"Architecture: {arch}\n"
+        "Maintainer: Kiro Gateway Tray <zhujunsan@users.noreply.github.com>\n"
+        "Homepage: https://github.com/zhujunsan/kiro-gateway-deploy\n"
+        "Description: Local tray app for the Kiro gateway\n"
+        " Runs kiro-gateway and exposes it through a Cloudflare Tunnel.\n"
+    )
+
+
+def _write_unix_text(path: Path, text: str) -> None:
+    """Write ``text`` with LF line endings, including on Windows checkouts."""
+    path.write_text(text, encoding="utf-8", newline="\n")
+
+
+def stage_linux_deb(
+    root: Path,
+    bundle: Path,
+    *,
+    version: str,
+    arch: str,
+    icon: Path | None,
+) -> None:
+    """Lay out a ``dpkg-deb`` tree for the PyInstaller onedir bundle.
+
+    The frozen program stays in ``/opt/kiro-gateway-tray`` so its libraries
+    remain beside the executable. ``/usr/bin/kiro-gateway-tray`` is a shell
+    wrapper, and the desktop entry plus pixmap register it in the app menu.
+
+    Args:
+        root: Package root that will contain ``DEBIAN``, ``opt``, and ``usr``.
+        bundle: PyInstaller ``dist/kiro-gateway-tray`` directory.
+        version: Debian package version.
+        arch: ``amd64`` or ``arm64``.
+        icon: PNG installed as the menu icon, or None to ship without one.
+
+    Raises:
+        FileNotFoundError: ``bundle`` has no ``kiro-gateway-tray`` executable.
+    """
+    binary = bundle / _LINUX_BINARY
+    if not binary.is_file():
+        raise FileNotFoundError(
+            f"PyInstaller bundle is missing {binary}; run pyinstaller before packaging"
+        )
+
+    opt = root / "opt" / "kiro-gateway-tray"
+    if opt.exists():
+        shutil.rmtree(opt)
+    shutil.copytree(bundle, opt, symlinks=True)
+    staged_bin = opt / _LINUX_BINARY
+    staged_bin.chmod(staged_bin.stat().st_mode | 0o755)
+
+    bindir = root / "usr" / "bin"
+    bindir.mkdir(parents=True, exist_ok=True)
+    _write_unix_text(
+        bindir / _LINUX_BINARY,
+        "#!/bin/sh\n"
+        'exec /opt/kiro-gateway-tray/kiro-gateway-tray "$@"\n',
+    )
+    (bindir / _LINUX_BINARY).chmod(0o755)
+
+    applications = root / "usr" / "share" / "applications"
+    applications.mkdir(parents=True, exist_ok=True)
+    _write_unix_text(
+        applications / "kiro-gateway-tray.desktop",
+        render_desktop_entry("/usr/bin/kiro-gateway-tray"),
+    )
+
+    pixmap = root / "usr" / "share" / "pixmaps" / "kiro-gateway-tray.png"
+    if icon is not None and icon.is_file():
+        pixmap.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(icon, pixmap)
+    elif pixmap.exists():
+        pixmap.unlink()
+
+    debian = root / "DEBIAN"
+    debian.mkdir(parents=True, exist_ok=True)
+    control = debian / "control"
+    _write_unix_text(control, render_deb_control(version, arch))
+    control.chmod(0o644)
+
+
+def _assert_deb_paths_do_not_overlap(bundle: Path, stage_dir: Path, output: Path) -> None:
+    """Reject a staging directory that would delete or recurse into the bundle."""
+    bundle_res = bundle.resolve()
+    stage_res = stage_dir.resolve()
+    output_res = output.resolve()
+    if (
+        stage_res == bundle_res
+        or bundle_res in stage_res.parents
+        or stage_res in bundle_res.parents
+    ):
+        raise ValueError(
+            f"deb stage directory {stage_dir} must not overlap the PyInstaller bundle {bundle}"
+        )
+    if output_res == stage_res or stage_res in output_res.parents:
+        raise ValueError(
+            f"deb output {output} must not be inside the stage directory {stage_dir}"
+        )
+
+
+def build_linux_deb(
+    bundle: Path,
+    output: Path,
+    *,
+    version: str,
+    machine: str,
+    icon: Path | None,
+    stage_dir: Path,
+) -> Path:
+    """Build a ``.deb`` from the PyInstaller bundle for ``machine``.
+
+    Args:
+        bundle: PyInstaller ``dist/kiro-gateway-tray`` directory.
+        output: Destination ``.deb`` path.
+        version: Debian package version.
+        machine: Value of ``platform.machine()``. Selects ``amd64`` or ``arm64``.
+        icon: PNG installed as the menu icon, or None.
+        stage_dir: Scratch directory. Replaced on every build.
+
+    Returns:
+        ``output``.
+
+    Raises:
+        ValueError: The stage directory overlaps the bundle or the output file.
+        FileNotFoundError: ``dpkg-deb`` is not installed, or the bundle is incomplete.
+    """
+    _assert_deb_paths_do_not_overlap(bundle, stage_dir, output)
+    if stage_dir.exists():
+        shutil.rmtree(stage_dir)
+    root = stage_dir / "kiro-gateway-tray"
+    root.mkdir(parents=True)
+    stage_linux_deb(
+        root,
+        bundle,
+        version=version,
+        arch=deb_arch(machine),
+        icon=icon,
+    )
+    dpkg_deb = shutil.which("dpkg-deb")
+    if dpkg_deb is None:
+        raise FileNotFoundError(
+            "dpkg-deb not found; install the dpkg package to build the .deb"
+        )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [dpkg_deb, "--root-owner-group", "--build", str(root), str(output)],
+        check=True,
+    )
+    return output
+
+
 def build_linux_appimage() -> Path:
     machine = platform.machine()
     out = OUT / linux_appimage_filename(VER, machine)
@@ -161,15 +375,11 @@ def build_linux_appimage() -> Path:
     apprun.write_text('#!/bin/sh\nexec "$APPDIR/kiro-gateway-tray/kiro-gateway-tray" "$@"\n')
     apprun.chmod(0o755)
 
-    # .desktop file (required by AppImage spec)
-    (appdir / "kiro-gateway-tray.desktop").write_text(
-        "[Desktop Entry]\n"
-        "Name=Kiro Gateway Tray\n"
-        "Exec=kiro-gateway-tray\n"
-        "Icon=kiro-gateway-tray\n"
-        "Type=Application\n"
-        "Categories=Utility;Network;\n"
-        "Comment=Kiro gateway tray app\n"
+    # .desktop file (required by AppImage spec). Exec stays a bare name;
+    # appimagetool rewrites it against the mounted AppDir.
+    _write_unix_text(
+        appdir / "kiro-gateway-tray.desktop",
+        render_desktop_entry("kiro-gateway-tray"),
     )
 
     # Icon
@@ -199,13 +409,25 @@ def main() -> None:
     OUT.mkdir(exist_ok=True)
 
     if sys.platform == "darwin":
-        out = build_macos_dmg()
+        outputs = [build_macos_dmg()]
     elif sys.platform.startswith("win"):
-        out = build_windows_installer()
+        outputs = [build_windows_installer()]
     else:
-        out = build_linux_appimage()
+        machine = platform.machine()
+        outputs = [
+            build_linux_appimage(),
+            build_linux_deb(
+                DIST / "kiro-gateway-tray",
+                OUT / linux_deb_filename(VER, machine),
+                version=VER,
+                machine=machine,
+                icon=APP / "resources" / "icon.png",
+                stage_dir=APP / "build" / "deb-stage",
+            ),
+        ]
 
-    print(f"[ok] {out.name}")
+    for out in outputs:
+        print(f"[ok] {out.name}")
 
 
 if __name__ == "__main__":

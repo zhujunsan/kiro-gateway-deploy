@@ -13,8 +13,10 @@
 1. 从 GitHub Releases 下载对应平台的安装包：
    - macOS: `KiroGatewayTray-<ver>-macos-arm64.dmg` → 打开 DMG，拖入 Applications
    - Windows: `KiroGatewayTray-<ver>-windows-amd64-setup.exe` → 双击运行安装向导
-   - Linux x86_64: `kiro-gateway-tray-<ver>-linux-x86_64.AppImage` → `chmod +x`，双击或直接运行
-   - Linux ARM64: `kiro-gateway-tray-<ver>-linux-aarch64.AppImage` → `chmod +x`，双击或直接运行
+   - Linux x86_64 AppImage: `kiro-gateway-tray-<ver>-linux-x86_64.AppImage` → `chmod +x`，双击或直接运行
+   - Linux ARM64 AppImage: `kiro-gateway-tray-<ver>-linux-aarch64.AppImage` → `chmod +x`，双击或直接运行
+   - Debian / Ubuntu x86_64: `kiro-gateway-tray_<ver>_amd64.deb` → `sudo apt install ./kiro-gateway-tray_<ver>_amd64.deb`
+   - Debian / Ubuntu ARM64: `kiro-gateway-tray_<ver>_arm64.deb` → `sudo apt install ./kiro-gateway-tray_<ver>_arm64.deb`
 
    > macOS 可用 Homebrew（本仓库即 tap）：
    > `brew tap zhujunsan/kiro-gateway-deploy https://github.com/zhujunsan/kiro-gateway-deploy && brew trust zhujunsan/kiro-gateway-deploy && brew install --cask kiro-gateway-tray`。
@@ -83,7 +85,7 @@ python packaging/make_dist.py           # 产物在 app/release/
 `make_dist.py` 会根据当前平台产出对应安装包，需预装打包工具：
 - macOS → `.dmg`，需 `brew install create-dmg`
 - Windows → `-setup.exe`，需安装 [Inno Setup 6](https://jrsoftware.org/isdl.php)
-- Linux → `.AppImage`，需与本机架构匹配的 `appimagetool`（放到 `app/build/appimagetool-x86_64.AppImage` 或 `app/build/appimagetool-aarch64.AppImage`）
+- Linux → 同一架构同时产出 `.AppImage` 与 `.deb`。AppImage 需与本机架构匹配的 `appimagetool`（放到 `app/build/appimagetool-x86_64.AppImage` 或 `app/build/appimagetool-aarch64.AppImage`）；deb 用系统自带的 `dpkg-deb`
 
 安装包由 GitHub Actions matrix 自动构建（macOS arm64/Intel、Windows、Linux x86_64/ARM64；CI 会自动装好上述工具），打 `v*` tag 即触发，
 构建完自动创建 GitHub Release 并上传安装包。

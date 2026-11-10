@@ -14,7 +14,9 @@ from target_arch import (  # noqa: E402
     appimage_arch,
     appimagetool_filename,
     cloudflared_arch,
+    deb_arch,
     linux_appimage_filename,
+    linux_deb_filename,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -58,11 +60,35 @@ def test_linux_arm_artifact_names() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("machine", "expected"),
+    [
+        ("x86_64", "amd64"),
+        ("amd64", "amd64"),
+        ("AMD64", "amd64"),
+        ("arm64", "arm64"),
+        ("aarch64", "arm64"),
+        ("AARCH64", "arm64"),
+    ],
+)
+def test_deb_arch(machine: str, expected: str) -> None:
+    assert deb_arch(machine) == expected
+
+
+def test_linux_deb_filenames() -> None:
+    assert linux_deb_filename("1.2.3", "x86_64") == "kiro-gateway-tray_1.2.3_amd64.deb"
+    assert linux_deb_filename("1.2.3", "amd64") == "kiro-gateway-tray_1.2.3_amd64.deb"
+    assert linux_deb_filename("1.2.3", "aarch64") == "kiro-gateway-tray_1.2.3_arm64.deb"
+    assert linux_deb_filename("1.2.3", "arm64") == "kiro-gateway-tray_1.2.3_arm64.deb"
+
+
 def test_unsupported_machine_is_rejected() -> None:
     with pytest.raises(ValueError, match="riscv64"):
         cloudflared_arch("riscv64")
     with pytest.raises(ValueError, match="riscv64"):
         appimage_arch("riscv64")
+    with pytest.raises(ValueError, match="riscv64"):
+        deb_arch("riscv64")
 
 
 def test_cloudflared_release_assets() -> None:
@@ -85,6 +111,10 @@ def test_make_dist_names_appimage_from_machine() -> None:
     source = (ROOT / "app" / "packaging" / "make_dist.py").read_text(encoding="utf-8")
     assert "linux_appimage_filename" in source
     assert "appimagetool_filename" in source
+    assert "linux_deb_filename" in source
+    assert "build_linux_deb(" in source
+    assert 'shutil.which("dpkg-deb")' in source
+    assert '"--root-owner-group"' in source
     assert "ARCH" in source
     assert "appimagetool-x86_64.AppImage" not in source
 

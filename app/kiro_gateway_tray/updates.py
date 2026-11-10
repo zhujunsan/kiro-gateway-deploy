@@ -41,8 +41,10 @@ _DOWNLOAD_URL = "https://github.com/{repo}/releases/download/{tag}/{filename}"
 
 # Published installer names (see packaging/make_dist.py and target_arch.py).
 # macOS DMGs use amd64/arm64. Windows publishes a single amd64 setup exe
-# (it also runs on Windows on ARM via emulation). Linux AppImages use
-# x86_64/aarch64.
+# (it also runs on Windows on ARM via emulation). The menu downloads the Linux
+# AppImage (x86_64/aarch64): opening a .deb still needs apt, so the click stays
+# on the file the user can run directly. Debian/Ubuntu packages are published
+# beside it for apt install.
 _MACOS_ARCH = {
     "arm64": "arm64",
     "aarch64": "arm64",

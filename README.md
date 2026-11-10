@@ -29,8 +29,10 @@ Cursor 支持自定义 OpenAI 兼容的 API 地址，但有几个坑：
 1. 从 [GitHub Releases](https://github.com/zhujunsan/kiro-gateway-deploy/releases) 下载对应平台的安装包：
    - macOS：`KiroGatewayTray-<ver>-macos-arm64.dmg` → 打开 DMG，拖入 Applications
    - Windows：`KiroGatewayTray-<ver>-windows-amd64-setup.exe` → 双击运行安装向导
-   - Linux x86_64：`kiro-gateway-tray-<ver>-linux-x86_64.AppImage` → `chmod +x`，双击或直接运行
-   - Linux ARM64：`kiro-gateway-tray-<ver>-linux-aarch64.AppImage` → `chmod +x`，双击或直接运行
+   - Linux x86_64 AppImage：`kiro-gateway-tray-<ver>-linux-x86_64.AppImage` → `chmod +x`，双击或直接运行
+   - Linux ARM64 AppImage：`kiro-gateway-tray-<ver>-linux-aarch64.AppImage` → `chmod +x`，双击或直接运行
+   - Debian / Ubuntu x86_64：`kiro-gateway-tray_<ver>_amd64.deb` → `sudo apt install ./kiro-gateway-tray_<ver>_amd64.deb`
+   - Debian / Ubuntu ARM64：`kiro-gateway-tray_<ver>_arm64.deb` → `sudo apt install ./kiro-gateway-tray_<ver>_arm64.deb`
 
    > macOS 也可以用 Homebrew 安装（本仓库即是 tap）：
    >
