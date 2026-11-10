@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.5.11 (2026-11-10)
+
+**Fixed**
+- 修复 Ubuntu 26.04 / GNOME 50 Wayland 上托盘图标能显示、左右键都打不开菜单的问题。该桌面的点击由 StatusNotifier 菜单处理，pystray 的旧托盘图标收不到点击。GNOME Wayland 会话改为直接注册带 DBus 菜单的 StatusNotifierItem，单击即可打开原有托盘菜单。KDE、X11 以及 macOS、Windows 仍使用 pystray。设置 `KIRO_GATEWAY_TRAY_BACKEND=pystray` 可强制走原来的托盘实现。
+
 ## v0.5.10 (2026-11-06)
 
 **New**

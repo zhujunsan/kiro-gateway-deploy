@@ -1763,6 +1763,47 @@ class TrayApp:
             pystray.MenuItem("⏏️ 退出", self._on_quit),
         )
 
+    def _on_sni_before_show(self) -> None:
+        """Refresh caches before GNOME reads the StatusNotifier menu."""
+        try:
+            self._on_menu_open()
+            self._refresh_activity_cache_quiet()
+        except (OSError, RuntimeError, ValueError, TypeError):
+            logger.debug("sni menu refresh failed", exc_info=True)
+
+    def _create_tray_icon(self, menu):
+        """Build the platform tray icon.
+
+        On GNOME Wayland, pystray's Gtk.StatusIcon and AppIndicator backends
+        leave a visible icon that does not open a menu. A native
+        StatusNotifierItem is what that shell's click handler actually toggles.
+
+        Args:
+            menu: The pystray menu shared by every backend.
+
+        Returns:
+            A pystray ``Icon`` or a ``SniIcon``.
+        """
+        image = make_icon(False)
+        try:
+            from . import linux_sni
+
+            if linux_sni.use_native_sni():
+                logger.info(
+                    "GNOME Wayland detected; registering a StatusNotifierItem "
+                    "so tray clicks open the menu"
+                )
+                return linux_sni.SniIcon(
+                    "kiro-gateway-tray",
+                    image,
+                    "Kiro Gateway",
+                    menu,
+                    before_show=self._on_sni_before_show,
+                )
+        except ImportError:
+            logger.warning("StatusNotifierItem support is unavailable", exc_info=True)
+        return self._pystray.Icon("kiro-gateway-tray", image, "Kiro Gateway", menu)
+
     def run(self) -> None:
         pystray = self._pystray
 
@@ -1802,7 +1843,7 @@ class TrayApp:
 
         self.sup.mark_starting()
         menu = self._build_menu()
-        self._icon = pystray.Icon("kiro-gateway-tray", make_icon(False), "Kiro Gateway", menu)
+        self._icon = self._create_tray_icon(menu)
         macos_menu.install_retina_icon_fix()
         macos_menu.install_menu_gray_suffix()
         macos_menu.install_live_status_menu(
