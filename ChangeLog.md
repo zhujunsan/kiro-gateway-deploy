@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.5.13 (2026-11-11)
+
+**Fixed**
+- 修复 Kiro 上游通过流内 metadata 事件拒绝请求时，网关丢弃 `CONTENT_FILTERED`、拒绝分类及说明，随后返回空内容并误报成功的问题。OpenAI、Anthropic 与 Responses 的流式和非流式接口均会明确返回 `content_filter` 错误并保留上游拒绝原因，已返回部分正文后发生拒绝时也会终止为失败。
+- 拒绝事件记录为上游明确拒绝（`expected_upstream`），诊断状态为 400，避免误记为网关内部故障。
+
+**Changed**
+- 同步内嵌网关与 Docker 镜像至 `main-5006f43`。
+
 ## v0.5.12 (2026-11-10)
 
 **New**
